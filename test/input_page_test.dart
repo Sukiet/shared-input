@@ -256,6 +256,81 @@ void main() {
   });
 
   windowsTest(
+    'private fields reveal only by eye and hide on blur or app exit',
+    (tester) async {
+      final saved = AppSettings()
+        ..host = '192.168.1.9'
+        ..peerKey = 'c' * 32;
+      final store = MemorySettingsStore()..value = jsonEncode(saved.toJson());
+      await open(tester, store: store);
+      TextField field(String key) =>
+          tester.widget<TextField>(find.byKey(Key(key)));
+      expect(field('remote-host').obscureText, isTrue);
+      expect(field('peer-key').obscureText, isTrue);
+
+      await tester.tap(find.byKey(const Key('remote-host')));
+      await tester.pumpAndSettle();
+      expect(field('remote-host').obscureText, isTrue);
+      await tester.tap(find.byTooltip('显示被控端 IP'));
+      await tester.pumpAndSettle();
+      expect(field('remote-host').obscureText, isFalse);
+      expect(field('remote-host').focusNode!.hasFocus, isTrue);
+      await tester.tap(find.byTooltip('隐藏被控端 IP'));
+      await tester.pumpAndSettle();
+      expect(field('remote-host').obscureText, isTrue);
+      await tester.tap(find.byTooltip('显示被控端 IP'));
+      await tester.pumpAndSettle();
+      await tester.tap(find.byKey(const Key('remote-port')));
+      await tester.pumpAndSettle();
+      expect(field('remote-host').obscureText, isTrue);
+
+      await tester.tap(find.byTooltip('显示连接码'));
+      await tester.pumpAndSettle();
+      expect(field('peer-key').obscureText, isFalse);
+      tester.binding.handleAppLifecycleStateChanged(AppLifecycleState.inactive);
+      await tester.pumpAndSettle();
+      expect(field('peer-key').obscureText, isTrue);
+      tester.binding.handleAppLifecycleStateChanged(AppLifecycleState.resumed);
+      await tester.pumpAndSettle();
+      expect(field('peer-key').obscureText, isTrue);
+      expect(jsonDecode(store.value!)['peerKey'], saved.peerKey);
+      await tester.pumpWidget(const SizedBox());
+    },
+  );
+
+  windowsTest(
+    'receiver code keeps copy and remasks after focus or role change',
+    (tester) async {
+      final saved = AppSettings()..role = InputRole.receiver;
+      await open(
+        tester,
+        width: 420,
+        store: MemorySettingsStore()..value = jsonEncode(saved.toJson()),
+      );
+      TextField code() =>
+          tester.widget<TextField>(find.byKey(const Key('listen-key')));
+      expect(code().readOnly, isTrue);
+      expect(code().obscureText, isTrue);
+      expect(find.byTooltip('复制连接码'), findsOneWidget);
+      await tester.tap(find.byTooltip('显示连接码'));
+      await tester.pumpAndSettle();
+      expect(code().obscureText, isFalse);
+      await tester.tap(find.byKey(const Key('remote-port')));
+      await tester.pumpAndSettle();
+      expect(code().obscureText, isTrue);
+      await tester.tap(find.byTooltip('显示连接码'));
+      await tester.pumpAndSettle();
+      await tester.tap(find.text('控制端'));
+      await tester.pumpAndSettle();
+      await tester.tap(find.text('被控端'));
+      await tester.pumpAndSettle();
+      expect(code().obscureText, isTrue);
+      expect(tester.takeException(), isNull);
+      await tester.pumpWidget(const SizedBox());
+    },
+  );
+
+  windowsTest(
     'settings restore native shortcut and role survives a restart without listening',
     (tester) async {
       final saved = AppSettings()

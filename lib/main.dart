@@ -5,6 +5,7 @@ import 'package:flutter/material.dart';
 import 'package:flutter/scheduler.dart';
 import 'package:flutter/services.dart';
 import 'pointer_preview.dart';
+import 'private_text_field.dart';
 import 'sensitivity.dart';
 import 'settings.dart';
 import 'remote/lan_session.dart';
@@ -759,11 +760,11 @@ class _InputPageState extends State<InputPage>
           children: [
             if (!_receiving) ...[
               Expanded(
-                child: TextField(
-                  key: const Key('remote-host'),
+                child: PrivateTextField(
+                  fieldKey: const Key('remote-host'),
                   controller: _hostText,
                   enabled: editable,
-                  decoration: const InputDecoration(labelText: '被控端 IP'),
+                  label: '被控端 IP',
                   onChanged: (_) => _persist(),
                 ),
               ),
@@ -792,23 +793,18 @@ class _InputPageState extends State<InputPage>
         Row(
           children: [
             Expanded(
-              child: TextField(
-                key: Key(_receiving ? 'listen-key' : 'peer-key'),
+              child: PrivateTextField(
+                key: ValueKey(_receiving),
+                fieldKey: Key(_receiving ? 'listen-key' : 'peer-key'),
                 controller: _receiving ? _listenKeyText : _peerKeyText,
                 enabled: _ready && !_active && !_busy,
                 readOnly: _receiving || _lan.connected,
-                decoration: InputDecoration(
-                  labelText: '连接码',
-                  suffixIcon: _receiving
-                      ? IconButton(
-                          tooltip: '复制连接码',
-                          icon: const Icon(Icons.copy, size: 17),
-                          onPressed: () => Clipboard.setData(
-                            ClipboardData(text: _settings.listenKey),
-                          ),
-                        )
-                      : null,
-                ),
+                label: '连接码',
+                onCopy: _receiving
+                    ? () => Clipboard.setData(
+                        ClipboardData(text: _settings.listenKey),
+                      )
+                    : null,
                 onChanged: (_) => _persist(),
               ),
             ),
