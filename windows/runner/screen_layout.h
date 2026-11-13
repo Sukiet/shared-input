@@ -53,13 +53,11 @@ struct ScreenLayout {
     }
     return std::isfinite(offset) && offset < ControllerSpan() && offset + RemoteSpan() > 0;
   }
-  bool ToRemote(double local, double& remote) const {
-    remote = (local * ControllerSpan() - offset) / RemoteSpan();
-    return remote >= 0 && remote <= 1;
+  double ToRemote(double local) const {
+    return std::clamp((local * ControllerSpan() - offset) / RemoteSpan(), 0.0, 1.0);
   }
-  bool ToController(double remote, double& local) const {
-    local = (offset + remote * RemoteSpan()) / ControllerSpan();
-    return local >= 0 && local <= 1;
+  double ToController(double remote) const {
+    return std::clamp((offset + remote * RemoteSpan()) / ControllerSpan(), 0.0, 1.0);
   }
 };
 }  // namespace shared_input

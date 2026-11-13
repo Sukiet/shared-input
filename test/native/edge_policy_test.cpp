@@ -32,11 +32,17 @@ int main() {
     layout.side = side; layout.controller_width = 340; layout.controller_height = 220;
     layout.remote_width = 280; layout.remote_height = 180; layout.offset = 25;
     Check(layout.Valid(), "offset physical layout is valid");
-    double remote = 0, local = 0;
     const double fraction = (25 + layout.RemoteSpan() * 0.4) / layout.ControllerSpan();
-    Check(layout.ToRemote(fraction, remote) && std::abs(remote - 0.4) < 1e-9, "physical entry mapping");
-    Check(layout.ToController(remote, local) && std::abs(local - fraction) < 1e-9, "physical return mapping");
-    Check(!layout.ToRemote(0, remote), "unshared edge does not switch");
+    const double remote = layout.ToRemote(fraction);
+    Check(std::abs(remote - 0.4) < 1e-9, "physical entry mapping");
+    Check(std::abs(layout.ToController(remote) - fraction) < 1e-9, "physical return mapping");
+    Check(layout.ToRemote(0) == 0, "unshared entry maps to nearest endpoint");
+    layout.offset = layout.ControllerSpan() / 2;
+    Check(layout.Valid() && layout.ToRemote(0) == 0 && layout.ToController(1) == 1,
+        "positive offset clamps entry and return to nearest endpoints");
+    layout.offset = -layout.RemoteSpan() / 2;
+    Check(layout.Valid() && layout.ToRemote(1) == 1 && layout.ToController(0) == 0,
+        "negative offset clamps entry and return to nearest endpoints");
     shared_input::EdgeReturnPolicy vertical;
     vertical.Begin(1000, side);
     int dx = side == shared_input::ScreenEdge::left ? -10 : side == shared_input::ScreenEdge::right ? 10 : 0;

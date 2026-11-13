@@ -111,15 +111,13 @@ class DisplayLayout {
     );
   }
 
-  double? toRemote(double localFraction) {
+  double toRemote(double localFraction) {
     final position = localFraction * controllerSpan;
-    if (position < overlapStart || position > overlapEnd) return null;
     return ((position - offset) / remoteSpan).clamp(0.0, 1.0);
   }
 
-  double? toController(double remoteFraction) {
+  double toController(double remoteFraction) {
     final position = offset + remoteFraction * remoteSpan;
-    if (position < 0 || position > controllerSpan) return null;
     return (position / controllerSpan).clamp(0.0, 1.0);
   }
 

@@ -232,7 +232,7 @@ class _DisplayLayoutDialogState extends State<DisplayLayoutDialog> {
             ),
             const SizedBox(height: 4),
             const Text(
-              '控制端固定；相邻的边缘区域用于跨屏映射。',
+              '控制端固定；跨屏位置超出另一块屏幕时，映射到最近的边界点。',
               style: TextStyle(fontSize: 11, color: Color(0xff929aa6)),
             ),
             const SizedBox(height: 20),

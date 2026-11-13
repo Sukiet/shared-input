@@ -637,9 +637,8 @@ InputBridge::Map InputBridge::EdgeState() const {
   const bool horizontal = shared_input::HorizontalEdge(display_layout_.side);
   const double local = horizontal ? shared_input::EdgeFraction(point.y, bounds.top, bounds.bottom - bounds.top)
       : shared_input::EdgeFraction(point.x, bounds.left, bounds.right - bounds.left);
-  double remote = 0;
-  const bool overlap = display_layout_.ToRemote(local, remote);
-  return {{Value("atEdge"), Value(overlap && shared_input::OnEdge(display_layout_.side, point.x, point.y,
+  const double remote = display_layout_.ToRemote(local);
+  return {{Value("atEdge"), Value(shared_input::OnEdge(display_layout_.side, point.x, point.y,
       bounds.left, bounds.top, bounds.right - bounds.left, bounds.bottom - bounds.top))},
       {Value("entryY"), Value(std::clamp(remote, 0.0, 1.0))}, {Value("localPosition"), Value(local)},
       {Value("entrySide"), Value(shared_input::EdgeName(shared_input::OppositeEdge(display_layout_.side)))},
@@ -673,11 +672,9 @@ void InputBridge::RemotePointer(const Map& data) {
   const auto remote_side = shared_input::OppositeEdge(display_layout_.side);
   const double fraction = shared_input::HorizontalEdge(remote_side)
       ? shared_input::EdgeFraction(y, top, height) : shared_input::EdgeFraction(x, left, width);
-  double local = 0;
-  const bool overlap = display_layout_.ToController(fraction, local);
-  return_fraction_ = std::clamp(local, 0.0, 1.0);
+  return_fraction_ = display_layout_.ToController(fraction);
   pointer_received_ = GetTickCount64();
-  if (active_ && background_capture_ && overlap && edge_return_.Return(x, y, left, top, width, height,
+  if (active_ && background_capture_ && edge_return_.Return(x, y, left, top, width, height,
       static_cast<int64_t>(NumberArg(data, "sequence", -1)),
       !held_keys_.empty() || !held_buttons_.empty() || background_.HasHeld(), GetTickCount64())) Stop("edge");
 }
