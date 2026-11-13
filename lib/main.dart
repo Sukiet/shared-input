@@ -10,6 +10,7 @@ import 'sensitivity.dart';
 import 'scroll_speed.dart';
 import 'display_layout.dart';
 import 'display_layout_dialog.dart';
+import 'clipboard_sync.dart';
 import 'settings.dart';
 import 'remote/lan_session.dart';
 
@@ -63,6 +64,7 @@ class _InputPageState extends State<InputPage>
   final _peerKeyText = TextEditingController();
   final _listenKeyText = TextEditingController();
   final _lan = LanSession();
+  late final ClipboardSync _clipboard;
   late final SettingsRepository _preferences;
   AppSettings _settings = AppSettings();
   bool _settingsLoaded = false;
@@ -104,6 +106,7 @@ class _InputPageState extends State<InputPage>
     // Override button activation for Space inside this app, before focus routing.
     FocusManager.instance.addEarlyKeyEventHandler(_onSpace);
     _preferences = SettingsRepository(widget.store ?? MemorySettingsStore());
+    _clipboard = ClipboardSync(_lan, _channel);
     _lan.addListener(_connectionChanged);
     _lan.onBeginWithOptions = (capture, options) => _channel.invokeMethod<void>(
       'receiverBegin',
@@ -213,6 +216,7 @@ class _InputPageState extends State<InputPage>
         await _configureEdge();
       }
       if (mounted) setState(() => _ready = true);
+      _clipboard.start(_settings.clipboardEnabled);
       await _saveSettings();
       unawaited(_readAddresses());
     });
@@ -680,6 +684,7 @@ class _InputPageState extends State<InputPage>
     _peerKeyText.dispose();
     _listenKeyText.dispose();
     _lan.removeListener(_connectionChanged);
+    _clipboard.dispose();
     _lan.dispose();
     super.dispose();
   }
@@ -1158,9 +1163,28 @@ class _InputPageState extends State<InputPage>
             ),
           ],
         ),
+        _clipboardSettings(),
       ],
     );
   }
+
+  Widget _clipboardSettings() => ListenableBuilder(
+    listenable: _clipboard,
+    builder: (_, _) => SwitchListTile(
+      key: const Key('clipboard-sync'),
+      contentPadding: EdgeInsets.zero,
+      title: const Text('剪贴板同步'),
+      subtitle: Text(_clipboard.status, style: const TextStyle(fontSize: 11)),
+      value: _settings.clipboardEnabled,
+      onChanged: _ready && !_busy
+          ? (value) {
+              setState(() => _settings.clipboardEnabled = value);
+              _clipboard.setEnabled(value);
+              _persist();
+            }
+          : null,
+    ),
+  );
 
   Future<void> _applySmoothing() => _channel.invokeMethod<void>(
     'receiverConfigureSmoothing',

@@ -6,6 +6,7 @@ import ApplicationServices
 // held state and a watchdog so a stalled Flutter loop cannot leave keys held.
 final class RemoteInputBridge {
   private let channel: FlutterMethodChannel
+  private let clipboard = ClipboardBridge()
   private let lock = NSLock()
   private var timer: DispatchSourceTimer?
   private var motionTimer: DispatchSourceTimer?
@@ -82,16 +83,19 @@ final class RemoteInputBridge {
     motionTimer.resume()
     self.motionTimer = motionTimer
   }
-  deinit { motionTimer?.cancel(); timer?.cancel(); stop() }
+  deinit { motionTimer?.cancel(); timer?.cancel(); clipboard.reset(); stop() }
+  func shutdown() { clipboard.reset(); stop() }
   func stop() {
     lock.lock(); defer { lock.unlock() }
     releaseLocked()
   }
 
   private func handle(_ call: FlutterMethodCall, _ result: @escaping FlutterResult) {
+    if call.method.hasPrefix("clipboard") { clipboard.handle(call, result); return }
     let args = call.arguments as? [String: Any] ?? [:]
     switch call.method {
     case "initialize":
+      clipboard.reset()
       stop()
       diagnosticsEnabled = args["diagnostics"] as? Bool ?? false
       result(nil)

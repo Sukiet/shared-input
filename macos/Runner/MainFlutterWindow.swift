@@ -12,7 +12,7 @@ class MainFlutterWindow: NSWindow {
     RegisterGeneratedPlugins(registry: flutterViewController)
     inputBridge = RemoteInputBridge(messenger: flutterViewController.engine.binaryMessenger)
     NotificationCenter.default.addObserver(forName: NSApplication.willTerminateNotification,
-      object: nil, queue: nil) { [weak self] _ in self?.inputBridge?.stop() }
+      object: nil, queue: nil) { [weak self] _ in self?.inputBridge?.shutdown() }
 
     super.awakeFromNib()
   }

@@ -17,6 +17,7 @@
 #include "remote_receiver.h"
 #include "background_hooks.h"
 #include "edge_policy.h"
+#include "clipboard_bridge.h"
 
 class InputBridge {
  public:
@@ -57,6 +58,7 @@ class InputBridge {
   void StopStream();
   HWND owner_, view_, capture_ = nullptr;
   std::unique_ptr<flutter::MethodChannel<Value>> channel_;
+  std::unique_ptr<ClipboardBridge> clipboard_;
   bool initialized_ = false, active_ = false, recording_ = false;
   std::string identifying_;
   uint64_t setup_since_ = 0, started_ = 0;

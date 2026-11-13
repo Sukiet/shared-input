@@ -21,6 +21,8 @@
 /* End PBXAggregateTarget section */
 
 /* Begin PBXBuildFile section */
+		AB0010010000000000000006 /* ClipboardBridge.swift in Test Sources */ = {isa = PBXBuildFile; fileRef = AB0010020000000000000004 /* ClipboardBridge.swift */; };
+		AB0010010000000000000005 /* ClipboardBridge.swift in Sources */ = {isa = PBXBuildFile; fileRef = AB0010020000000000000004 /* ClipboardBridge.swift */; };
 		AB0010010000000000000004 /* PointerInterpolator.swift in Sources */ = {isa = PBXBuildFile; fileRef = AB0010020000000000000003 /* PointerInterpolator.swift */; };
 		AB0010010000000000000003 /* MacKeyMap.swift in Test Sources */ = {isa = PBXBuildFile; fileRef = AB0010020000000000000002 /* MacKeyMap.swift */; };
 		AB0010010000000000000001 /* RemoteInputBridge.swift in Sources */ = {isa = PBXBuildFile; fileRef = AB0010020000000000000001 /* RemoteInputBridge.swift */; };
@@ -65,6 +67,7 @@
 /* End PBXCopyFilesBuildPhase section */
 
 /* Begin PBXFileReference section */
+		AB0010020000000000000004 /* ClipboardBridge.swift */ = {isa = PBXFileReference; lastKnownFileType = sourcecode.swift; path = ClipboardBridge.swift; sourceTree = "<group>"; };
 		AB0010020000000000000003 /* PointerInterpolator.swift */ = {isa = PBXFileReference; lastKnownFileType = sourcecode.swift; path = PointerInterpolator.swift; sourceTree = "<group>"; };
 		AB0010020000000000000001 /* RemoteInputBridge.swift */ = {isa = PBXFileReference; lastKnownFileType = sourcecode.swift; path = RemoteInputBridge.swift; sourceTree = "<group>"; };
 		AB0010020000000000000002 /* MacKeyMap.swift */ = {isa = PBXFileReference; lastKnownFileType = sourcecode.swift; path = MacKeyMap.swift; sourceTree = "<group>"; };
@@ -176,6 +179,7 @@
 				33CC10F02044A3C60003C045 /* AppDelegate.swift */,
 				33CC11122044BFA00003C045 /* MainFlutterWindow.swift */,
 				AB0010020000000000000001 /* RemoteInputBridge.swift */,
+				AB0010020000000000000004 /* ClipboardBridge.swift */,
 				AB0010020000000000000003 /* PointerInterpolator.swift */,
 				AB0010020000000000000002 /* MacKeyMap.swift */,
 				33E51913231747F40026EE4D /* DebugProfile.entitlements */,
@@ -357,6 +361,7 @@
 			buildActionMask = 2147483647;
 			files = (
 				331C80D8294CF71000263BE5 /* RunnerTests.swift in Sources */,
+				AB0010010000000000000006 /* ClipboardBridge.swift in Test Sources */,
 				AB0010010000000000000003 /* MacKeyMap.swift in Test Sources */,
 			);
 			runOnlyForDeploymentPostprocessing = 0;
@@ -367,6 +372,7 @@
 			files = (
 				33CC11132044BFA00003C045 /* MainFlutterWindow.swift in Sources */,
 				AB0010010000000000000001 /* RemoteInputBridge.swift in Sources */,
+				AB0010010000000000000005 /* ClipboardBridge.swift in Sources */,
 				AB0010010000000000000004 /* PointerInterpolator.swift in Sources */,
 				AB0010010000000000000002 /* MacKeyMap.swift in Sources */,
 				33CC10F12044A3C60003C045 /* AppDelegate.swift in Sources */,

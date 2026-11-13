@@ -5,83 +5,17 @@ import 'package:flutter/foundation.dart';
 import '../settings.dart';
 import '../scroll_speed.dart';
 import 'protocol.dart';
+import 'wire.dart';
+import 'clipboard_channel.dart';
 import 'input_diagnostics.dart';
 
-class _Wire {
-  _Wire(this.socket) {
-    socket.setOption(SocketOption.tcpNoDelay, true);
-    _subscription = socket.listen(
-      (bytes) {
-        try {
-          for (final frame in _decoder.add(bytes)) {
-            _frames.add(frame);
-          }
-        } catch (error, stack) {
-          _frames.addError(error, stack);
-          close();
-        }
-      },
-      onError: (Object error, StackTrace stack) {
-        _frames.addError(error, stack);
-        _frames.close();
-      },
-      onDone: () => _frames.close(),
-    );
-    incoming = StreamIterator(_frames.stream);
-  }
-  final Socket socket;
-  final _decoder = FrameDecoder();
-  final _frames = StreamController<Uint8List>();
-  late final StreamSubscription<Uint8List> _subscription;
-  late final StreamIterator<Uint8List> incoming;
-  Future<void> _sending = Future.value();
-  int _queued = 0;
-  bool closed = false;
-  PacketCipher? transmit, receive;
-
-  Future<Uint8List> next() async {
-    if (!await incoming.moveNext().timeout(const Duration(seconds: 4))) {
-      throw const SocketException('连接已关闭。');
-    }
-    return incoming.current;
-  }
-
-  Future<void> raw(Uint8List packet) async {
-    if (closed) throw const SocketException('连接已关闭。');
-    socket.add(frameTcp(packet));
-    await socket.flush();
-  }
-
-  Future<void> send(Map<String, dynamic> json) {
-    if (++_queued > 512) {
-      close();
-      return Future.error(const SocketException('连接发送积压，已停止控制。'));
-    }
-    final operation = _sending
-        .then((_) async {
-          if (closed) throw const SocketException('连接已关闭。');
-          socket.add(
-            frameTcp(await transmit!.encrypt(utf8.encode(jsonEncode(json)))),
-          );
-          await socket.flush();
-        })
-        .whenComplete(() {
-          --_queued;
-        });
-    _sending = operation.catchError((Object _) {});
-    return operation;
-  }
-
-  void close() {
-    if (closed) return;
-    closed = true;
-    socket.destroy();
-    _subscription.cancel();
-    _frames.close();
-  }
-}
-
 class LanSession extends ChangeNotifier {
+  final clipboard = ClipboardChannel();
+  bool clipboardSupported = false, supportsClipboard = false;
+  bool _clipboardOpening = false;
+  void Function(Map<String, dynamic> message)? onClipboardControl;
+  int get connectionGeneration => _generation;
+  bool get receiving => _receiver;
   final diagnostics = InputDiagnostics();
   double scrollSpeed = ScrollSpeed.defaultValue;
   Future<void> Function(String capture)? onBegin;
@@ -103,8 +37,8 @@ class LanSession extends ChangeNotifier {
 
   ServerSocket? _server;
   RawDatagramSocket? _udp;
-  _Wire? _wire;
-  final Set<_Wire> _handshakes = {};
+  EncryptedWire? _wire;
+  final Set<EncryptedWire> _handshakes = {};
   PacketCipher? _mouseCipher;
   Timer? _heartbeat;
   InternetAddress? _remoteAddress;
@@ -168,7 +102,7 @@ class LanSession extends ChangeNotifier {
           socket.destroy();
           return;
         }
-        final wire = _Wire(socket);
+        final wire = EncryptedWire(socket);
         _handshakes.add(wire);
         final generation = _generation;
         try {
@@ -196,6 +130,7 @@ class LanSession extends ChangeNotifier {
               'nonce': base64Encode(serverNonce),
               'udpPort': _udp!.port,
               'capabilities': [
+                if (clipboardSupported) 'clipboard-v1',
                 if (onPointerInfo != null) 'edge-pointer-v1',
                 if (display != null && onBeginWithOptions != null)
                   'edge-layout-v1',
@@ -219,6 +154,10 @@ class LanSession extends ChangeNotifier {
             throw const SocketException('监听已停止。');
           }
           _wire = wire;
+          supportsClipboard =
+              clipboardSupported &&
+              (hello['capabilities'] as List?)?.contains('clipboard-v1') ==
+                  true;
           _mouseCipher = PacketCipher(keys.mouse);
           _remoteAddress = socket.remoteAddress;
           _remoteUdpPort = udpPort;
@@ -263,7 +202,7 @@ class LanSession extends ChangeNotifier {
         port,
         timeout: const Duration(seconds: 4),
       );
-      final wire = _Wire(socket);
+      final wire = EncryptedWire(socket);
       _handshakes.add(wire);
       final clientNonce = secureBytes(32);
       await wire.raw(
@@ -272,6 +211,7 @@ class LanSession extends ChangeNotifier {
           'version': protocolVersion,
           'nonce': base64Encode(clientNonce),
           'udpPort': _udp!.port,
+          'capabilities': [if (clipboardSupported) 'clipboard-v1'],
         }, master),
       );
       final ack = await openHandshake(await wire.next(), master);
@@ -282,6 +222,9 @@ class LanSession extends ChangeNotifier {
       }
       supportsEdge =
           (ack['capabilities'] as List?)?.contains('edge-pointer-v1') == true;
+      supportsClipboard =
+          clipboardSupported &&
+          (ack['capabilities'] as List?)?.contains('clipboard-v1') == true;
       remoteDisplay = _displayInfo(ack['display']);
       supportsLayout =
           remoteDisplay != null &&
@@ -312,7 +255,7 @@ class LanSession extends ChangeNotifier {
     }
   }
 
-  void _activate(_Wire wire) {
+  void _activate(EncryptedWire wire) {
     unawaited(diagnostics.start());
     latencyMs = null;
     sentPackets = receivedPackets = _previousSent = _previousReceived = 0;
@@ -350,9 +293,31 @@ class LanSession extends ChangeNotifier {
     });
     _changed();
     unawaited(_readControl(wire));
+    if (_receiver && supportsClipboard) unawaited(_startClipboard(wire));
   }
 
-  Future<void> _readControl(_Wire wire) async {
+  Future<void> _startClipboard(EncryptedWire wire) async {
+    final key = randomHex();
+    try {
+      final port = await clipboard.listen(
+        key: key,
+        bindAddress: wire.socket.address.address,
+        remoteAddress: wire.socket.remoteAddress.address,
+      );
+      if (identical(wire, _wire) && supportsClipboard) {
+        await wire.send({'type': 'clipboardPort', 'port': port, 'key': key});
+      }
+    } catch (_) {
+      /* Clipboard failure never interrupts input sharing. */
+    }
+  }
+
+  Future<void> sendClipboardControl(Map<String, dynamic> message) async {
+    if (!connected || !supportsClipboard) return;
+    await _wire!.send(message);
+  }
+
+  Future<void> _readControl(EncryptedWire wire) async {
     try {
       while (!wire.closed && await wire.incoming.moveNext()) {
         final plain = await wire.receive!.decrypt(wire.incoming.current);
@@ -362,6 +327,31 @@ class LanSession extends ChangeNotifier {
         );
         _lastReceived = DateTime.now();
         switch (json['type']) {
+          case 'clipboardPort':
+            if (!_receiver && supportsClipboard && !_clipboardOpening) {
+              final port = json['port'], key = json['key'];
+              if (port is! int ||
+                  port <= 0 ||
+                  port > 65535 ||
+                  key is! String ||
+                  !RegExp(r'^[a-f0-9]{32}$').hasMatch(key)) {
+                throw const FormatException('Invalid clipboard endpoint');
+              }
+              _clipboardOpening = true;
+              unawaited(
+                clipboard
+                    .connect(
+                      key: key,
+                      host: wire.socket.remoteAddress.address,
+                      port: port,
+                    )
+                    .catchError((Object _) {}),
+              );
+            }
+          case 'clipboardState':
+          case 'clipboardOffer':
+          case 'clipboardRequest':
+            if (supportsClipboard) onClipboardControl?.call(json);
           case 'ping':
             if (_receiver && capturing) await onHeartbeat?.call();
             if (_receiver && json['motion'] is Map) {
@@ -755,6 +745,9 @@ class LanSession extends ChangeNotifier {
     _closing = true;
     supportsEdge = false;
     supportsLayout = false;
+    supportsClipboard = false;
+    _clipboardOpening = false;
+    clipboard.close();
     remoteDisplay = null;
     diagnostics.stop();
     ++_generation;
@@ -788,6 +781,7 @@ class LanSession extends ChangeNotifier {
   void dispose() {
     _disposed = true;
     unawaited(close());
+    clipboard.dispose();
     metrics.dispose();
     super.dispose();
   }

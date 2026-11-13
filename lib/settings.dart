@@ -52,6 +52,7 @@ class AppSettings {
   int smoothingLeewayUs = 500;
   bool statisticsExpanded = false;
   bool edgeSwitchEnabled = false;
+  bool clipboardEnabled = true;
   DisplayLayout displayLayout = const DisplayLayout();
 
   Map<String, dynamic> get smoothingOptions => {
@@ -81,6 +82,7 @@ class AppSettings {
     'smoothingLeewayUs': smoothingLeewayUs,
     'statisticsExpanded': statisticsExpanded,
     'edgeSwitchEnabled': edgeSwitchEnabled,
+    'clipboardEnabled': clipboardEnabled,
     'displayLayout': displayLayout.toJson(),
   };
 
@@ -119,6 +121,9 @@ class AppSettings {
     }
     result.statisticsExpanded = json['statisticsExpanded'] == true;
     result.edgeSwitchEnabled = json['edgeSwitchEnabled'] == true;
+    if (json['clipboardEnabled'] is bool) {
+      result.clipboardEnabled = json['clipboardEnabled'] as bool;
+    }
     result.displayLayout = DisplayLayout.fromJson(json['displayLayout']);
     if (json['smoothingEnabled'] is bool) {
       result.smoothingEnabled = json['smoothingEnabled'] as bool;

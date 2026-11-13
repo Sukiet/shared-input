@@ -394,6 +394,29 @@ void main() {
     await tester.pumpWidget(const SizedBox());
   });
 
+  windowsTest('clipboard toggle persists across role changes and restart', (
+    tester,
+  ) async {
+    final store = MemorySettingsStore();
+    await open(tester, store: store);
+    final toggle = find.byKey(const Key('clipboard-sync'));
+    await tester.ensureVisible(toggle);
+    expect(tester.widget<SwitchListTile>(toggle).value, isTrue);
+    await tester.tap(
+      find.descendant(of: toggle, matching: find.byType(Switch)),
+    );
+    await tester.pumpAndSettle();
+    expect(jsonDecode(store.value!)['clipboardEnabled'], isFalse);
+    await tester.ensureVisible(find.text('被控端'));
+    await tester.tap(find.text('被控端'));
+    await tester.pumpAndSettle();
+    expect(tester.widget<SwitchListTile>(toggle).value, isFalse);
+    await tester.pumpWidget(const SizedBox());
+    await open(tester, store: store);
+    expect(tester.widget<SwitchListTile>(toggle).value, isFalse);
+    await tester.pumpWidget(const SizedBox());
+  });
+
   windowsTest('compact window scrolls without overflow', (tester) async {
     await open(tester, width: 420);
     expect(tester.takeException(), isNull);

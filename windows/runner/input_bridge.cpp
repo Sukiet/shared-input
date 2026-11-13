@@ -136,6 +136,7 @@ int PhysicalKey(const RAWKEYBOARD& key) {
 
 InputBridge::InputBridge(HWND owner, HWND view, flutter::BinaryMessenger* messenger)
     : owner_(owner), view_(view) {
+  clipboard_ = std::make_unique<ClipboardBridge>(owner_);
   channel_ = std::make_unique<flutter::MethodChannel<Value>>(
       messenger, "shared_input/dry_run", &flutter::StandardMethodCodec::GetInstance());
   channel_->SetMethodCallHandler([this](const auto& call, auto result) {
@@ -148,6 +149,7 @@ InputBridge::~InputBridge() {
   Stop("shutdown", false);
   background_.Close();
   receiver_.Stop();
+  clipboard_.reset();
   closing_ = true;
   if (watchdog_.joinable()) watchdog_.join();
   KillTimer(owner_, kStatsTimer);
@@ -216,7 +218,11 @@ std::vector<InputBridge::Device> InputBridge::Enumerate() {
 void InputBridge::OnMethod(const flutter::MethodCall<Value>& call,
                            std::unique_ptr<Result> result) {
   const auto& method = call.method_name();
+  if (method.rfind("clipboard", 0) == 0) {
+    clipboard_->Handle(call, std::move(result)); return;
+  }
   if (method == "initialize") {
+    clipboard_->Reset();
     // Hot restart / a new Dart view always starts disarmed.
     Stop("manual", false);
     receiver_.Stop();
@@ -699,6 +705,7 @@ void InputBridge::CancelSetup() {
 }
 
 std::optional<LRESULT> InputBridge::HandleMessage(UINT message, WPARAM wparam, LPARAM lparam) {
+  if (clipboard_ && message == ClipboardBridge::kResultMessage) { clipboard_->Complete(); return 0; }
   switch (message) {
     case kStreamMessage:
       stream_posted_ = false;
