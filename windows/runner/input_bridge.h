@@ -15,6 +15,8 @@
 #include <vector>
 #include "safety_policy.h"
 #include "remote_receiver.h"
+#include "background_hooks.h"
+#include "edge_policy.h"
 
 class InputBridge {
  public:
@@ -35,6 +37,9 @@ class InputBridge {
   bool Initialize();
   std::vector<Device> Enumerate();
   void ReadInput(HRAWINPUT input);
+  void ProcessInput(const RAWINPUT& input, UINT bytes);
+  Map EdgeState() const;
+  void RemotePointer(const Map& data);
   void Start(const Map& args, std::unique_ptr<Result> result);
   void Stop(const std::string& reason, bool notify = true);
   void CancelSetup();
@@ -69,6 +74,12 @@ class InputBridge {
   std::mutex cursor_lease_;
   RECT owned_clip_{};
   bool keyboard_captured_ = false;
+  bool edge_enabled_ = false, background_capture_ = false;
+  uint64_t edge_requested_ = 0, edge_cooldown_ = 0;
+  double return_fraction_ = 0.5;
+  shared_input::BackgroundHooks background_;
+  shared_input::EdgeReturnPolicy edge_return_;
+  std::atomic<uint64_t> pointer_received_{0};
   std::thread watchdog_;
   RemoteReceiver receiver_;
   UINT stream_timer_ = 0;

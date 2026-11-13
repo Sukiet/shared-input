@@ -83,6 +83,13 @@ class _Wire {
 class LanSession extends ChangeNotifier {
   final diagnostics = InputDiagnostics();
   Future<void> Function(String capture)? onBegin;
+  Future<void> Function(String capture, Map<String, dynamic> options)?
+  onBeginWithOptions;
+  Future<Map<String, dynamic>?> Function()? onPointerInfo;
+  Future<void> Function(Map<String, dynamic> pointer)? onPointerFeedback;
+  bool supportsEdge = false;
+  bool _edgeCapture = false, _pollingPointer = false;
+  Timer? _pointerTimer;
   Future<void> Function(String capture, List<Map<String, dynamic>> frames)?
   onInput;
   Future<void> Function()? onEnd;
@@ -162,6 +169,7 @@ class LanSession extends ChangeNotifier {
               'clientNonce': hello['nonce'],
               'nonce': base64Encode(serverNonce),
               'udpPort': _udp!.port,
+              'capabilities': [if (onPointerInfo != null) 'edge-pointer-v1'],
             }, master),
           );
           final keys = await SessionKeys.derive(
@@ -241,6 +249,8 @@ class LanSession extends ChangeNotifier {
           ack['clientNonce'] != base64Encode(clientNonce)) {
         throw const FormatException('配对失败。');
       }
+      supportsEdge =
+          (ack['capabilities'] as List?)?.contains('edge-pointer-v1') == true;
       final keys = await SessionKeys.derive(
         master,
         clientNonce,
@@ -340,10 +350,34 @@ class LanSession extends ChangeNotifier {
             final id = json['capture'] as String;
             MotionFrame(id, 0, 0, 0).validate();
             try {
-              await onBegin?.call(id);
+              final options = Map<String, dynamic>.from(
+                json['options'] as Map? ?? {},
+              );
+              final entry = options['edgeEntryY'];
+              if (entry != null &&
+                  (entry is! num ||
+                      !entry.isFinite ||
+                      entry < 0 ||
+                      entry > 1 ||
+                      onPointerInfo == null)) {
+                throw const FormatException('被控端不支持边缘切换。');
+              }
+              if (onBeginWithOptions != null) {
+                await onBeginWithOptions!(id, options);
+              } else {
+                await onBegin?.call(id);
+              }
               _capture = id;
+              _edgeCapture = entry != null;
               _appliedEpoch = 0;
               await wire.send({'type': 'begun', 'capture': id});
+              if (_edgeCapture) {
+                _pointerTimer = Timer.periodic(
+                  const Duration(milliseconds: 16),
+                  (_) => unawaited(_sendPointer()),
+                );
+                unawaited(_sendPointer());
+              }
               _changed();
             } catch (error) {
               await wire.send({'type': 'rejected', 'message': '$error'});
@@ -364,6 +398,25 @@ class LanSession extends ChangeNotifier {
               await _end();
               if (!_receiver) onCaptureEnded?.call();
               _changed();
+            }
+          case 'pointer':
+            if (!_receiver && _edgeCapture && json['capture'] == _capture) {
+              final pointer = Map<String, dynamic>.from(json['pointer'] as Map);
+              for (final key in [
+                'x',
+                'y',
+                'left',
+                'top',
+                'width',
+                'height',
+                'sequence',
+              ]) {
+                final value = pointer[key];
+                if (value is! num || !value.isFinite || value.abs() > 1e12) {
+                  throw const FormatException('无效的指针反馈。');
+                }
+              }
+              await onPointerFeedback?.call(pointer);
             }
           case 'events':
             if (!_receiver || json['capture'] != _capture) break;
@@ -404,19 +457,57 @@ class LanSession extends ChangeNotifier {
     }
   }
 
-  Future<void> beginCapture() async {
+  Future<void> beginCapture({double? edgeEntryY}) async {
     if (!connected || _receiver) throw StateError('请先连接被控端。');
+    if (edgeEntryY != null &&
+        (!supportsEdge ||
+            !edgeEntryY.isFinite ||
+            edgeEntryY < 0 ||
+            edgeEntryY > 1)) {
+      throw StateError('请更新 Mac 被控端以支持边缘切换。');
+    }
     await endCapture();
     _capture = randomHex();
+    _edgeCapture = edgeEntryY != null;
     final ack = Completer<void>();
     _startAck = ack;
     try {
-      final sent = _wire!.send({'type': 'begin', 'capture': _capture});
+      final sent = _wire!.send({
+        'type': 'begin',
+        'capture': _capture,
+        if (edgeEntryY != null) 'options': {'edgeEntryY': edgeEntryY},
+      });
       await Future.wait([sent, ack.future.timeout(const Duration(seconds: 4))]);
     } catch (_) {
       if (identical(_startAck, ack)) _startAck = null;
       await endCapture();
       rethrow;
+    }
+  }
+
+  Future<void> _sendPointer() async {
+    if (_pollingPointer || !_receiver || !_edgeCapture || _capture == null) {
+      return;
+    }
+    _pollingPointer = true;
+    final capture = _capture;
+    final wire = _wire;
+    try {
+      final pointer = await onPointerInfo?.call();
+      if (pointer != null &&
+          capture == _capture &&
+          wire == _wire &&
+          wire != null) {
+        await wire.send({
+          'type': 'pointer',
+          'capture': capture,
+          'pointer': pointer,
+        });
+      }
+    } catch (_) {
+      if (capture == _capture) await _lost('指针反馈中断');
+    } finally {
+      _pollingPointer = false;
     }
   }
 
@@ -569,6 +660,9 @@ class LanSession extends ChangeNotifier {
   }
 
   Future<void> _end() async {
+    _pointerTimer?.cancel();
+    _pointerTimer = null;
+    _edgeCapture = false;
     final wasCapturing = _capture != null;
     _capture = null;
     _pendingSend = _pendingReceive = null;
@@ -601,6 +695,7 @@ class LanSession extends ChangeNotifier {
   Future<void> close({bool keepListener = false}) async {
     if (_closing) return;
     _closing = true;
+    supportsEdge = false;
     diagnostics.stop();
     ++_generation;
     _heartbeat?.cancel();

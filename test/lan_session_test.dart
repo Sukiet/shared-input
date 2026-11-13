@@ -97,6 +97,64 @@ void main() {
     },
   );
 
+  test(
+    'edge sessions negotiate capability, carry placement and return pointer feedback',
+    () async {
+      Map<String, dynamic>? entry, feedback;
+      var polls = 0;
+      receiver.onBeginWithOptions = (_, options) async {
+        entry = options;
+      };
+      receiver.onPointerInfo = () async {
+        ++polls;
+        return {
+          'x': 24,
+          'y': 500,
+          'left': 0,
+          'top': 0,
+          'width': 1920,
+          'height': 1080,
+          'sequence': 7,
+        };
+      };
+      controller.onPointerFeedback = (pointer) async {
+        feedback = pointer;
+      };
+      await connect();
+      expect(controller.supportsEdge, isTrue);
+      await controller.beginCapture(edgeEntryY: 0.5);
+      await eventually(() => feedback != null);
+      expect(entry, {'edgeEntryY': 0.5});
+      expect(feedback!['x'], 24);
+      expect(feedback!['sequence'], 7);
+      await controller.endCapture();
+      await eventually(() => !receiver.capturing);
+      final stoppedPolls = polls;
+      await Future<void>.delayed(const Duration(milliseconds: 60));
+      expect(polls, stoppedPolls);
+    },
+  );
+
+  test(
+    'edge mode rejects receivers without position feedback before starting',
+    () async {
+      var begins = 0;
+      receiver.onBegin = (_) async {
+        ++begins;
+      };
+      await connect();
+      expect(controller.supportsEdge, isFalse);
+      await expectLater(
+        controller.beginCapture(edgeEntryY: 0.5),
+        throwsStateError,
+      );
+      expect(begins, 0);
+      expect(controller.capturing, isFalse);
+      await controller.beginCapture();
+      expect(begins, 1);
+    },
+  );
+
   test('UDP motion cannot pass a pending reliable button transition', () async {
     final blocked = Completer<void>(), entered = Completer<void>();
     final applied = <String>[];

@@ -55,6 +55,9 @@ void main() {
     messenger.setMockMethodCallHandler(channel, (call) async {
       calls.add(call);
       if (call.method == 'devices') return devices;
+      if (call.method == 'edgeState') {
+        return {'atEdge': true, 'entryY': 0.25, 'ready': true};
+      }
       if (call.method == 'pointer') {
         return pendingPointer?.future ?? [pointer.dx, pointer.dy, true];
       }
@@ -113,66 +116,71 @@ void main() {
     await tester.pumpAndSettle();
   }
 
-  testWidgets('Mac receiver smoothing applies live, persists and resets', (
-    tester,
-  ) async {
-    final settings = AppSettings()
-      ..role = InputRole.receiver
-      ..smoothingDurationMs = 25
-      ..smoothingIntervalMs = 8
-      ..smoothingLeewayUs = 1000;
-    final store = MemorySettingsStore()..value = jsonEncode(settings.toJson());
-    await open(tester, width: 600, store: store);
-    Map<dynamic, dynamic> applied() =>
-        calls
-                .lastWhere((c) => c.method == 'receiverConfigureSmoothing')
-                .arguments
-            as Map;
-    expect(applied()['durationMs'], 25);
-    expect(applied()['intervalMs'], 8);
-    expect(applied()['leewayUs'], 1000);
-    expect(find.text('鼠标平滑设置'), findsOneWidget);
-    for (final entry in {
-      'smoothing-duration': 40.0,
-      'smoothing-interval': 2.0,
-      'smoothing-leeway': 200.0,
-    }.entries) {
-      tester.widget<Slider>(find.byKey(Key(entry.key))).onChanged!(entry.value);
+  testWidgets(
+    'Mac receiver smoothing applies live, persists and resets',
+    (tester) async {
+      final settings = AppSettings()
+        ..role = InputRole.receiver
+        ..smoothingDurationMs = 25
+        ..smoothingIntervalMs = 8
+        ..smoothingLeewayUs = 1000;
+      final store = MemorySettingsStore()
+        ..value = jsonEncode(settings.toJson());
+      await open(tester, width: 600, store: store);
+      Map<dynamic, dynamic> applied() =>
+          calls
+                  .lastWhere((c) => c.method == 'receiverConfigureSmoothing')
+                  .arguments
+              as Map;
+      expect(applied()['durationMs'], 25);
+      expect(applied()['intervalMs'], 8);
+      expect(applied()['leewayUs'], 1000);
+      expect(find.text('鼠标平滑设置'), findsOneWidget);
+      for (final entry in {
+        'smoothing-duration': 40.0,
+        'smoothing-interval': 2.0,
+        'smoothing-leeway': 200.0,
+      }.entries) {
+        tester.widget<Slider>(find.byKey(Key(entry.key))).onChanged!(
+          entry.value,
+        );
+        await tester.pumpAndSettle();
+      }
+      expect(applied(), {
+        'enabled': true,
+        'durationMs': 40,
+        'intervalMs': 2,
+        'leewayUs': 200,
+      });
+      await tester.tap(find.byKey(const Key('smoothing-enabled')));
       await tester.pumpAndSettle();
-    }
-    expect(applied(), {
-      'enabled': true,
-      'durationMs': 40,
-      'intervalMs': 2,
-      'leewayUs': 200,
-    });
-    await tester.tap(find.byKey(const Key('smoothing-enabled')));
-    await tester.pumpAndSettle();
-    expect(applied()['enabled'], false);
-    expect(
-      tester
-          .widget<Slider>(find.byKey(const Key('smoothing-duration')))
-          .onChanged,
-      isNull,
-    );
-    await tester.pumpWidget(const SizedBox.shrink());
-    await open(tester, width: 600, store: store);
-    expect(applied(), {
-      'enabled': false,
-      'durationMs': 40,
-      'intervalMs': 2,
-      'leewayUs': 200,
-    });
-    await tester.tap(find.byKey(const Key('reset-smoothing')));
-    await tester.pumpAndSettle();
-    expect(applied(), {
-      'enabled': true,
-      'durationMs': 12,
-      'intervalMs': 4,
-      'leewayUs': 500,
-    });
-    expect(tester.takeException(), isNull);
-  }, variant: TargetPlatformVariant.only(TargetPlatform.macOS));
+      expect(applied()['enabled'], false);
+      expect(
+        tester
+            .widget<Slider>(find.byKey(const Key('smoothing-duration')))
+            .onChanged,
+        isNull,
+      );
+      await tester.pumpWidget(const SizedBox.shrink());
+      await open(tester, width: 600, store: store);
+      expect(applied(), {
+        'enabled': false,
+        'durationMs': 40,
+        'intervalMs': 2,
+        'leewayUs': 200,
+      });
+      await tester.tap(find.byKey(const Key('reset-smoothing')));
+      await tester.pumpAndSettle();
+      expect(applied(), {
+        'enabled': true,
+        'durationMs': 12,
+        'intervalMs': 4,
+        'leewayUs': 500,
+      });
+      expect(tester.takeException(), isNull);
+    },
+    variant: TargetPlatformVariant.only(TargetPlatform.macOS),
+  );
 
   windowsTest(
     'devices and a recorded exit are required; configuration never starts capture',
@@ -316,6 +324,93 @@ void main() {
     expect(tester.takeException(), isNull);
     await tester.pumpWidget(const SizedBox());
   });
+
+  windowsTest(
+    'edge switching starts in background and retains both emergency exits',
+    (tester) async {
+      const key = '0123456789abcdef0123456789abcdef';
+      final receiver = LanSession();
+      Map<String, dynamic>? options;
+      var ended = 0;
+      receiver.onBeginWithOptions = (_, entry) async {
+        options = entry;
+      };
+      receiver.onEnd = () async {
+        ++ended;
+      };
+      receiver.onPointerInfo = () async => {
+        'x': 24,
+        'y': 270,
+        'left': 0,
+        'top': 0,
+        'width': 1920,
+        'height': 1080,
+        'sequence': 0,
+      };
+      addTearDown(() async {
+        await receiver.close();
+        receiver.dispose();
+      });
+      await tester.runAsync(
+        () => receiver.listen(port: 0, key: key, bindAddress: '127.0.0.1'),
+      );
+      final saved = AppSettings()
+        ..edgeSwitchEnabled = true
+        ..shortcut = const ExitShortcut(0x77)
+        ..host = '127.0.0.1'
+        ..port = receiver.port
+        ..peerKey = key;
+      final store = MemorySettingsStore()..value = jsonEncode(saved.toJson());
+      await open(tester, store: store);
+      expect(start(tester).onPressed, isNotNull);
+      expect(
+        calls.any(
+          (call) =>
+              call.method == 'configureEdge' &&
+              (call.arguments as Map)['enabled'] == true,
+        ),
+        isTrue,
+      );
+      tester.binding.handleAppLifecycleStateChanged(AppLifecycleState.inactive);
+      var starts = 0;
+      for (final reason in ['shake', 'shortcut']) {
+        ++starts;
+        await tester.runAsync(() async {
+          await native('edgeEnter', {'entryY': 0.25});
+          final deadline = DateTime.now().add(const Duration(seconds: 5));
+          while (calls.where((call) => call.method == 'start').length <
+              starts) {
+            if (DateTime.now().isAfter(deadline)) {
+              fail('Edge did not start background capture');
+            }
+            await Future<void>.delayed(const Duration(milliseconds: 5));
+          }
+        });
+        await tester.pump();
+        final args =
+            calls.lastWhere((call) => call.method == 'start').arguments as Map;
+        expect(args['background'], isTrue);
+        expect(args['remote'], isTrue);
+        expect(args['edgeTriggered'], isTrue);
+        expect(options, {'edgeEntryY': 0.25});
+        await tester.runAsync(() async {
+          await native('stopped', {'reason': reason});
+          final deadline = DateTime.now().add(const Duration(seconds: 5));
+          while (ended < starts) {
+            if (DateTime.now().isAfter(deadline)) {
+              fail('Emergency exit did not end receiver capture');
+            }
+            await Future<void>.delayed(const Duration(milliseconds: 5));
+          }
+        });
+        await tester.pumpAndSettle();
+        expect(start(tester).onPressed, isNotNull);
+        expect(jsonDecode(store.value!)['edgeSwitchEnabled'], isTrue);
+      }
+      tester.binding.handleAppLifecycleStateChanged(AppLifecycleState.resumed);
+      await tester.pumpWidget(const SizedBox());
+    },
+  );
 
   windowsTest('space connects then starts remotely on release and can resume', (
     tester,

@@ -48,6 +48,7 @@ class AppSettings {
   int smoothingIntervalMs = 4;
   int smoothingLeewayUs = 500;
   bool statisticsExpanded = false;
+  bool edgeSwitchEnabled = false;
 
   Map<String, dynamic> get smoothingOptions => {
     'enabled': smoothingEnabled,
@@ -74,6 +75,7 @@ class AppSettings {
     'smoothingIntervalMs': smoothingIntervalMs,
     'smoothingLeewayUs': smoothingLeewayUs,
     'statisticsExpanded': statisticsExpanded,
+    'edgeSwitchEnabled': edgeSwitchEnabled,
   };
 
   static AppSettings fromJson(Map<String, dynamic> json) {
@@ -108,6 +110,7 @@ class AppSettings {
       result.sendHz = json['sendHz'] as int;
     }
     result.statisticsExpanded = json['statisticsExpanded'] == true;
+    result.edgeSwitchEnabled = json['edgeSwitchEnabled'] == true;
     if (json['smoothingEnabled'] is bool) {
       result.smoothingEnabled = json['smoothingEnabled'] as bool;
     }

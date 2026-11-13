@@ -125,6 +125,15 @@ final class RemoteInputBridge {
       lock.unlock()
       result(["active": active, "timings": snapshot])
     case "heartbeat", "restoreShortcut", "cancelSetup": result(nil)
+    case "receiverPointer":
+      lock.lock()
+      let actual = CGEvent(source: nil)?.location ?? position
+      let bounds = CGDisplayBounds(CGMainDisplayID())
+      let snapshot: [String: Any] = ["x": actual.x, "y": actual.y,
+        "left": bounds.minX, "top": bounds.minY, "width": bounds.width,
+        "height": bounds.height, "sequence": sequence]
+      lock.unlock()
+      result(snapshot)
     case "devices": result([])
     case "permissions": result(CGPreflightPostEventAccess())
     case "requestPermissions":
@@ -142,6 +151,11 @@ final class RemoteInputBridge {
       activity = ProcessInfo.processInfo.beginActivity(options: [.userInitiated, .latencyCritical],
         reason: "Receiving keyboard and mouse input")
       position = CGEvent(source: nil)?.location ?? .zero
+      if let entry = args["edgeEntryY"] as? Double, entry.isFinite, (0...1).contains(entry) {
+        let bounds = CGDisplayBounds(CGMainDisplayID())
+        emitMotionLocked(CGPoint(x: bounds.minX + min(24, bounds.width / 2),
+          y: bounds.minY + entry * max(0, bounds.height - 1)))
+      }
       lastReceived = ProcessInfo.processInfo.systemUptime
       interpolator.reset(position, at: lastReceived)
       scheduleMotionLocked()

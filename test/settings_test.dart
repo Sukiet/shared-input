@@ -35,6 +35,7 @@ void main() {
       ..smoothingIntervalMs = 2
       ..smoothingLeewayUs = 100
       ..statisticsExpanded = true;
+    saved.edgeSwitchEnabled = true;
     await SettingsRepository(store).save(saved);
     final restored = await SettingsRepository(store).load();
     expect(restored.toJson(), saved.toJson());

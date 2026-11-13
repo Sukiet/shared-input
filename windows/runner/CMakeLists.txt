@@ -22,6 +22,11 @@ add_executable(${BINARY_NAME} WIN32
 # that need different build settings.
 apply_standard_settings(${BINARY_NAME})
 target_compile_options(${BINARY_NAME} PRIVATE /utf-8)
+add_library(shared_input_hooks SHARED "background_hooks.cpp")
+apply_standard_settings(shared_input_hooks)
+target_compile_definitions(shared_input_hooks PRIVATE SHARED_INPUT_HOOKS_EXPORTS NOMINMAX)
+target_link_libraries(shared_input_hooks PRIVATE user32)
+target_link_libraries(${BINARY_NAME} PRIVATE shared_input_hooks)
 
 # Add preprocessor definitions for the build version.
 target_compile_definitions(${BINARY_NAME} PRIVATE "FLUTTER_VERSION=\"${FLUTTER_VERSION}\"")

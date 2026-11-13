@@ -16,6 +16,8 @@ namespace {
 constexpr UINT kWatchdogMessage = WM_APP + 0x142;
 constexpr UINT kRestoreFocusMessage = WM_APP + 0x143;
 constexpr UINT kStreamMessage = WM_APP + 0x144;
+constexpr UINT kBackgroundStopMessage = WM_APP + 0x145;
+constexpr UINT kBackgroundKeyMessage = kBackgroundStopMessage + 1;
 constexpr UINT_PTR kStatsTimer = 0x5349;
 constexpr wchar_t kCaptureClass[] = L"SharedInputLocalCapture";
 using Value = flutter::EncodableValue;
@@ -103,6 +105,26 @@ bool BoolArg(const Map& map, const char* key) {
   const auto value = Find(map, key);
   return value && std::get_if<bool>(value) && std::get<bool>(*value);
 }
+double NumberArg(const Map& map, const char* key, double fallback = 0) {
+  const auto value = Find(map, key);
+  if (value) {
+    if (const auto number = std::get_if<double>(value)) return *number;
+    if (const auto number = std::get_if<int32_t>(value)) return *number;
+    if (const auto number = std::get_if<int64_t>(value)) return static_cast<double>(*number);
+  }
+  return fallback;
+}
+RECT PrimaryBounds() {
+  MONITORINFO info{}; info.cbSize = sizeof(info);
+  GetMonitorInfoW(MonitorFromPoint(POINT{0, 0}, MONITOR_DEFAULTTOPRIMARY), &info);
+  return info.rcMonitor;
+}
+bool AnyHeld() {
+  for (int key = VK_LBUTTON; key < 255; ++key) {
+    if (GetAsyncKeyState(key) & 0x8000) return true;
+  }
+  return false;
+}
 
 int PhysicalKey(const RAWKEYBOARD& key) {
   if (key.VKey == VK_CONTROL) return key.Flags & RI_KEY_E0 ? VK_RCONTROL : VK_LCONTROL;
@@ -124,6 +146,7 @@ InputBridge::InputBridge(HWND owner, HWND view, flutter::BinaryMessenger* messen
 
 InputBridge::~InputBridge() {
   Stop("shutdown", false);
+  background_.Close();
   receiver_.Stop();
   closing_ = true;
   if (watchdog_.joinable()) watchdog_.join();
@@ -223,6 +246,28 @@ void InputBridge::OnMethod(const flutter::MethodCall<Value>& call,
       shortcut_shift_ = BoolArg(*args, "shift");
       result->Success();
     }
+  } else if (method == "configureEdge") {
+    const auto args = call.arguments() ? std::get_if<Map>(call.arguments()) : nullptr;
+    const bool enabled = args && BoolArg(*args, "enabled");
+    if (active_) Stop("manual");
+    if (enabled && !background_.Install(owner_, kBackgroundStopMessage, shortcut_key_, shortcut_shift_)) {
+      result->Error("hook_failed", "后台输入拦截初始化失败。"); return;
+    }
+    RAWINPUTDEVICE devices[] = {
+      {1, 6, static_cast<DWORD>(enabled ? RIDEV_REMOVE : RIDEV_DEVNOTIFY), enabled ? nullptr : owner_},
+      {1, 2, static_cast<DWORD>(RIDEV_DEVNOTIFY | (enabled ? RIDEV_INPUTSINK : 0)), owner_}};
+    if (!RegisterRawInputDevices(devices, 2, sizeof(RAWINPUTDEVICE))) {
+      result->Error("edge_failed", "后台输入监听初始化失败。"); return;
+    }
+    edge_enabled_ = enabled;
+    edge_cooldown_ = GetTickCount64() + 500;
+    if (!enabled) background_.Close();
+    result->Success();
+  } else if (method == "edgeState") {
+    result->Success(Value(EdgeState()));
+  } else if (method == "remotePointer") {
+    if (const auto args = call.arguments() ? std::get_if<Map>(call.arguments()) : nullptr) RemotePointer(*args);
+    result->Success();
   } else if (method == "receiverBegin") {
     const auto args = call.arguments() ? std::get_if<Map>(call.arguments()) : nullptr;
     if (active_ || !args || !receiver_.Begin(StringArg(*args, "capture"))) {
@@ -290,12 +335,19 @@ void InputBridge::Start(const Map& args, std::unique_ptr<Result> result) {
     result->Error("not_ready", "必须先选择设备并设置退出快捷键。");
     return;
   }
-  if (GetForegroundWindow() != owner_ || IsIconic(owner_)) {
+  const bool background = BoolArg(args, "background");
+  if (background && (!edge_enabled_ || !BoolArg(args, "remote"))) {
+    result->Error("edge_not_ready", "请先启用边缘切换并连接支持此功能的 Mac。"); return;
+  }
+  if (background && BoolArg(args, "edgeTriggered") && !BoolArg(EdgeState(), "atEdge")) {
+    result->Error("edge_cancelled", "指针已离开右边缘，已取消切换。"); return;
+  }
+  if (!background && (GetForegroundWindow() != owner_ || IsIconic(owner_))) {
     result->Error("not_foreground", "开始控制前，请先打开并激活本窗口。");
     return;
   }
   // Do not inherit a held modifier or shortcut into the simulated session.
-  for (int key = VK_BACK; key < 255; ++key) {
+  for (int key = background ? VK_LBUTTON : VK_BACK; key < 255; ++key) {
     if (GetAsyncKeyState(key) & 0x8000) {
       result->Error("keys_held", "请松开所有键盘按键，再点击开始控制。");
       return;
@@ -306,7 +358,7 @@ void InputBridge::Start(const Map& args, std::unique_ptr<Result> result) {
     if (device.type == "keyboard" && device.id == StringArg(args, "keyboard")) keyboard_ = device.handle;
     if (device.type == "mouse" && device.id == StringArg(args, "mouse")) mouse_ = device.handle;
   }
-  if (!keyboard_ || !mouse_) {
+  if (!background && (!keyboard_ || !mouse_)) {
     result->Error("missing_device", "所选设备不存在，请刷新并重新选择。");
     return;
   }
@@ -331,44 +383,61 @@ void InputBridge::Start(const Map& args, std::unique_ptr<Result> result) {
   x_ = 300; y_ = 120;
   held_keys_.clear(); held_buttons_.clear(); physical_keys_.clear(); shakes_.clear();
   started_ = GetTickCount64();
-  RECT client{};
-  GetClientRect(owner_, &client);
-  POINT center{(client.right - client.left) / 2, (client.bottom - client.top) / 2};
-  if (!shared_input::DisableCaptureIme(capture_)) {
-    remote_capture_ = false;
-    result->Error("ime_disable_failed", "无法暂停采集窗口的本地输入法，已取消控制。");
-    return;
+  background_capture_ = background;
+  if (background) {
+    if (!background_.Install(owner_, kBackgroundStopMessage, shortcut_key_, shortcut_shift_) ||
+        !background_.Begin()) {
+      background_capture_ = false; remote_capture_ = false;
+      result->Error("hook_failed", "后台输入拦截未就绪，请移动鼠标或按键后重试。"); return;
+    }
+    edge_return_.Begin(started_);
+    pointer_received_ = started_;
+    active_ = true;
+    {
+      std::lock_guard<std::mutex> lock(cursor_lease_);
+      ++generation_; heartbeat_ = started_; watch_started_ = started_; armed_ = true;
+      owned_clip_ = {};
+    }
+  } else {
+    RECT client{};
+    GetClientRect(owner_, &client);
+    POINT center{(client.right - client.left) / 2, (client.bottom - client.top) / 2};
+    if (!shared_input::DisableCaptureIme(capture_)) {
+      remote_capture_ = false;
+      result->Error("ime_disable_failed", "无法暂停采集窗口的本地输入法，已取消控制。");
+      return;
+    }
+    SetWindowPos(capture_, HWND_TOP, center.x, center.y, 1, 1, SWP_SHOWWINDOW);
+    active_ = true;
+    SetFocus(capture_);
+    if (GetFocus() != capture_) {
+      Stop("focus_lost", false);
+      result->Error("focus_failed", "无法取得输入焦点，已取消开始。");
+      return;
+    }
+    ClientToScreen(owner_, &center);
+    RECT clip{center.x, center.y, center.x + 1, center.y + 1};
+    bool clipped = false;
+    bool keyboard_ready = false;
+    {
+      std::lock_guard<std::mutex> lock(cursor_lease_);
+      ++generation_;
+      heartbeat_ = started_;
+      watch_started_ = started_;
+      owned_clip_ = clip;
+      keyboard_ready = shared_input::RegisterKeyboard(owner_, true);
+      keyboard_captured_ = keyboard_ready;
+      clipped = keyboard_ready && ClipCursor(&clip) != FALSE;
+      armed_ = clipped;
+    }
+    if (!clipped) {
+      Stop("manual", false);
+      if (!keyboard_ready) result->Error("keyboard_capture_failed", "无法接管 Windows 快捷键，已取消控制。");
+      else result->Error("clip_failed", "鼠标限制失败，已取消开始并释放鼠标。");
+      return;
+    }
+    SetCursor(nullptr);
   }
-  SetWindowPos(capture_, HWND_TOP, center.x, center.y, 1, 1, SWP_SHOWWINDOW);
-  active_ = true;
-  SetFocus(capture_);
-  if (GetFocus() != capture_) {
-    Stop("focus_lost", false);
-    result->Error("focus_failed", "无法取得输入焦点，已取消开始。");
-    return;
-  }
-  ClientToScreen(owner_, &center);
-  RECT clip{center.x, center.y, center.x + 1, center.y + 1};
-  bool clipped = false;
-  bool keyboard_ready = false;
-  {
-    std::lock_guard<std::mutex> lock(cursor_lease_);
-    ++generation_;
-    heartbeat_ = started_;
-    watch_started_ = started_;
-    owned_clip_ = clip;
-    keyboard_ready = shared_input::RegisterKeyboard(owner_, true);
-    keyboard_captured_ = keyboard_ready;
-    clipped = keyboard_ready && ClipCursor(&clip) != FALSE;
-    armed_ = clipped;
-  }
-  if (!clipped) {
-    Stop("manual", false);
-    if (!keyboard_ready) result->Error("keyboard_capture_failed", "无法接管 Windows 快捷键，已取消控制。");
-    else result->Error("clip_failed", "鼠标限制失败，已取消开始并释放鼠标。");
-    return;
-  }
-  SetCursor(nullptr);
   if (remote_capture_) {
     timer_resolution_ = timeBeginPeriod(1) == TIMERR_NOERROR;
     stream_timer_ = timeSetEvent(static_cast<UINT>(1000 / hz), 1, StreamTick,
@@ -384,21 +453,29 @@ void InputBridge::Start(const Map& args, std::unique_ptr<Result> result) {
 
 void InputBridge::Stop(const std::string& reason, bool notify) {
   const bool was_active = active_;
+  const bool was_background = background_capture_;
   // Release first; neither Dart nor a channel response is needed for cleanup.
   {
     std::lock_guard<std::mutex> lock(cursor_lease_);
     ReleaseInputCapture();
   }
   active_ = false;
+  background_capture_ = false;
   if (was_active && remote_capture_) FlushStream();
   StopStream();
   if (!was_active) return;
   released_ = static_cast<int>(held_keys_.size() + held_buttons_.size());
   held_keys_.clear(); held_buttons_.clear(); physical_keys_.clear(); shakes_.clear();
-  SetCursor(LoadCursor(nullptr, IDC_ARROW));
+  if (was_background) {
+    edge_cooldown_ = GetTickCount64() + 500;
+    const auto bounds = PrimaryBounds();
+    SetCursorPos(bounds.right - 24, bounds.top + static_cast<int>(return_fraction_ * (bounds.bottom - bounds.top - 1)));
+  } else {
+    SetCursor(LoadCursor(nullptr, IDC_ARROW));
   // Stop can run inside WM_KILLFOCUS. Defer window visibility/focus changes
   // until that notification returns to avoid focus reentrancy/deadlocks.
   PostMessage(owner_, kRestoreFocusMessage, 0, generation_.load());
+  }
   if (notify) {
     auto stats = Stats();
     stats[Value("reason")] = Value(reason);
@@ -421,22 +498,28 @@ bool InputBridge::MatchesShortcut(int key) const {
 }
 
 void InputBridge::ReadInput(HRAWINPUT handle) {
-  if (GetForegroundWindow() != owner_) return;
   UINT bytes = 0;
   if (GetRawInputData(handle, RID_INPUT, nullptr, &bytes, sizeof(RAWINPUTHEADER)) == UINT(-1)) return;
   if (bytes < sizeof(RAWINPUTHEADER) || bytes > 65536) return;
   std::vector<BYTE> data(bytes);
   if (GetRawInputData(handle, RID_INPUT, data.data(), &bytes, sizeof(RAWINPUTHEADER)) != bytes) return;
   const auto& raw = *reinterpret_cast<const RAWINPUT*>(data.data());
+  ProcessInput(raw, bytes);
+}
+
+void InputBridge::ProcessInput(const RAWINPUT& raw, UINT bytes) {
+  if (!edge_enabled_ && GetForegroundWindow() != owner_) return;
+  if (active_ && background_capture_ && !background_.Blocking()) return;
   const auto now = GetTickCount64();
   if (raw.header.dwType == RIM_TYPEKEYBOARD && bytes >= sizeof(RAWINPUTHEADER) + sizeof(RAWKEYBOARD)) {
+    if (background_capture_ && !background_.KeyboardFresh(now)) { Stop("hook_lost"); return; }
     const auto& keyboard = raw.data.keyboard;
-    if (keyboard.VKey == 255 || !raw.header.hDevice) return;
+    if (keyboard.VKey == 255 || (!background_capture_ && !raw.header.hDevice)) return;
     const int key = PhysicalKey(keyboard);
     const bool up = (keyboard.Flags & RI_KEY_BREAK) != 0;
     auto& physical = physical_keys_[raw.header.hDevice];
     if (up) physical.erase(key); else physical.insert(key);
-    if (recording_ && !up) {
+    if (recording_ && !up && GetForegroundWindow() == owner_) {
       if (key == VK_ESCAPE) { CancelSetup(); return; }
       if (shared_input::ValidShortcut(key,
             Down(VK_LCONTROL) || Down(VK_RCONTROL),
@@ -463,7 +546,7 @@ void InputBridge::ReadInput(HRAWINPUT handle) {
     if (!active_) return;
     // Emergency shortcut precedes the selected-device filter.
     if (!up && MatchesShortcut(key)) { Stop("shortcut"); return; }
-    if (raw.header.hDevice != keyboard_) { ++ignored_; return; }
+    if (!background_capture_ && raw.header.hDevice != keyboard_) { ++ignored_; return; }
     ++keys_;
     const auto scan = shared_input::NormalizeKeyboardScanCode(keyboard);
     const int physical_id = scan.HeldId() | ((keyboard.Flags & RI_KEY_E1) << 16);
@@ -473,7 +556,15 @@ void InputBridge::ReadInput(HRAWINPUT handle) {
         {Value("extended"), Value(scan.extended)},
         {Value("down"), Value(!up)}, {Value("repeat"), Value(repeat)}});
   } else if (raw.header.dwType == RIM_TYPEMOUSE && bytes >= sizeof(RAWINPUTHEADER) + sizeof(RAWMOUSE)) {
+    if (background_capture_ && !background_.MouseFresh(now)) { Stop("hook_lost"); return; }
     const auto& mouse = raw.data.mouse;
+    if (!active_ && edge_enabled_ && !recording_ && identifying_.empty() &&
+        !(mouse.usFlags & MOUSE_MOVE_ABSOLUTE) && mouse.lLastX > 0 &&
+        now >= edge_cooldown_ && now - edge_requested_ >= 1000 && !AnyHeld() &&
+        !background_.HasHeld()) {
+      auto state = EdgeState();
+      if (BoolArg(state, "atEdge")) { edge_requested_ = now; Emit("edgeEnter", std::move(state)); }
+    }
     if (identifying_ == "mouse" && (mouse.lLastX || mouse.lLastY || mouse.usButtonFlags)) {
       const auto path = Utf8(DevicePath(raw.header.hDevice));
       if (!path.empty()) {
@@ -488,7 +579,7 @@ void InputBridge::ReadInput(HRAWINPUT handle) {
     if (relative && shakes_[raw.header.hDevice].Add(mouse.lLastX, mouse.lLastY, now)) {
       Stop("shake"); return;
     }
-    if (raw.header.hDevice != mouse_) { ++ignored_; return; }
+    if (!background_capture_ && raw.header.hDevice != mouse_) { ++ignored_; return; }
     if (relative && (mouse.lLastX || mouse.lLastY)) {
       ++moves_;
       x_ = shared_input::MovePointer(x_, mouse.lLastX, speed_, 600.0);
@@ -496,6 +587,7 @@ void InputBridge::ReadInput(HRAWINPUT handle) {
       total_x_ += mouse.lLastX * speed_;
       total_y_ += mouse.lLastY * speed_;
       ++motion_sequence_;
+      if (background_capture_) edge_return_.Motion(mouse.lLastX, motion_sequence_, now);
     }
     if (mouse.usButtonFlags) ++buttons_;
     for (int button = 0; button < 5; ++button) {
@@ -514,6 +606,28 @@ void InputBridge::ReadInput(HRAWINPUT handle) {
           {Value("horizontal"), Value((mouse.usButtonFlags & RI_MOUSE_HWHEEL) != 0)}});
     }
   }
+}
+
+InputBridge::Map InputBridge::EdgeState() const {
+  POINT point{}; GetCursorPos(&point);
+  const auto bounds = PrimaryBounds();
+  const double fraction = shared_input::EdgeFraction(point.y, bounds.top, bounds.bottom - bounds.top);
+  return {{Value("atEdge"), Value(point.x >= bounds.right - 1 && point.x < bounds.right &&
+      point.y >= bounds.top && point.y < bounds.bottom)}, {Value("entryY"), Value(fraction)},
+      {Value("ready"), Value(background_.Observed() && !background_.HasHeld() && !AnyHeld())}};
+}
+
+void InputBridge::RemotePointer(const Map& data) {
+  const double x = NumberArg(data, "x", NAN), y = NumberArg(data, "y", NAN);
+  const double left = NumberArg(data, "left", NAN), top = NumberArg(data, "top", NAN);
+  const double width = NumberArg(data, "width", NAN), height = NumberArg(data, "height", NAN);
+  if (!std::isfinite(x) || !std::isfinite(y) || !std::isfinite(left) || !std::isfinite(top) ||
+      !std::isfinite(width) || !std::isfinite(height) || width <= 1 || height <= 1) return;
+  return_fraction_ = shared_input::EdgeFraction(y, top, height);
+  pointer_received_ = GetTickCount64();
+  if (active_ && background_capture_ && edge_return_.Return(x, y, left, top, width, height,
+      static_cast<int64_t>(NumberArg(data, "sequence", -1)),
+      !held_keys_.empty() || !held_buttons_.empty() || background_.HasHeld(), GetTickCount64())) Stop("edge");
 }
 
 InputBridge::Map InputBridge::Stats() const {
@@ -555,15 +669,18 @@ std::optional<LRESULT> InputBridge::HandleMessage(UINT message, WPARAM wparam, L
       Emit("devicesChanged");
       return 0;
     case WM_ACTIVATEAPP:
-      if (!wparam) { Stop("focus_lost"); CancelSetup(); physical_keys_.clear(); }
+      if (!wparam) { if (!background_capture_) Stop("focus_lost"); CancelSetup(); physical_keys_.clear(); }
       break;
     case WM_ACTIVATE:
-      if (LOWORD(wparam) == WA_INACTIVE) { Stop("focus_lost"); CancelSetup(); }
+      if (LOWORD(wparam) == WA_INACTIVE) { if (!background_capture_) Stop("focus_lost"); CancelSetup(); }
       break;
     case WM_ENTERSIZEMOVE:
     case WM_SIZE:
     case WM_MOVE:
     case WM_DPICHANGED:
+      if (!background_capture_) Stop("window_changed");
+      break;
+    case WM_DISPLAYCHANGE:
       Stop("window_changed");
       break;
     case WM_CLOSE:
@@ -577,15 +694,31 @@ std::optional<LRESULT> InputBridge::HandleMessage(UINT message, WPARAM wparam, L
       if (wparam == kStatsTimer) {
         if ((recording_ || !identifying_.empty()) && GetTickCount64() - setup_since_ >= 10000) CancelSetup();
         if (active_) {
-          if (GetForegroundWindow() != owner_ || GetFocus() != capture_) Stop("focus_lost");
+          if (background_capture_ && !background_.Blocking()) Stop("hook_lost");
+          else if (!background_capture_ && (GetForegroundWindow() != owner_ || GetFocus() != capture_)) Stop("focus_lost");
           else Emit("stats", Stats());
         }
         return 0;
       }
       break;
+    case kBackgroundStopMessage:
+      if (active_ && background_capture_ && !background_.Blocking()) Stop("shortcut");
+      return 0;
+    case kBackgroundKeyMessage: {
+      if (!edge_enabled_) return 0;
+      RAWINPUT input{};
+      input.header.dwType = RIM_TYPEKEYBOARD;
+      input.header.hDevice = reinterpret_cast<HANDLE>(1);
+      input.data.keyboard.VKey = static_cast<USHORT>(wparam);
+      input.data.keyboard.MakeCode = static_cast<USHORT>(lparam & 0xff);
+      input.data.keyboard.Flags = static_cast<USHORT>(((lparam & 0x100) ? RI_KEY_E0 : 0) |
+          ((lparam & 0x200) ? 0 : RI_KEY_BREAK));
+      ProcessInput(input, sizeof(input));
+      return 0;
+    }
     case kWatchdogMessage:
       if (static_cast<unsigned>(lparam) == generation_.load()) {
-        Stop(wparam == 1 ? "timeout" : "heartbeat");
+        Stop(wparam == 1 ? "timeout" : wparam == 3 ? "pointer_timeout" : "heartbeat");
       }
       return 0;
     case kRestoreFocusMessage:
@@ -640,6 +773,11 @@ void InputBridge::Watchdog() {
     if (!armed_) continue;
     const auto now = GetTickCount64();
     const auto heartbeat = heartbeat_.load();
+    if (background_.Blocking() && now - pointer_received_.load() >= 1000) {
+      ReleaseInputCapture();
+      PostMessage(owner_, kWatchdogMessage, 3, generation_.load());
+      continue;
+    }
     const auto expiry = remote_capture_
         ? (now >= heartbeat && now - heartbeat >= shared_input::kHeartbeatLimitMs
             ? shared_input::Expiry::heartbeat : shared_input::Expiry::none)
@@ -654,6 +792,7 @@ void InputBridge::Watchdog() {
 }
 
 void InputBridge::ReleaseInputCapture() {
+  background_.Release();
   if (armed_.exchange(false)) {
     RECT current{};
     if (GetClipCursor(&current) && EqualRect(&current, &owned_clip_)) ClipCursor(nullptr);

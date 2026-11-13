@@ -72,6 +72,7 @@ class _InputPageState extends State<InputPage>
   bool _readingPointer = false;
   bool _spaceArmed = false, _windowActive = true;
   int _shortcutGeneration = 0;
+  int _edgeGeneration = 0;
   int _frameGeneration = 0;
   double _speed = Sensitivity.defaultValue, _step = 0.0001;
   String _status = '';
@@ -84,8 +85,7 @@ class _InputPageState extends State<InputPage>
       !_active &&
       !_recording &&
       _identify == null &&
-      _keyboard != null &&
-      _mouse != null &&
+      (_settings.edgeSwitchEnabled || (_keyboard != null && _mouse != null)) &&
       _shortcut != null &&
       _speedError == null;
 
@@ -99,8 +99,16 @@ class _InputPageState extends State<InputPage>
     FocusManager.instance.addEarlyKeyEventHandler(_onSpace);
     _preferences = SettingsRepository(widget.store ?? MemorySettingsStore());
     _lan.addListener(_connectionChanged);
-    _lan.onBegin = (capture) =>
-        _channel.invokeMethod<void>('receiverBegin', {'capture': capture});
+    _lan.onBeginWithOptions = (capture, options) => _channel.invokeMethod<void>(
+      'receiverBegin',
+      {'capture': capture, ...options},
+    );
+    if (defaultTargetPlatform == TargetPlatform.macOS) {
+      _lan.onPointerInfo = () =>
+          _channel.invokeMapMethod<String, dynamic>('receiverPointer');
+    }
+    _lan.onPointerFeedback = (pointer) =>
+        _channel.invokeMethod<void>('remotePointer', pointer);
     _lan.onInput = (capture, frames) => _channel.invokeMethod<void>(
       'receiverInput',
       {'capture': capture, 'frames': frames},
@@ -110,6 +118,7 @@ class _InputPageState extends State<InputPage>
         _channel.invokeMapMethod<String, dynamic>('receiverDiagnostics');
     _lan.onEnd = () => _channel.invokeMethod<void>('receiverStop');
     _lan.onConnectionLost = () {
+      ++_edgeGeneration;
       if (mounted && _active) {
         unawaited(
           _channel.invokeMethod<void>('stop').catchError((Object _) {}),
@@ -193,6 +202,7 @@ class _InputPageState extends State<InputPage>
             _settings.shortcut!.toJson(),
           );
         }
+        await _configureEdge();
       }
       if (mounted) setState(() => _ready = true);
       await _saveSettings();
@@ -255,6 +265,10 @@ class _InputPageState extends State<InputPage>
     if (!mounted) return;
     final data = Map<String, dynamic>.from(call.arguments as Map? ?? {});
     switch (call.method) {
+      case 'edgeEnter':
+        if (_settings.edgeSwitchEnabled && _canStart) {
+          unawaited(_beginEdge(triggered: true));
+        }
       case 'shortcut':
         setState(() {
           _shortcut = data['label'] as String;
@@ -294,6 +308,7 @@ class _InputPageState extends State<InputPage>
       case 'inputFrame':
         _lan.sendInput(data);
       case 'stopped':
+        ++_edgeGeneration;
         unawaited(_lan.endCapture());
         ++_frameGeneration;
         _frames.stop();
@@ -312,6 +327,9 @@ class _InputPageState extends State<InputPage>
   }
 
   String _reason(String value) => switch (value) {
+    'edge' => '已从 Mac 左边缘切回 Windows。',
+    'pointer_timeout' => 'Mac 指针反馈中断，已恢复 Windows 输入。',
+    'hook_lost' => '后台输入拦截中断，已恢复 Windows 输入。',
     'shortcut' => '已通过快捷键退出。',
     'shake' => '已通过晃动鼠标退出。',
     'focus_lost' => '窗口失焦，已退出。',
@@ -395,6 +413,10 @@ class _InputPageState extends State<InputPage>
   }
 
   Future<void> _connectAndStart() async {
+    if (_settings.edgeSwitchEnabled) {
+      await _beginEdge();
+      return;
+    }
     if (!_canStart) return;
     final generation = _shortcutGeneration;
     bool allowed() =>
@@ -409,15 +431,65 @@ class _InputPageState extends State<InputPage>
     });
   }
 
-  Future<void> _start() => _perform(_startCapture);
+  Future<void> _configureEdge() async {
+    if (_captureSupported) {
+      await _channel.invokeMethod<void>('configureEdge', {
+        'enabled': !_receiving && _settings.edgeSwitchEnabled,
+      });
+    }
+  }
 
-  Future<void> _startCapture({bool Function()? allowed}) async {
-    FocusManager.instance.primaryFocus?.unfocus();
+  Future<void> _setEdge(bool enabled) => _perform(() async {
+    ++_edgeGeneration;
+    await _channel.invokeMethod<void>('configureEdge', {'enabled': enabled});
+    if (!mounted) return;
+    setState(() => _settings.edgeSwitchEnabled = enabled);
+    await _saveSettings();
+  });
+
+  Future<void> _beginEdge({bool triggered = false}) async {
+    if (!_canStart || !_settings.edgeSwitchEnabled) return;
+    final generation = _edgeGeneration;
+    bool allowed() =>
+        mounted &&
+        generation == _edgeGeneration &&
+        _settings.edgeSwitchEnabled &&
+        _configuredForControl &&
+        _lan.connected;
+    await _perform(() async {
+      if (!_lan.connected) await _changeConnection();
+      if (!allowed()) return;
+      if (!_lan.supportsEdge) throw StateError('请更新 Mac 被控端以支持边缘切换。');
+      final state =
+          await _channel.invokeMapMethod<String, dynamic>('edgeState') ?? {};
+      if (state['ready'] != true) {
+        throw StateError('后台输入拦截未就绪，请松开按键并移动鼠标后重试。');
+      }
+      if (!allowed() || (triggered && state['atEdge'] != true)) return;
+      await _startCapture(
+        allowed: allowed,
+        background: true,
+        edgeTriggered: triggered,
+        entryY: (state['entryY'] as num? ?? 0.5).toDouble(),
+      );
+    });
+  }
+
+  Future<void> _start() =>
+      _settings.edgeSwitchEnabled ? _beginEdge() : _perform(_startCapture);
+
+  Future<void> _startCapture({
+    bool Function()? allowed,
+    bool background = false,
+    bool edgeTriggered = false,
+    double entryY = 0.5,
+  }) async {
+    if (!background) FocusManager.instance.primaryFocus?.unfocus();
     await _saveSettings();
     await _preferences.flush();
     if (allowed != null && !allowed()) return;
     if (_lan.connected) {
-      await _lan.beginCapture();
+      await _lan.beginCapture(edgeEntryY: background ? entryY : null);
     }
     if (allowed != null && !allowed()) {
       await _lan.endCapture();
@@ -430,6 +502,8 @@ class _InputPageState extends State<InputPage>
         'speed': _speed,
         'remote': _lan.capturing,
         'sendHz': _settings.sendHz,
+        'background': background,
+        'edgeTriggered': edgeTriggered,
       });
     } catch (_) {
       await _lan.endCapture();
@@ -481,6 +555,7 @@ class _InputPageState extends State<InputPage>
   }
 
   Future<void> _switchRole(int index) => _perform(() async {
+    ++_edgeGeneration;
     if (_active) await _channel.invokeMethod<void>('stop');
     await _lan.endCapture();
     await _lan.close();
@@ -493,6 +568,7 @@ class _InputPageState extends State<InputPage>
       _status = '';
     });
     await _saveSettings();
+    await _configureEdge();
   });
   Future<void> _connect() => _perform(_changeConnection);
 
@@ -620,6 +696,18 @@ class _InputPageState extends State<InputPage>
   Widget _controllerSettings(bool canStart) => Column(
     crossAxisAlignment: CrossAxisAlignment.start,
     children: [
+      if (_captureSupported)
+        SwitchListTile(
+          key: const Key('edge-switch'),
+          contentPadding: EdgeInsets.zero,
+          title: const Text('屏幕边缘切换'),
+          subtitle: const Text(
+            'Win 主屏右侧 → Mac 主屏左侧\n全部键鼠一起切换，可在后台运行',
+            style: TextStyle(fontSize: 11),
+          ),
+          value: _settings.edgeSwitchEnabled,
+          onChanged: _ready && !_busy && !_active ? _setEdge : null,
+        ),
       if (!_captureSupported)
         const Padding(
           padding: EdgeInsets.only(bottom: 14),
@@ -628,25 +716,27 @@ class _InputPageState extends State<InputPage>
             style: TextStyle(fontSize: 12),
           ),
         ),
-      Row(
-        children: [
-          const Expanded(
-            child: Text('设备', style: TextStyle(fontWeight: FontWeight.w600)),
-          ),
-          IconButton(
-            onPressed: _ready && !_active && !_busy
-                ? () => _perform(_refresh)
-                : null,
-            tooltip: '刷新设备',
-            icon: const Icon(Icons.refresh, size: 19),
-            visualDensity: VisualDensity.compact,
-          ),
-        ],
-      ),
-      const SizedBox(height: 10),
-      _devicePicker('keyboard', '键盘', _keyboard),
-      const SizedBox(height: 12),
-      _devicePicker('mouse', '鼠标', _mouse),
+      if (!_settings.edgeSwitchEnabled) ...[
+        Row(
+          children: [
+            const Expanded(
+              child: Text('设备', style: TextStyle(fontWeight: FontWeight.w600)),
+            ),
+            IconButton(
+              onPressed: _ready && !_active && !_busy
+                  ? () => _perform(_refresh)
+                  : null,
+              tooltip: '刷新设备',
+              icon: const Icon(Icons.refresh, size: 19),
+              visualDensity: VisualDensity.compact,
+            ),
+          ],
+        ),
+        const SizedBox(height: 10),
+        _devicePicker('keyboard', '键盘', _keyboard),
+        const SizedBox(height: 12),
+        _devicePicker('mouse', '鼠标', _mouse),
+      ],
       const SizedBox(height: 25),
       const Text('退出快捷键', style: TextStyle(fontWeight: FontWeight.w600)),
       const SizedBox(height: 10),
