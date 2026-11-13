@@ -1,5 +1,6 @@
 #include "input_bridge.h"
 #include "pointer_motion.h"
+#include "keyboard_capture.h"
 
 #include <cfgmgr32.h>
 #include <setupapi.h>
@@ -140,7 +141,7 @@ InputBridge::~InputBridge() {
 
 bool InputBridge::Initialize() {
   if (initialized_) return true;
-  // Foreground only: deliberately no INPUTSINK, hooks or RegisterHotKey.
+  // Foreground only. NOHOTKEYS is enabled only during an explicit capture.
   RAWINPUTDEVICE devices[] = {{0x01, 0x06, RIDEV_DEVNOTIFY, owner_},
                               {0x01, 0x02, RIDEV_DEVNOTIFY, owner_}};
   if (!RegisterRawInputDevices(devices, 2, sizeof(RAWINPUTDEVICE))) return false;
@@ -342,18 +343,22 @@ void InputBridge::Start(const Map& args, std::unique_ptr<Result> result) {
   ClientToScreen(owner_, &center);
   RECT clip{center.x, center.y, center.x + 1, center.y + 1};
   bool clipped = false;
+  bool keyboard_ready = false;
   {
     std::lock_guard<std::mutex> lock(cursor_lease_);
     ++generation_;
     heartbeat_ = started_;
     watch_started_ = started_;
     owned_clip_ = clip;
-    clipped = ClipCursor(&clip) != FALSE;
+    keyboard_ready = shared_input::RegisterKeyboard(owner_, true);
+    keyboard_captured_ = keyboard_ready;
+    clipped = keyboard_ready && ClipCursor(&clip) != FALSE;
     armed_ = clipped;
   }
   if (!clipped) {
     Stop("manual", false);
-    result->Error("clip_failed", "鼠标限制失败，已取消开始并释放鼠标。");
+    if (!keyboard_ready) result->Error("keyboard_capture_failed", "无法接管 Windows 快捷键，已取消控制。");
+    else result->Error("clip_failed", "鼠标限制失败，已取消开始并释放鼠标。");
     return;
   }
   SetCursor(nullptr);
@@ -375,7 +380,7 @@ void InputBridge::Stop(const std::string& reason, bool notify) {
   // Release first; neither Dart nor a channel response is needed for cleanup.
   {
     std::lock_guard<std::mutex> lock(cursor_lease_);
-    ReleaseCursorIfOwned();
+    ReleaseInputCapture();
   }
   active_ = false;
   if (was_active && remote_capture_) FlushStream();
@@ -453,11 +458,12 @@ void InputBridge::ReadInput(HRAWINPUT handle) {
     if (!up && MatchesShortcut(key)) { Stop("shortcut"); return; }
     if (raw.header.hDevice != keyboard_) { ++ignored_; return; }
     ++keys_;
-    const int physical_id = keyboard.MakeCode | ((keyboard.Flags & (RI_KEY_E0 | RI_KEY_E1)) << 16);
+    const auto scan = shared_input::NormalizeKeyboardScanCode(keyboard);
+    const int physical_id = scan.HeldId() | ((keyboard.Flags & RI_KEY_E1) << 16);
     const bool repeat = !up && held_keys_.count(physical_id) != 0;
     if (up) held_keys_.erase(physical_id); else held_keys_.insert(physical_id);
-    QueueInput({{Value("kind"), Value("key")}, {Value("code"), Value(static_cast<int>(keyboard.MakeCode))},
-        {Value("extended"), Value((keyboard.Flags & RI_KEY_E0) != 0)},
+    QueueInput({{Value("kind"), Value("key")}, {Value("code"), Value(static_cast<int>(scan.code))},
+        {Value("extended"), Value(scan.extended)},
         {Value("down"), Value(!up)}, {Value("repeat"), Value(repeat)}});
   } else if (raw.header.dwType == RIM_TYPEMOUSE && bytes >= sizeof(RAWINPUTHEADER) + sizeof(RAWMOUSE)) {
     const auto& mouse = raw.data.mouse;
@@ -631,17 +637,25 @@ void InputBridge::Watchdog() {
     if (expiry == shared_input::Expiry::none) continue;
     // This thread releases confinement even if Flutter/the platform loop stalls.
     // Session generations prevent a queued old timeout stopping a new session.
-    ReleaseCursorIfOwned();
+    ReleaseInputCapture();
     PostMessage(owner_, kWatchdogMessage,
         expiry == shared_input::Expiry::timeout ? 1 : 2, generation_.load());
   }
 }
 
-void InputBridge::ReleaseCursorIfOwned() {
-  if (!armed_.exchange(false)) return;
-  RECT current{};
-  if (GetClipCursor(&current) && EqualRect(&current, &owned_clip_)) {
-    ClipCursor(nullptr);
+void InputBridge::ReleaseInputCapture() {
+  if (armed_.exchange(false)) {
+    RECT current{};
+    if (GetClipCursor(&current) && EqualRect(&current, &owned_clip_)) ClipCursor(nullptr);
+  }
+  if (keyboard_captured_) {
+    if (!shared_input::RegisterKeyboard(owner_, false)) {
+      // If the owner window is already gone, remove this process's registration
+      // altogether rather than leave a captured keyboard configuration behind.
+      RAWINPUTDEVICE remove{0x01, 0x06, RIDEV_REMOVE, nullptr};
+      RegisterRawInputDevices(&remove, 1, sizeof(remove));
+    }
+    keyboard_captured_ = false;
   }
 }
 

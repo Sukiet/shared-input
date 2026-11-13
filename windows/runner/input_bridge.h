@@ -43,8 +43,8 @@ class InputBridge {
   bool Down(int key) const;
   bool MatchesShortcut(int key) const;
   void Watchdog();
-  // Requires cursor_lease_; do not clear confinement installed by another app.
-  void ReleaseCursorIfOwned();
+  // Requires cursor_lease_; also restores this process's keyboard registration.
+  void ReleaseInputCapture();
   static void CALLBACK StreamTick(UINT, UINT, DWORD_PTR user, DWORD_PTR, DWORD_PTR);
   void FlushStream();
   void QueueInput(Map event);
@@ -68,6 +68,7 @@ class InputBridge {
   std::atomic<unsigned> generation_{0};
   std::mutex cursor_lease_;
   RECT owned_clip_{};
+  bool keyboard_captured_ = false;
   std::thread watchdog_;
   RemoteReceiver receiver_;
   UINT stream_timer_ = 0;
