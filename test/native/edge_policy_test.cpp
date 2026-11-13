@@ -26,4 +26,24 @@ int main() {
   Check(shared_input::EdgeFraction(500, 0, 1001) == 0.5, "normalize vertical placement");
   Check(shared_input::EdgeFraction(-50, 0, 1001) == 0, "clamp negative coordinates");
   std::cout << "Edge return policy passed.\n";
+  for (const auto side : {shared_input::ScreenEdge::left, shared_input::ScreenEdge::right,
+      shared_input::ScreenEdge::top, shared_input::ScreenEdge::bottom}) {
+    shared_input::ScreenLayout layout;
+    layout.side = side; layout.controller_width = 340; layout.controller_height = 220;
+    layout.remote_width = 280; layout.remote_height = 180; layout.offset = 25;
+    Check(layout.Valid(), "offset physical layout is valid");
+    double remote = 0, local = 0;
+    const double fraction = (25 + layout.RemoteSpan() * 0.4) / layout.ControllerSpan();
+    Check(layout.ToRemote(fraction, remote) && std::abs(remote - 0.4) < 1e-9, "physical entry mapping");
+    Check(layout.ToController(remote, local) && std::abs(local - fraction) < 1e-9, "physical return mapping");
+    Check(!layout.ToRemote(0, remote), "unshared edge does not switch");
+    shared_input::EdgeReturnPolicy vertical;
+    vertical.Begin(1000, side);
+    int dx = side == shared_input::ScreenEdge::left ? -10 : side == shared_input::ScreenEdge::right ? 10 : 0;
+    int dy = side == shared_input::ScreenEdge::top ? -10 : side == shared_input::ScreenEdge::bottom ? 10 : 0;
+    vertical.Motion(dx, 1, 1300, dy);
+    const double x = side == shared_input::ScreenEdge::left ? 0 : side == shared_input::ScreenEdge::right ? 999 : 500;
+    const double y = side == shared_input::ScreenEdge::top ? 0 : side == shared_input::ScreenEdge::bottom ? 799 : 400;
+    Check(vertical.Return(x, y, 0, 0, 1000, 800, 1, false, 1350), "return on configured edge");
+  }
 }

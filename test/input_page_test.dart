@@ -365,6 +365,35 @@ void main() {
     },
   );
 
+  windowsTest('display arrangement drags and persists sizes', (tester) async {
+    final store = MemorySettingsStore();
+    await open(tester, store: store);
+    await tester.tap(find.byKey(const Key('display-layout-settings')));
+    await tester.pumpAndSettle();
+    final local = tester.getRect(find.byKey(const Key('controller-screen')));
+    final remote = tester.getRect(find.byKey(const Key('remote-screen')));
+    expect(local.width, greaterThan(remote.width));
+    await tester.drag(
+      find.byKey(const Key('remote-screen')),
+      Offset(local.left - remote.right - 50, 0),
+    );
+    await tester.pumpAndSettle();
+    expect(find.textContaining('Mac 在左侧'), findsOneWidget);
+    await tester.enterText(find.byKey(const Key('remote-inches')), '14.2');
+    await tester.tap(find.byKey(const Key('save-display-layout')));
+    await tester.pumpAndSettle();
+    final layout = jsonDecode(store.value!)['displayLayout'] as Map;
+    expect(layout['side'], 'left');
+    expect(layout['remoteInches'], 14.2);
+    await tester.pumpWidget(const SizedBox());
+    await open(tester, width: 420, store: store);
+    await tester.tap(find.byKey(const Key('display-layout-settings')));
+    await tester.pumpAndSettle();
+    expect(find.textContaining('Mac 在左侧'), findsOneWidget);
+    expect(tester.takeException(), isNull);
+    await tester.pumpWidget(const SizedBox());
+  });
+
   windowsTest('compact window scrolls without overflow', (tester) async {
     await open(tester, width: 420);
     expect(tester.takeException(), isNull);

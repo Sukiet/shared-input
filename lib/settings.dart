@@ -3,6 +3,7 @@ import 'dart:math';
 import 'package:shared_preferences/shared_preferences.dart';
 import 'sensitivity.dart';
 import 'scroll_speed.dart';
+import 'display_layout.dart';
 
 enum InputRole { controller, receiver }
 
@@ -51,6 +52,7 @@ class AppSettings {
   int smoothingLeewayUs = 500;
   bool statisticsExpanded = false;
   bool edgeSwitchEnabled = false;
+  DisplayLayout displayLayout = const DisplayLayout();
 
   Map<String, dynamic> get smoothingOptions => {
     'enabled': smoothingEnabled,
@@ -79,6 +81,7 @@ class AppSettings {
     'smoothingLeewayUs': smoothingLeewayUs,
     'statisticsExpanded': statisticsExpanded,
     'edgeSwitchEnabled': edgeSwitchEnabled,
+    'displayLayout': displayLayout.toJson(),
   };
 
   static AppSettings fromJson(Map<String, dynamic> json) {
@@ -116,6 +119,7 @@ class AppSettings {
     }
     result.statisticsExpanded = json['statisticsExpanded'] == true;
     result.edgeSwitchEnabled = json['edgeSwitchEnabled'] == true;
+    result.displayLayout = DisplayLayout.fromJson(json['displayLayout']);
     if (json['smoothingEnabled'] is bool) {
       result.smoothingEnabled = json['smoothingEnabled'] as bool;
     }

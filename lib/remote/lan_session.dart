@@ -90,6 +90,8 @@ class LanSession extends ChangeNotifier {
   Future<Map<String, dynamic>?> Function()? onPointerInfo;
   Future<void> Function(Map<String, dynamic> pointer)? onPointerFeedback;
   bool supportsEdge = false;
+  bool supportsLayout = false;
+  Map<String, dynamic>? remoteDisplay;
   bool _edgeCapture = false, _pollingPointer = false;
   Timer? _pointerTimer;
   Future<void> Function(String capture, List<Map<String, dynamic>> frames)?
@@ -132,6 +134,22 @@ class LanSession extends ChangeNotifier {
     if (!_disposed) notifyListeners();
   }
 
+  static Map<String, dynamic>? _displayInfo(dynamic value) {
+    if (value is! Map) return null;
+    final width = value['width'], height = value['height'];
+    if (width is! num ||
+        height is! num ||
+        !width.isFinite ||
+        !height.isFinite ||
+        width <= 1 ||
+        height <= 1 ||
+        width > 100000 ||
+        height > 100000) {
+      return null;
+    }
+    return {'width': width.toDouble(), 'height': height.toDouble()};
+  }
+
   Future<void> listen({
     required int port,
     required String key,
@@ -164,6 +182,12 @@ class LanSession extends ChangeNotifier {
           if (udpPort <= 0 || udpPort > 65535) {
             throw const FormatException('Invalid UDP port');
           }
+          Map<String, dynamic>? display;
+          try {
+            display = _displayInfo(await onPointerInfo?.call());
+          } catch (_) {
+            /* Optional metadata. */
+          }
           await wire.raw(
             await sealHandshake({
               'type': 'helloAck',
@@ -171,7 +195,12 @@ class LanSession extends ChangeNotifier {
               'clientNonce': hello['nonce'],
               'nonce': base64Encode(serverNonce),
               'udpPort': _udp!.port,
-              'capabilities': [if (onPointerInfo != null) 'edge-pointer-v1'],
+              'capabilities': [
+                if (onPointerInfo != null) 'edge-pointer-v1',
+                if (display != null && onBeginWithOptions != null)
+                  'edge-layout-v1',
+              ],
+              ...?(display == null ? null : {'display': display}),
             }, master),
           );
           final keys = await SessionKeys.derive(
@@ -253,6 +282,10 @@ class LanSession extends ChangeNotifier {
       }
       supportsEdge =
           (ack['capabilities'] as List?)?.contains('edge-pointer-v1') == true;
+      remoteDisplay = _displayInfo(ack['display']);
+      supportsLayout =
+          remoteDisplay != null &&
+          (ack['capabilities'] as List?)?.contains('edge-layout-v1') == true;
       final keys = await SessionKeys.derive(
         master,
         clientNonce,
@@ -356,6 +389,12 @@ class LanSession extends ChangeNotifier {
                 json['options'] as Map? ?? {},
               );
               final entry = options['edgeEntryY'];
+              final side = options['edgeEntrySide'] ?? 'left';
+              if (!['left', 'right', 'top', 'bottom'].contains(side) ||
+                  (entry == null && options.containsKey('edgeEntrySide')) ||
+                  (side != 'left' && onBeginWithOptions == null)) {
+                throw const FormatException('被控端不支持此显示屏布局。');
+              }
               if (entry != null &&
                   (entry is! num ||
                       !entry.isFinite ||
@@ -459,7 +498,10 @@ class LanSession extends ChangeNotifier {
     }
   }
 
-  Future<void> beginCapture({double? edgeEntryY}) async {
+  Future<void> beginCapture({
+    double? edgeEntryY,
+    String edgeEntrySide = 'left',
+  }) async {
     if (!connected || _receiver) throw StateError('请先连接被控端。');
     if (edgeEntryY != null &&
         (!supportsEdge ||
@@ -467,6 +509,10 @@ class LanSession extends ChangeNotifier {
             edgeEntryY < 0 ||
             edgeEntryY > 1)) {
       throw StateError('请更新 Mac 被控端以支持边缘切换。');
+    }
+    if (!['left', 'right', 'top', 'bottom'].contains(edgeEntrySide) ||
+        (edgeEntrySide != 'left' && (edgeEntryY == null || !supportsLayout))) {
+      throw StateError('请更新 Mac 被控端以支持此显示屏布局。');
     }
     await endCapture();
     _capture = randomHex();
@@ -477,7 +523,11 @@ class LanSession extends ChangeNotifier {
       final sent = _wire!.send({
         'type': 'begin',
         'capture': _capture,
-        if (edgeEntryY != null) 'options': {'edgeEntryY': edgeEntryY},
+        if (edgeEntryY != null)
+          'options': {
+            'edgeEntryY': edgeEntryY,
+            if (edgeEntrySide != 'left') 'edgeEntrySide': edgeEntrySide,
+          },
       });
       await Future.wait([sent, ack.future.timeout(const Duration(seconds: 4))]);
     } catch (_) {
@@ -704,6 +754,8 @@ class LanSession extends ChangeNotifier {
     if (_closing) return;
     _closing = true;
     supportsEdge = false;
+    supportsLayout = false;
+    remoteDisplay = null;
     diagnostics.stop();
     ++_generation;
     _heartbeat?.cancel();

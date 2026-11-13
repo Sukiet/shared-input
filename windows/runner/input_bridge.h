@@ -39,6 +39,7 @@ class InputBridge {
   void ReadInput(HRAWINPUT input);
   void ProcessInput(const RAWINPUT& input, UINT bytes);
   Map EdgeState() const;
+  bool ConfigureLayout(const Map& options);
   void RemotePointer(const Map& data);
   void Start(const Map& args, std::unique_ptr<Result> result);
   void Stop(const std::string& reason, bool notify = true);
@@ -79,6 +80,7 @@ class InputBridge {
   double return_fraction_ = 0.5;
   shared_input::BackgroundHooks background_;
   shared_input::EdgeReturnPolicy edge_return_;
+  shared_input::ScreenLayout display_layout_;
   std::atomic<uint64_t> pointer_received_{0};
   std::thread watchdog_;
   RemoteReceiver receiver_;

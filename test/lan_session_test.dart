@@ -166,6 +166,8 @@ void main() {
       };
       await connect();
       expect(controller.supportsEdge, isTrue);
+      expect(controller.supportsLayout, isTrue);
+      expect(controller.remoteDisplay, {'width': 1920.0, 'height': 1080.0});
       await controller.beginCapture(edgeEntryY: 0.5);
       await eventually(() => feedback != null);
       expect(entry, {'edgeEntryY': 0.5});
@@ -176,6 +178,37 @@ void main() {
       final stoppedPolls = polls;
       await Future<void>.delayed(const Duration(milliseconds: 60));
       expect(polls, stoppedPolls);
+      for (final side in ['right', 'top', 'bottom']) {
+        await controller.beginCapture(edgeEntryY: 0.25, edgeEntrySide: side);
+        expect(entry, {'edgeEntryY': 0.25, 'edgeEntrySide': side});
+        await controller.endCapture();
+        await eventually(() => !receiver.capturing);
+      }
+      await controller.close();
+      expect(controller.remoteDisplay, isNull);
+      expect(controller.supportsLayout, isFalse);
+    },
+  );
+
+  test(
+    'legacy edge receivers reject unsupported entry sides before capture',
+    () async {
+      var begins = 0;
+      receiver.onBegin = (_) async {
+        ++begins;
+      };
+      receiver.onPointerInfo = () async => {'width': 1920, 'height': 1080};
+      await connect();
+      expect(controller.supportsEdge, isTrue);
+      expect(controller.supportsLayout, isFalse);
+      await expectLater(
+        controller.beginCapture(edgeEntryY: 0.5, edgeEntrySide: 'right'),
+        throwsStateError,
+      );
+      expect(begins, 0);
+      expect(controller.capturing, isFalse);
+      await controller.beginCapture(edgeEntryY: 0.5);
+      expect(begins, 1);
     },
   );
 

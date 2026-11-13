@@ -250,6 +250,12 @@ void InputBridge::OnMethod(const flutter::MethodCall<Value>& call,
     const auto args = call.arguments() ? std::get_if<Map>(call.arguments()) : nullptr;
     const bool enabled = args && BoolArg(*args, "enabled");
     if (active_) Stop("manual");
+    if (args) {
+      if (const auto value = Find(*args, "layout")) {
+        const auto layout = std::get_if<Map>(value);
+        if (!layout || !ConfigureLayout(*layout)) { result->Error("invalid_layout", "显示屏布局无效。"); return; }
+      }
+    }
     if (enabled && !background_.Install(owner_, kBackgroundStopMessage, shortcut_key_, shortcut_shift_)) {
       result->Error("hook_failed", "后台输入拦截初始化失败。"); return;
     }
@@ -263,6 +269,14 @@ void InputBridge::OnMethod(const flutter::MethodCall<Value>& call,
     edge_cooldown_ = GetTickCount64() + 500;
     if (!enabled) background_.Close();
     result->Success();
+  } else if (method == "configureLayout") {
+    const auto args = call.arguments() ? std::get_if<Map>(call.arguments()) : nullptr;
+    if (active_ || !args || !ConfigureLayout(*args)) result->Error("invalid_layout", "请停止控制后设置有效的显示屏布局。");
+    else result->Success();
+  } else if (method == "displayInfo") {
+    const auto bounds = PrimaryBounds();
+    result->Success(Value(Map{{Value("width"), Value(static_cast<int>(bounds.right - bounds.left))},
+      {Value("height"), Value(static_cast<int>(bounds.bottom - bounds.top))}}));
   } else if (method == "edgeState") {
     result->Success(Value(EdgeState()));
   } else if (method == "remotePointer") {
@@ -340,7 +354,7 @@ void InputBridge::Start(const Map& args, std::unique_ptr<Result> result) {
     result->Error("edge_not_ready", "请先启用边缘切换并连接支持此功能的 Mac。"); return;
   }
   if (background && BoolArg(args, "edgeTriggered") && !BoolArg(EdgeState(), "atEdge")) {
-    result->Error("edge_cancelled", "指针已离开右边缘，已取消切换。"); return;
+    result->Error("edge_cancelled", "指针已离开相邻边缘，已取消切换。"); return;
   }
   if (!background && (GetForegroundWindow() != owner_ || IsIconic(owner_))) {
     result->Error("not_foreground", "开始控制前，请先打开并激活本窗口。");
@@ -390,7 +404,8 @@ void InputBridge::Start(const Map& args, std::unique_ptr<Result> result) {
       background_capture_ = false; remote_capture_ = false;
       result->Error("hook_failed", "后台输入拦截未就绪，请移动鼠标或按键后重试。"); return;
     }
-    edge_return_.Begin(started_);
+    edge_return_.Begin(started_, shared_input::OppositeEdge(display_layout_.side));
+    return_fraction_ = NumberArg(EdgeState(), "localPosition", 0.5);
     pointer_received_ = started_;
     active_ = true;
     {
@@ -469,7 +484,14 @@ void InputBridge::Stop(const std::string& reason, bool notify) {
   if (was_background) {
     edge_cooldown_ = GetTickCount64() + 500;
     const auto bounds = PrimaryBounds();
-    SetCursorPos(bounds.right - 24, bounds.top + static_cast<int>(return_fraction_ * (bounds.bottom - bounds.top - 1)));
+    const int along_x = bounds.left + static_cast<int>(return_fraction_ * (bounds.right - bounds.left - 1));
+    const int along_y = bounds.top + static_cast<int>(return_fraction_ * (bounds.bottom - bounds.top - 1));
+    switch (display_layout_.side) {
+      case shared_input::ScreenEdge::right: SetCursorPos(bounds.right - 24, along_y); break;
+      case shared_input::ScreenEdge::left: SetCursorPos(bounds.left + 24, along_y); break;
+      case shared_input::ScreenEdge::top: SetCursorPos(along_x, bounds.top + 24); break;
+      case shared_input::ScreenEdge::bottom: SetCursorPos(along_x, bounds.bottom - 24); break;
+    }
   } else {
     SetCursor(LoadCursor(nullptr, IDC_ARROW));
   // Stop can run inside WM_KILLFOCUS. Defer window visibility/focus changes
@@ -559,7 +581,8 @@ void InputBridge::ProcessInput(const RAWINPUT& raw, UINT bytes) {
     if (background_capture_ && !background_.MouseFresh(now)) { Stop("hook_lost"); return; }
     const auto& mouse = raw.data.mouse;
     if (!active_ && edge_enabled_ && !recording_ && identifying_.empty() &&
-        !(mouse.usFlags & MOUSE_MOVE_ABSOLUTE) && mouse.lLastX > 0 &&
+        !(mouse.usFlags & MOUSE_MOVE_ABSOLUTE) &&
+        shared_input::OutwardMotion(display_layout_.side, mouse.lLastX, mouse.lLastY) > 0 &&
         now >= edge_cooldown_ && now - edge_requested_ >= 1000 && !AnyHeld() &&
         !background_.HasHeld()) {
       auto state = EdgeState();
@@ -587,7 +610,7 @@ void InputBridge::ProcessInput(const RAWINPUT& raw, UINT bytes) {
       total_x_ += mouse.lLastX * speed_;
       total_y_ += mouse.lLastY * speed_;
       ++motion_sequence_;
-      if (background_capture_) edge_return_.Motion(mouse.lLastX, motion_sequence_, now);
+      if (background_capture_) edge_return_.Motion(mouse.lLastX, motion_sequence_, now, mouse.lLastY);
     }
     if (mouse.usButtonFlags) ++buttons_;
     for (int button = 0; button < 5; ++button) {
@@ -611,10 +634,34 @@ void InputBridge::ProcessInput(const RAWINPUT& raw, UINT bytes) {
 InputBridge::Map InputBridge::EdgeState() const {
   POINT point{}; GetCursorPos(&point);
   const auto bounds = PrimaryBounds();
-  const double fraction = shared_input::EdgeFraction(point.y, bounds.top, bounds.bottom - bounds.top);
-  return {{Value("atEdge"), Value(point.x >= bounds.right - 1 && point.x < bounds.right &&
-      point.y >= bounds.top && point.y < bounds.bottom)}, {Value("entryY"), Value(fraction)},
+  const bool horizontal = shared_input::HorizontalEdge(display_layout_.side);
+  const double local = horizontal ? shared_input::EdgeFraction(point.y, bounds.top, bounds.bottom - bounds.top)
+      : shared_input::EdgeFraction(point.x, bounds.left, bounds.right - bounds.left);
+  double remote = 0;
+  const bool overlap = display_layout_.ToRemote(local, remote);
+  return {{Value("atEdge"), Value(overlap && shared_input::OnEdge(display_layout_.side, point.x, point.y,
+      bounds.left, bounds.top, bounds.right - bounds.left, bounds.bottom - bounds.top))},
+      {Value("entryY"), Value(std::clamp(remote, 0.0, 1.0))}, {Value("localPosition"), Value(local)},
+      {Value("entrySide"), Value(shared_input::EdgeName(shared_input::OppositeEdge(display_layout_.side)))},
       {Value("ready"), Value(background_.Observed() && !background_.HasHeld() && !AnyHeld())}};
+}
+
+bool InputBridge::ConfigureLayout(const Map& options) {
+  shared_input::ScreenLayout layout;
+  const auto side = StringArg(options, "side");
+  if (side == "right") layout.side = shared_input::ScreenEdge::right;
+  else if (side == "left") layout.side = shared_input::ScreenEdge::left;
+  else if (side == "top") layout.side = shared_input::ScreenEdge::top;
+  else if (side == "bottom") layout.side = shared_input::ScreenEdge::bottom;
+  else return false;
+  layout.controller_width = NumberArg(options, "controllerWidth", NAN);
+  layout.controller_height = NumberArg(options, "controllerHeight", NAN);
+  layout.remote_width = NumberArg(options, "remoteWidth", NAN);
+  layout.remote_height = NumberArg(options, "remoteHeight", NAN);
+  layout.offset = NumberArg(options, "offset", NAN);
+  if (!layout.Valid()) return false;
+  display_layout_ = layout;
+  return true;
 }
 
 void InputBridge::RemotePointer(const Map& data) {
@@ -623,9 +670,14 @@ void InputBridge::RemotePointer(const Map& data) {
   const double width = NumberArg(data, "width", NAN), height = NumberArg(data, "height", NAN);
   if (!std::isfinite(x) || !std::isfinite(y) || !std::isfinite(left) || !std::isfinite(top) ||
       !std::isfinite(width) || !std::isfinite(height) || width <= 1 || height <= 1) return;
-  return_fraction_ = shared_input::EdgeFraction(y, top, height);
+  const auto remote_side = shared_input::OppositeEdge(display_layout_.side);
+  const double fraction = shared_input::HorizontalEdge(remote_side)
+      ? shared_input::EdgeFraction(y, top, height) : shared_input::EdgeFraction(x, left, width);
+  double local = 0;
+  const bool overlap = display_layout_.ToController(fraction, local);
+  return_fraction_ = std::clamp(local, 0.0, 1.0);
   pointer_received_ = GetTickCount64();
-  if (active_ && background_capture_ && edge_return_.Return(x, y, left, top, width, height,
+  if (active_ && background_capture_ && overlap && edge_return_.Return(x, y, left, top, width, height,
       static_cast<int64_t>(NumberArg(data, "sequence", -1)),
       !held_keys_.empty() || !held_buttons_.empty() || background_.HasHeld(), GetTickCount64())) Stop("edge");
 }

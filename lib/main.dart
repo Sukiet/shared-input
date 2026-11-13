@@ -8,6 +8,8 @@ import 'pointer_preview.dart';
 import 'private_text_field.dart';
 import 'sensitivity.dart';
 import 'scroll_speed.dart';
+import 'display_layout.dart';
+import 'display_layout_dialog.dart';
 import 'settings.dart';
 import 'remote/lan_session.dart';
 
@@ -207,6 +209,7 @@ class _InputPageState extends State<InputPage>
             _settings.shortcut!.toJson(),
           );
         }
+        await _syncDisplayLayout();
         await _configureEdge();
       }
       if (mounted) setState(() => _ready = true);
@@ -332,7 +335,7 @@ class _InputPageState extends State<InputPage>
   }
 
   String _reason(String value) => switch (value) {
-    'edge' => '已从 Mac 左边缘切回 Windows。',
+    'edge' => '已切回 Windows。',
     'pointer_timeout' => 'Mac 指针反馈中断，已恢复 Windows 输入。',
     'hook_lost' => '后台输入拦截中断，已恢复 Windows 输入。',
     'shortcut' => '已通过快捷键退出。',
@@ -440,15 +443,62 @@ class _InputPageState extends State<InputPage>
     if (_captureSupported) {
       await _channel.invokeMethod<void>('configureEdge', {
         'enabled': !_receiving && _settings.edgeSwitchEnabled,
+        'layout': _settings.displayLayout.nativeOptions,
       });
     }
   }
 
   Future<void> _setEdge(bool enabled) => _perform(() async {
     ++_edgeGeneration;
-    await _channel.invokeMethod<void>('configureEdge', {'enabled': enabled});
+    await _channel.invokeMethod<void>('configureEdge', {
+      'enabled': enabled,
+      'layout': _settings.displayLayout.nativeOptions,
+    });
     if (!mounted) return;
     setState(() => _settings.edgeSwitchEnabled = enabled);
+    await _saveSettings();
+  });
+
+  Future<void> _syncDisplayLayout() async {
+    if (!_captureSupported) return;
+    double? aspect(Map<String, dynamic>? info) {
+      final width = info?['width'], height = info?['height'];
+      if (width is! num ||
+          height is! num ||
+          !width.isFinite ||
+          !height.isFinite ||
+          width <= 1 ||
+          height <= 1) {
+        return null;
+      }
+      final ratio = width / height;
+      return ratio >= 0.2 && ratio <= 5 ? ratio : null;
+    }
+
+    final local = await _channel.invokeMapMethod<String, dynamic>(
+      'displayInfo',
+    );
+    if (!mounted) return;
+    final layout = _settings.displayLayout.copyWith(
+      controllerAspect: aspect(local),
+      remoteAspect: aspect(_lan.remoteDisplay),
+    );
+    await _channel.invokeMethod<void>('configureLayout', layout.nativeOptions);
+    if (!mounted) return;
+    setState(() => _settings.displayLayout = layout);
+    await _saveSettings();
+  }
+
+  Future<void> _editDisplayLayout() => _perform(() async {
+    final result = await showDialog<DisplayLayout>(
+      context: context,
+      builder: (_) => DisplayLayoutDialog(layout: _settings.displayLayout),
+    );
+    if (result == null || !mounted) return;
+    await _channel.invokeMethod<void>('configureLayout', result.nativeOptions);
+    if (!mounted) return;
+    ++_edgeGeneration;
+    setState(() => _settings.displayLayout = result);
     await _saveSettings();
   });
 
@@ -476,6 +526,7 @@ class _InputPageState extends State<InputPage>
         background: true,
         edgeTriggered: triggered,
         entryY: (state['entryY'] as num? ?? 0.5).toDouble(),
+        entrySide: state['entrySide'] as String? ?? 'left',
       );
     });
   }
@@ -488,13 +539,17 @@ class _InputPageState extends State<InputPage>
     bool background = false,
     bool edgeTriggered = false,
     double entryY = 0.5,
+    String entrySide = 'left',
   }) async {
     if (!background) FocusManager.instance.primaryFocus?.unfocus();
     await _saveSettings();
     await _preferences.flush();
     if (allowed != null && !allowed()) return;
     if (_lan.connected) {
-      await _lan.beginCapture(edgeEntryY: background ? entryY : null);
+      await _lan.beginCapture(
+        edgeEntryY: background ? entryY : null,
+        edgeEntrySide: entrySide,
+      );
     }
     if (allowed != null && !allowed()) {
       await _lan.endCapture();
@@ -603,6 +658,7 @@ class _InputPageState extends State<InputPage>
         port: port,
         key: _peerKeyText.text,
       );
+      await _syncDisplayLayout();
     }
     if (mounted) setState(() => _status = '');
   }
@@ -708,12 +764,19 @@ class _InputPageState extends State<InputPage>
           key: const Key('edge-switch'),
           contentPadding: EdgeInsets.zero,
           title: const Text('屏幕边缘切换'),
-          subtitle: const Text(
-            'Win 主屏右侧 → Mac 主屏左侧\n全部键鼠一起切换，可在后台运行',
-            style: TextStyle(fontSize: 11),
+          subtitle: Text(
+            'Win 主屏${_settings.displayLayout.side.label} ↔ Mac 主屏${_settings.displayLayout.side.opposite.label}\n全部键鼠一起切换，可在后台运行',
+            style: const TextStyle(fontSize: 11),
           ),
           value: _settings.edgeSwitchEnabled,
           onChanged: _ready && !_busy && !_active ? _setEdge : null,
+        ),
+      if (_captureSupported)
+        TextButton.icon(
+          key: const Key('display-layout-settings'),
+          onPressed: _ready && !_busy && !_active ? _editDisplayLayout : null,
+          icon: const Icon(Icons.settings_outlined, size: 17),
+          label: const Text('显示屏设置'),
         ),
       if (!_captureSupported)
         const Padding(

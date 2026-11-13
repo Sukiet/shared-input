@@ -145,16 +145,31 @@ final class RemoteInputBridge {
       guard CGPreflightPostEventAccess(), let id = args["capture"] as? String, id.count == 32 else {
         result(FlutterError(code: "permission_required", message: "请先在系统设置中允许辅助功能访问。", details: nil)); return
       }
+      let entry = (args["edgeEntryY"] as? NSNumber)?.doubleValue
+      let entrySide = args["edgeEntrySide"] as? String ?? "left"
+      if let entry = entry, !entry.isFinite || !(0...1).contains(entry) ||
+          !["left", "right", "top", "bottom"].contains(entrySide) {
+        result(FlutterError(code: "invalid_layout", message: "显示屏入口无效。", details: nil)); return
+      }
       lock.lock()
       releaseLocked()
       capture = id; sequence = -1; total = .zero
       activity = ProcessInfo.processInfo.beginActivity(options: [.userInitiated, .latencyCritical],
         reason: "Receiving keyboard and mouse input")
       position = CGEvent(source: nil)?.location ?? .zero
-      if let entry = args["edgeEntryY"] as? Double, entry.isFinite, (0...1).contains(entry) {
+      if let entry = entry {
         let bounds = CGDisplayBounds(CGMainDisplayID())
-        emitMotionLocked(CGPoint(x: bounds.minX + min(24, bounds.width / 2),
-          y: bounds.minY + entry * max(0, bounds.height - 1)))
+        let x = bounds.minX + entry * max(0, bounds.width - 1)
+        let y = bounds.minY + entry * max(0, bounds.height - 1)
+        let insetX = min(24, bounds.width / 2), insetY = min(24, bounds.height / 2)
+        let destination: CGPoint
+        switch entrySide {
+        case "right": destination = CGPoint(x: bounds.maxX - 1 - insetX, y: y)
+        case "top": destination = CGPoint(x: x, y: bounds.minY + insetY)
+        case "bottom": destination = CGPoint(x: x, y: bounds.maxY - 1 - insetY)
+        default: destination = CGPoint(x: bounds.minX + insetX, y: y)
+        }
+        emitMotionLocked(destination)
       }
       lastReceived = ProcessInfo.processInfo.systemUptime
       interpolator.reset(position, at: lastReceived)
