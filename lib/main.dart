@@ -87,6 +87,8 @@ class _InputPageState extends State<InputPage>
       {'capture': capture, 'frames': frames},
     );
     _lan.onHeartbeat = () => _channel.invokeMethod<void>('receiverHeartbeat');
+    _lan.diagnostics.native = () =>
+        _channel.invokeMapMethod<String, dynamic>('receiverDiagnostics');
     _lan.onEnd = () => _channel.invokeMethod<void>('receiverStop');
     _lan.onConnectionLost = () {
       if (mounted && _active) {
@@ -158,7 +160,12 @@ class _InputPageState extends State<InputPage>
         setState(() => _status = '输入共享目前支持 Windows 控制端和 Windows / macOS 被控端。');
         return;
       }
-      await _channel.invokeMethod<void>('initialize');
+      await _channel.invokeMethod<void>('initialize', {
+        'diagnostics': const bool.fromEnvironment('INPUT_DIAGNOSTICS'),
+      });
+      if (defaultTargetPlatform == TargetPlatform.macOS) {
+        await _applySmoothing();
+      }
       if (_captureSupported) {
         await _refresh();
         if (_settings.shortcut != null) {
@@ -846,9 +853,161 @@ class _InputPageState extends State<InputPage>
     );
   }
 
+  Future<void> _applySmoothing() => _channel.invokeMethod<void>(
+    'receiverConfigureSmoothing',
+    _settings.smoothingOptions,
+  );
+
+  void _updateSmoothing(VoidCallback change) {
+    setState(change);
+    _persist();
+    unawaited(
+      _applySmoothing().catchError((Object error) {
+        if (mounted) setState(() => _status = '平滑设置应用失败：$error');
+      }),
+    );
+  }
+
+  Widget _smoothingSlider({
+    required String label,
+    required String valueLabel,
+    required String hint,
+    required String id,
+    required int value,
+    required int min,
+    required int max,
+    int step = 1,
+    required ValueChanged<int> onChanged,
+  }) => Column(
+    crossAxisAlignment: CrossAxisAlignment.start,
+    children: [
+      Row(
+        children: [
+          Expanded(child: Text(label)),
+          Text(valueLabel),
+        ],
+      ),
+      Slider(
+        key: Key(id),
+        value: value.toDouble(),
+        min: min.toDouble(),
+        max: max.toDouble(),
+        divisions: (max - min) ~/ step,
+        label: valueLabel,
+        onChanged: _ready && _settings.smoothingEnabled
+            ? (v) => onChanged((v / step).round() * step)
+            : null,
+      ),
+      Text(
+        hint,
+        style: const TextStyle(fontSize: 11, color: Color(0xff929aa6)),
+      ),
+      const SizedBox(height: 14),
+    ],
+  );
+
+  Widget _smoothingSettings() => Container(
+    key: const Key('receiver-smoothing-settings'),
+    padding: const EdgeInsets.all(16),
+    decoration: BoxDecoration(
+      color: const Color(0xff191c21),
+      borderRadius: BorderRadius.circular(12),
+      border: Border.all(color: const Color(0xff343b45)),
+    ),
+    child: Column(
+      crossAxisAlignment: CrossAxisAlignment.start,
+      children: [
+        Row(
+          children: [
+            const Expanded(
+              child: Text(
+                '鼠标平滑设置',
+                style: TextStyle(fontWeight: FontWeight.w600),
+              ),
+            ),
+            TextButton(
+              key: const Key('reset-smoothing'),
+              onPressed: !_ready
+                  ? null
+                  : () => _updateSmoothing(() {
+                      _settings.smoothingEnabled = true;
+                      _settings.smoothingDurationMs = 12;
+                      _settings.smoothingIntervalMs = 4;
+                      _settings.smoothingLeewayUs = 500;
+                    }),
+              child: const Text('恢复默认'),
+            ),
+          ],
+        ),
+        Material(
+          color: Colors.transparent,
+          child: SwitchListTile(
+            key: const Key('smoothing-enabled'),
+            contentPadding: EdgeInsets.zero,
+            title: const Text('启用平滑插值'),
+            subtitle: const Text(
+              '调整立即生效，自动保存；关闭后直接跟随收到的位移。',
+              style: TextStyle(fontSize: 11),
+            ),
+            value: _settings.smoothingEnabled,
+            onChanged: !_ready
+                ? null
+                : (value) => _updateSmoothing(
+                    () => _settings.smoothingEnabled = value,
+                  ),
+          ),
+        ),
+        const SizedBox(height: 12),
+        _smoothingSlider(
+          label: '平滑时长',
+          valueLabel: '${_settings.smoothingDurationMs} ms',
+          hint: '1–100 ms；越大越平滑，跟手延迟也越大。默认 12 ms。',
+          id: 'smoothing-duration',
+          value: _settings.smoothingDurationMs,
+          min: 1,
+          max: 100,
+          onChanged: (v) =>
+              _updateSmoothing(() => _settings.smoothingDurationMs = v),
+        ),
+        _smoothingSlider(
+          label: '更新间隔',
+          valueLabel: '${_settings.smoothingIntervalMs} ms',
+          hint: '1–16 ms；越小更新越频繁、开销越高。默认 4 ms。',
+          id: 'smoothing-interval',
+          value: _settings.smoothingIntervalMs,
+          min: 1,
+          max: 16,
+          onChanged: (v) =>
+              _updateSmoothing(() => _settings.smoothingIntervalMs = v),
+        ),
+        _smoothingSlider(
+          label: '调度容差',
+          valueLabel:
+              '${(_settings.smoothingLeewayUs / 1000).toStringAsFixed(1)} ms',
+          hint: '0–2 ms；允许系统合并定时唤醒的余量，越小越严格。默认 0.5 ms。',
+          id: 'smoothing-leeway',
+          value: _settings.smoothingLeewayUs,
+          min: 0,
+          max: 2000,
+          step: 100,
+          onChanged: (v) =>
+              _updateSmoothing(() => _settings.smoothingLeewayUs = v),
+        ),
+        const Text(
+          '点击和拖拽状态切换前会立即到达目标；停止控制时取消剩余插值。',
+          style: TextStyle(fontSize: 11, color: Color(0xff929aa6)),
+        ),
+      ],
+    ),
+  );
+
   Widget _receiverPanel() => Column(
     crossAxisAlignment: CrossAxisAlignment.start,
     children: [
+      if (defaultTargetPlatform == TargetPlatform.macOS) ...[
+        _smoothingSettings(),
+        const SizedBox(height: 20),
+      ],
       const Text('本机 IP', style: TextStyle(fontWeight: FontWeight.w600)),
       const SizedBox(height: 8),
       SelectableText(_addresses.isEmpty ? '正在读取…' : _addresses.join(' / ')),

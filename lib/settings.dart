@@ -43,7 +43,18 @@ class AppSettings {
   double sensitivity = Sensitivity.defaultValue;
   double step = 0.0001;
   int sendHz = 500;
+  bool smoothingEnabled = true;
+  int smoothingDurationMs = 12;
+  int smoothingIntervalMs = 4;
+  int smoothingLeewayUs = 500;
   bool statisticsExpanded = false;
+
+  Map<String, dynamic> get smoothingOptions => {
+    'enabled': smoothingEnabled,
+    'durationMs': smoothingDurationMs,
+    'intervalMs': smoothingIntervalMs,
+    'leewayUs': smoothingLeewayUs,
+  };
 
   Map<String, dynamic> toJson() => {
     'version': 1,
@@ -58,6 +69,10 @@ class AppSettings {
     'sensitivity': sensitivity,
     'step': step,
     'sendHz': sendHz,
+    'smoothingEnabled': smoothingEnabled,
+    'smoothingDurationMs': smoothingDurationMs,
+    'smoothingIntervalMs': smoothingIntervalMs,
+    'smoothingLeewayUs': smoothingLeewayUs,
     'statisticsExpanded': statisticsExpanded,
   };
 
@@ -93,6 +108,17 @@ class AppSettings {
       result.sendHz = json['sendHz'] as int;
     }
     result.statisticsExpanded = json['statisticsExpanded'] == true;
+    if (json['smoothingEnabled'] is bool) {
+      result.smoothingEnabled = json['smoothingEnabled'] as bool;
+    }
+    int validInt(String key, int min, int max, int fallback) {
+      final value = json[key];
+      return value is int && value >= min && value <= max ? value : fallback;
+    }
+
+    result.smoothingDurationMs = validInt('smoothingDurationMs', 1, 100, 12);
+    result.smoothingIntervalMs = validInt('smoothingIntervalMs', 1, 16, 4);
+    result.smoothingLeewayUs = validInt('smoothingLeewayUs', 0, 2000, 500);
     return result;
   }
 }
