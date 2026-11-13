@@ -4,9 +4,19 @@ import XCTest
 
 class RunnerTests: XCTestCase {
 
-  func testExample() {
-    // If you add code to the Runner application, consider adding tests here.
-    // See https://developer.apple.com/documentation/xctest for more information about using XCTest.
+  func testWindowsKeysMapToCommand() {
+    XCTAssertEqual(windowsToMacKeyCode[0xe05b], 55)
+    XCTAssertEqual(windowsToMacKeyCode[0xe05c], 54)
+  }
+
+  func testControlKeysRemainControl() {
+    XCTAssertEqual(windowsToMacKeyCode[0x001d], 59)
+    XCTAssertEqual(windowsToMacKeyCode[0xe01d], 62)
+  }
+
+  func testAltKeysMapToOption() {
+    XCTAssertEqual(windowsToMacKeyCode[0x0038], 58)
+    XCTAssertEqual(windowsToMacKeyCode[0xe038], 61)
   }
 
 }

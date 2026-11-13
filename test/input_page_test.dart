@@ -1,9 +1,11 @@
 import 'dart:async';
+import 'dart:convert';
 import 'package:flutter/material.dart';
 import 'package:flutter/services.dart';
 import 'package:flutter_test/flutter_test.dart';
 import 'package:shared_input/main.dart';
 import 'package:shared_input/pointer_preview.dart';
+import 'package:shared_input/settings.dart';
 
 void main() {
   TestWidgetsFlutterBinding.ensureInitialized();
@@ -66,17 +68,21 @@ void main() {
   });
   tearDown(() => messenger.setMockMethodCallHandler(channel, null));
 
-  Future<void> open(WidgetTester tester, {double width = 1100}) async {
+  Future<void> open(
+    WidgetTester tester, {
+    double width = 1100,
+    SettingsStore? store,
+  }) async {
     tester.view.physicalSize = Size(width, 900);
     tester.view.devicePixelRatio = 1;
     addTearDown(tester.view.resetPhysicalSize);
     addTearDown(tester.view.resetDevicePixelRatio);
-    await tester.pumpWidget(const SharedInputApp());
+    await tester.pumpWidget(SharedInputApp(store: store));
     await tester.pumpAndSettle();
   }
 
   FilledButton start(WidgetTester tester) =>
-      tester.widget<FilledButton>(find.byType(FilledButton));
+      tester.widget<FilledButton>(find.byKey(const Key('start-control')));
   PointerPainter painter(WidgetTester tester) =>
       tester
               .widget<CustomPaint>(
@@ -98,7 +104,11 @@ void main() {
     await selectDevices(tester);
     await tester.tap(find.text('设置退出快捷键'));
     await tester.pumpAndSettle();
-    await native('shortcut', {'label': 'Ctrl + Alt + F8'});
+    await native('shortcut', {
+      'label': 'Ctrl + Alt + F8',
+      'key': 0x77,
+      'shift': false,
+    });
     await tester.pumpAndSettle();
   }
 
@@ -112,7 +122,11 @@ void main() {
       await tester.tap(find.text('设置退出快捷键'));
       await tester.pumpAndSettle();
       expect(start(tester).onPressed, isNull);
-      await native('shortcut', {'label': 'Ctrl + Alt + F8'});
+      await native('shortcut', {
+        'label': 'Ctrl + Alt + F8',
+        'key': 0x77,
+        'shift': false,
+      });
       await tester.pumpAndSettle();
       expect(start(tester).onPressed, isNotNull);
       expect(calls.any((call) => call.method == 'start'), isFalse);
@@ -141,7 +155,7 @@ void main() {
       await tester.tap(find.byKey(const Key('decrease-sensitivity')));
       await tester.pump();
       expect(field.controller!.text, '0.0001');
-      await tester.tap(find.byType(FilledButton));
+      await tester.tap(find.byKey(const Key('start-control')));
       await tester.pump();
       final args =
           calls.singleWhere((call) => call.method == 'start').arguments as Map;
@@ -171,7 +185,7 @@ void main() {
     (tester) async {
       await open(tester);
       await configure(tester);
-      await tester.tap(find.byType(FilledButton));
+      await tester.tap(find.byKey(const Key('start-control')));
       await tester.pump();
       final originalPainter = painter(tester);
       for (var i = 0; i < 4; i++) {
@@ -197,7 +211,7 @@ void main() {
       await open(tester);
       await configure(tester);
       pendingPointer = Completer<Object?>();
-      await tester.tap(find.byType(FilledButton));
+      await tester.tap(find.byKey(const Key('start-control')));
       await tester.pump();
       for (var i = 0; i < 8; i++) {
         await tester.pump(const Duration(milliseconds: 16));
@@ -223,7 +237,7 @@ void main() {
       await open(tester);
       await configure(tester);
       rejectStart = true;
-      await tester.tap(find.byType(FilledButton));
+      await tester.tap(find.byKey(const Key('start-control')));
       await tester.pumpAndSettle();
       expect(find.text('请松开所有键盘按键，再点击开始控制。'), findsOneWidget);
       expect(start(tester).onPressed, isNotNull);
@@ -240,4 +254,80 @@ void main() {
     expect(tester.takeException(), isNull);
     await tester.pumpWidget(const SizedBox());
   });
+
+  windowsTest(
+    'settings restore native shortcut and role survives a restart without listening',
+    (tester) async {
+      final saved = AppSettings()
+        ..keyboardId = 'keyboard-1'
+        ..mouseId = 'mouse-1'
+        ..shortcut = const ExitShortcut(0x77, shift: true)
+        ..sensitivity = 0.0017
+        ..step = 0.001
+        ..sendHz = 1000
+        ..statisticsExpanded = true
+        ..host = '192.168.1.9'
+        ..peerKey = 'c' * 32;
+      final store = MemorySettingsStore()..value = jsonEncode(saved.toJson());
+      await open(tester, store: store);
+      expect(
+        calls.any(
+          (call) =>
+              call.method == 'restoreShortcut' &&
+              (call.arguments as Map)['key'] == 0x77,
+        ),
+        isTrue,
+      );
+      expect(find.text('Ctrl + Alt + Shift + F8'), findsOneWidget);
+      expect(
+        tester
+            .widget<TextField>(find.byKey(const Key('sensitivity')))
+            .controller!
+            .text,
+        '0.0017',
+      );
+      expect(
+        tester
+            .widget<TextField>(find.byKey(const Key('remote-host')))
+            .controller!
+            .text,
+        '192.168.1.9',
+      );
+      expect(start(tester).onPressed, isNotNull);
+      expect(find.text('按住 0'), findsOneWidget);
+      await tester.tap(find.byKey(const Key('increase-sensitivity')));
+      await tester.pumpAndSettle();
+      expect(jsonDecode(store.value!)['sensitivity'], 0.0027);
+      await tester.tap(find.text('被控端'));
+      await tester.pumpAndSettle();
+      expect(jsonDecode(store.value!)['role'], 'receiver');
+      await tester.pumpWidget(const SizedBox());
+      await open(tester, store: store);
+      expect(find.byKey(const Key('listen-key')), findsOneWidget);
+      expect(find.text('开始接收'), findsOneWidget);
+      expect(find.text('未连接'), findsOneWidget);
+      expect(find.byKey(const Key('start-control')), findsNothing);
+      await tester.pumpWidget(const SizedBox());
+    },
+  );
+
+  windowsTest(
+    'temporarily absent devices keep their persisted identity and restore on arrival',
+    (tester) async {
+      final saved = AppSettings()
+        ..keyboardId = 'keyboard-1'
+        ..mouseId = 'mouse-1'
+        ..shortcut = const ExitShortcut(0x77);
+      final keyboard = devices.removeAt(0);
+      final store = MemorySettingsStore()..value = jsonEncode(saved.toJson());
+      await open(tester, store: store);
+      expect(start(tester).onPressed, isNull);
+      expect(jsonDecode(store.value!)['keyboardId'], 'keyboard-1');
+      devices.add(keyboard);
+      await native('devicesChanged');
+      await tester.pumpAndSettle();
+      expect(start(tester).onPressed, isNotNull);
+      await tester.pumpWidget(const SizedBox());
+    },
+  );
 }

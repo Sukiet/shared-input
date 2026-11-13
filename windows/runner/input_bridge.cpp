@@ -3,6 +3,7 @@
 
 #include <cfgmgr32.h>
 #include <setupapi.h>
+#include <mmsystem.h>
 #include <flutter/standard_method_codec.h>
 #include <algorithm>
 #include <chrono>
@@ -12,6 +13,7 @@
 namespace {
 constexpr UINT kWatchdogMessage = WM_APP + 0x142;
 constexpr UINT kRestoreFocusMessage = WM_APP + 0x143;
+constexpr UINT kStreamMessage = WM_APP + 0x144;
 constexpr UINT_PTR kStatsTimer = 0x5349;
 constexpr wchar_t kCaptureClass[] = L"SharedInputLocalCapture";
 using Value = flutter::EncodableValue;
@@ -87,6 +89,18 @@ std::string StringArg(const Map& map, const char* key) {
   const auto text = value ? std::get_if<std::string>(value) : nullptr;
   return text ? *text : "";
 }
+int IntegerArg(const Map& map, const char* key, int fallback = 0) {
+  const auto value = Find(map, key);
+  if (value) {
+    if (const auto number = std::get_if<int32_t>(value)) return *number;
+    if (const auto number = std::get_if<int64_t>(value)) return static_cast<int>(*number);
+  }
+  return fallback;
+}
+bool BoolArg(const Map& map, const char* key) {
+  const auto value = Find(map, key);
+  return value && std::get_if<bool>(value) && std::get<bool>(*value);
+}
 
 int PhysicalKey(const RAWKEYBOARD& key) {
   if (key.VKey == VK_CONTROL) return key.Flags & RI_KEY_E0 ? VK_RCONTROL : VK_LCONTROL;
@@ -108,6 +122,7 @@ InputBridge::InputBridge(HWND owner, HWND view, flutter::BinaryMessenger* messen
 
 InputBridge::~InputBridge() {
   Stop("shutdown", false);
+  receiver_.Stop();
   closing_ = true;
   if (watchdog_.joinable()) watchdog_.join();
   KillTimer(owner_, kStatsTimer);
@@ -178,6 +193,7 @@ void InputBridge::OnMethod(const flutter::MethodCall<Value>& call,
   if (method == "initialize") {
     // Hot restart / a new Dart view always starts disarmed.
     Stop("manual", false);
+    receiver_.Stop();
     CancelSetup();
     shortcut_key_ = 0;
     shortcut_label_.clear();
@@ -191,6 +207,33 @@ void InputBridge::OnMethod(const flutter::MethodCall<Value>& call,
   }
   if (method == "heartbeat") {
     heartbeat_ = GetTickCount64();
+    result->Success();
+  } else if (method == "permissions" || method == "requestPermissions") {
+    result->Success(Value(true));
+  } else if (method == "restoreShortcut") {
+    const auto args = call.arguments() ? std::get_if<Map>(call.arguments()) : nullptr;
+    const int key = args ? IntegerArg(*args, "key") : 0;
+    if (active_ || !shared_input::ValidShortcut(key, true, true, false)) {
+      result->Error("invalid_shortcut", "保存的退出快捷键无效。");
+    } else {
+      shortcut_key_ = key;
+      shortcut_shift_ = BoolArg(*args, "shift");
+      result->Success();
+    }
+  } else if (method == "receiverBegin") {
+    const auto args = call.arguments() ? std::get_if<Map>(call.arguments()) : nullptr;
+    if (active_ || !args || !receiver_.Begin(StringArg(*args, "capture"))) {
+      result->Error("receive_failed", "无法开始接收输入。");
+    } else result->Success();
+  } else if (method == "receiverInput") {
+    const auto args = call.arguments() ? std::get_if<Map>(call.arguments()) : nullptr;
+    if (!args || !receiver_.Apply(*args)) result->Error("inject_failed", "输入注入失败或接收已停止。");
+    else result->Success();
+  } else if (method == "receiverHeartbeat") {
+    if (receiver_.Heartbeat()) result->Success();
+    else result->Error("receiver_stopped", "接收已因超时停止。");
+  } else if (method == "receiverStop") {
+    receiver_.Stop();
     result->Success();
   } else if (method == "pointer") {
     // Latest coordinates, pulled by Flutter vsync. No input-event backlog or
@@ -206,6 +249,9 @@ void InputBridge::OnMethod(const flutter::MethodCall<Value>& call,
     result->Success(Value(list));
   } else if (method == "stop") {
     Stop("manual");
+    result->Success();
+  } else if (method == "cancelSetup") {
+    CancelSetup();
     result->Success();
   } else if (method == "recordShortcut" || method == "identify") {
     if (active_ || GetForegroundWindow() != owner_) {
@@ -268,6 +314,16 @@ void InputBridge::Start(const Map& args, std::unique_ptr<Result> result) {
     return;
   }
   speed_ = *number;
+  remote_capture_ = BoolArg(args, "remote");
+  const int hz = IntegerArg(args, "sendHz", 500);
+  if (hz != 125 && hz != 250 && hz != 500 && hz != 1000) {
+    remote_capture_ = false;
+    result->Error("invalid_frequency", "发送频率无效。");
+    return;
+  }
+  motion_sequence_ = event_epoch_ = flushed_sequence_ = flushed_epoch_ = 0;
+  total_x_ = total_y_ = 0;
+  input_events_.clear();
   keys_ = moves_ = buttons_ = ignored_ = released_ = 0;
   x_ = 300; y_ = 120;
   held_keys_.clear(); held_buttons_.clear(); physical_keys_.clear(); shakes_.clear();
@@ -301,6 +357,16 @@ void InputBridge::Start(const Map& args, std::unique_ptr<Result> result) {
     return;
   }
   SetCursor(nullptr);
+  if (remote_capture_) {
+    timer_resolution_ = timeBeginPeriod(1) == TIMERR_NOERROR;
+    stream_timer_ = timeSetEvent(static_cast<UINT>(1000 / hz), 1, StreamTick,
+        reinterpret_cast<DWORD_PTR>(this), TIME_PERIODIC | TIME_KILL_SYNCHRONOUS);
+    if (!stream_timer_) {
+      Stop("manual", false);
+      result->Error("timer_failed", "高频采集定时器启动失败。");
+      return;
+    }
+  }
   result->Success();
 }
 
@@ -312,6 +378,8 @@ void InputBridge::Stop(const std::string& reason, bool notify) {
     ReleaseCursorIfOwned();
   }
   active_ = false;
+  if (was_active && remote_capture_) FlushStream();
+  StopStream();
   if (!was_active) return;
   released_ = static_cast<int>(held_keys_.size() + held_buttons_.size());
   held_keys_.clear(); held_buttons_.clear(); physical_keys_.clear(); shakes_.clear();
@@ -367,7 +435,8 @@ void InputBridge::ReadInput(HRAWINPUT handle) {
         if (shortcut_shift_) shortcut_label_ += "Shift + ";
         shortcut_label_ += key >= VK_F1 ? "F" + std::to_string(key - VK_F1 + 1) : std::string(1, static_cast<char>(key));
         recording_ = false;
-        Emit("shortcut", {{Value("label"), Value(shortcut_label_)}});
+        Emit("shortcut", {{Value("label"), Value(shortcut_label_)},
+            {Value("key"), Value(shortcut_key_)}, {Value("shift"), Value(shortcut_shift_)}});
       }
       return;
     }
@@ -385,7 +454,11 @@ void InputBridge::ReadInput(HRAWINPUT handle) {
     if (raw.header.hDevice != keyboard_) { ++ignored_; return; }
     ++keys_;
     const int physical_id = keyboard.MakeCode | ((keyboard.Flags & (RI_KEY_E0 | RI_KEY_E1)) << 16);
+    const bool repeat = !up && held_keys_.count(physical_id) != 0;
     if (up) held_keys_.erase(physical_id); else held_keys_.insert(physical_id);
+    QueueInput({{Value("kind"), Value("key")}, {Value("code"), Value(static_cast<int>(keyboard.MakeCode))},
+        {Value("extended"), Value((keyboard.Flags & RI_KEY_E0) != 0)},
+        {Value("down"), Value(!up)}, {Value("repeat"), Value(repeat)}});
   } else if (raw.header.dwType == RIM_TYPEMOUSE && bytes >= sizeof(RAWINPUTHEADER) + sizeof(RAWMOUSE)) {
     const auto& mouse = raw.data.mouse;
     if (identifying_ == "mouse" && (mouse.lLastX || mouse.lLastY || mouse.usButtonFlags)) {
@@ -407,11 +480,25 @@ void InputBridge::ReadInput(HRAWINPUT handle) {
       ++moves_;
       x_ = shared_input::MovePointer(x_, mouse.lLastX, speed_, 600.0);
       y_ = shared_input::MovePointer(y_, mouse.lLastY, speed_, 240.0);
+      total_x_ += mouse.lLastX * speed_;
+      total_y_ += mouse.lLastY * speed_;
+      ++motion_sequence_;
     }
     if (mouse.usButtonFlags) ++buttons_;
     for (int button = 0; button < 5; ++button) {
-      if (mouse.usButtonFlags & (1 << (button * 2))) held_buttons_.insert(button);
-      if (mouse.usButtonFlags & (2 << (button * 2))) held_buttons_.erase(button);
+      if (mouse.usButtonFlags & (1 << (button * 2))) {
+        held_buttons_.insert(button);
+        QueueInput({{Value("kind"), Value("button")}, {Value("button"), Value(button)}, {Value("down"), Value(true)}});
+      }
+      if (mouse.usButtonFlags & (2 << (button * 2))) {
+        held_buttons_.erase(button);
+        QueueInput({{Value("kind"), Value("button")}, {Value("button"), Value(button)}, {Value("down"), Value(false)}});
+      }
+    }
+    if (mouse.usButtonFlags & (RI_MOUSE_WHEEL | RI_MOUSE_HWHEEL)) {
+      QueueInput({{Value("kind"), Value("wheel")},
+          {Value("delta"), Value(static_cast<int>(static_cast<SHORT>(mouse.usButtonData)))},
+          {Value("horizontal"), Value((mouse.usButtonFlags & RI_MOUSE_HWHEEL) != 0)}});
     }
   }
 }
@@ -437,6 +524,10 @@ void InputBridge::CancelSetup() {
 
 std::optional<LRESULT> InputBridge::HandleMessage(UINT message, WPARAM wparam, LPARAM lparam) {
   switch (message) {
+    case kStreamMessage:
+      stream_posted_ = false;
+      if (static_cast<unsigned>(wparam) == generation_.load() && active_ && remote_capture_) FlushStream();
+      return 0;
     case WM_INPUT:
       ReadInput(reinterpret_cast<HRAWINPUT>(lparam));
       // Foreground raw input requires DefWindowProc cleanup.
@@ -466,6 +557,7 @@ std::optional<LRESULT> InputBridge::HandleMessage(UINT message, WPARAM wparam, L
     case WM_DESTROY:
     case WM_QUERYENDSESSION:
       Stop("shutdown");
+      receiver_.Stop();
       CancelSetup();
       break;
     case WM_TIMER:
@@ -530,7 +622,12 @@ void InputBridge::Watchdog() {
     std::this_thread::sleep_for(std::chrono::milliseconds(50));
     std::lock_guard<std::mutex> lock(cursor_lease_);
     if (!armed_) continue;
-    const auto expiry = shared_input::CheckExpiry(GetTickCount64(), watch_started_, heartbeat_);
+    const auto now = GetTickCount64();
+    const auto heartbeat = heartbeat_.load();
+    const auto expiry = remote_capture_
+        ? (now >= heartbeat && now - heartbeat >= shared_input::kHeartbeatLimitMs
+            ? shared_input::Expiry::heartbeat : shared_input::Expiry::none)
+        : shared_input::CheckExpiry(now, watch_started_, heartbeat);
     if (expiry == shared_input::Expiry::none) continue;
     // This thread releases confinement even if Flutter/the platform loop stalls.
     // Session generations prevent a queued old timeout stopping a new session.
@@ -546,4 +643,35 @@ void InputBridge::ReleaseCursorIfOwned() {
   if (GetClipCursor(&current) && EqualRect(&current, &owned_clip_)) {
     ClipCursor(nullptr);
   }
+}
+
+void CALLBACK InputBridge::StreamTick(UINT, UINT, DWORD_PTR user, DWORD_PTR, DWORD_PTR) {
+  auto self = reinterpret_cast<InputBridge*>(user);
+  if (self->armed_ && !self->closing_ && !self->stream_posted_.exchange(true)) {
+    PostMessage(self->owner_, kStreamMessage, self->generation_.load(), 0);
+  }
+}
+void InputBridge::QueueInput(Map event) {
+  if (!remote_capture_) return;
+  if (input_events_.size() >= 256) { Stop("input_overflow"); return; }
+  event[Value("epoch")] = Value(++event_epoch_);
+  event[Value("sequence")] = Value(motion_sequence_);
+  event[Value("x")] = Value(total_x_);
+  event[Value("y")] = Value(total_y_);
+  input_events_.emplace_back(std::move(event));
+}
+void InputBridge::FlushStream() {
+  if (motion_sequence_ == flushed_sequence_ && event_epoch_ == flushed_epoch_) return;
+  Emit("inputFrame", {{Value("sequence"), Value(motion_sequence_)}, {Value("epoch"), Value(event_epoch_)},
+      {Value("x"), Value(total_x_)}, {Value("y"), Value(total_y_)}, {Value("events"), Value(std::move(input_events_))}});
+  input_events_.clear();
+  flushed_sequence_ = motion_sequence_;
+  flushed_epoch_ = event_epoch_;
+}
+void InputBridge::StopStream() {
+  if (stream_timer_) { timeKillEvent(stream_timer_); stream_timer_ = 0; }
+  if (timer_resolution_) { timeEndPeriod(1); timer_resolution_ = false; }
+  remote_capture_ = false;
+  stream_posted_ = false;
+  input_events_.clear();
 }

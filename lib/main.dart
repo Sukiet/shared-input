@@ -1,15 +1,22 @@
 import 'dart:async';
+import 'dart:io';
 import 'package:flutter/foundation.dart';
 import 'package:flutter/material.dart';
 import 'package:flutter/scheduler.dart';
 import 'package:flutter/services.dart';
 import 'pointer_preview.dart';
 import 'sensitivity.dart';
+import 'settings.dart';
+import 'remote/lan_session.dart';
 
-void main() => runApp(const SharedInputApp());
+void main() {
+  WidgetsFlutterBinding.ensureInitialized();
+  runApp(SharedInputApp(store: PreferencesSettingsStore()));
+}
 
 class SharedInputApp extends StatelessWidget {
-  const SharedInputApp({super.key});
+  const SharedInputApp({super.key, this.store});
+  final SettingsStore? store;
   @override
   Widget build(BuildContext context) => MaterialApp(
     title: 'Shared Input',
@@ -29,12 +36,13 @@ class SharedInputApp extends StatelessWidget {
         contentPadding: EdgeInsets.symmetric(horizontal: 12, vertical: 13),
       ),
     ),
-    home: const InputPage(),
+    home: InputPage(store: store),
   );
 }
 
 class InputPage extends StatefulWidget {
-  const InputPage({super.key});
+  const InputPage({super.key, this.store});
+  final SettingsStore? store;
   @override
   State<InputPage> createState() => _InputPageState();
 }
@@ -45,6 +53,17 @@ class _InputPageState extends State<InputPage>
   final _position = ValueNotifier(const Offset(300, 120));
   final _stats = ValueNotifier<Map<String, dynamic>>({});
   final _speedText = TextEditingController(text: '0.1000');
+  final _hostText = TextEditingController();
+  final _portText = TextEditingController(text: '45831');
+  final _peerKeyText = TextEditingController();
+  final _listenKeyText = TextEditingController();
+  final _lan = LanSession();
+  late final SettingsRepository _preferences;
+  AppSettings _settings = AppSettings();
+  bool _settingsLoaded = false;
+  List<String> _addresses = [];
+  bool get _captureSupported => defaultTargetPlatform == TargetPlatform.windows;
+  bool get _receiving => _settings.role == InputRole.receiver;
   late final Ticker _frames;
   List<Map<String, dynamic>> _devices = [];
   String? _keyboard, _mouse, _shortcut, _identify, _speedError;
@@ -58,6 +77,24 @@ class _InputPageState extends State<InputPage>
   @override
   void initState() {
     super.initState();
+    _preferences = SettingsRepository(widget.store ?? MemorySettingsStore());
+    _lan.addListener(_connectionChanged);
+    _lan.onBegin = (capture) =>
+        _channel.invokeMethod<void>('receiverBegin', {'capture': capture});
+    _lan.onInput = (capture, frames) => _channel.invokeMethod<void>(
+      'receiverInput',
+      {'capture': capture, 'frames': frames},
+    );
+    _lan.onHeartbeat = () => _channel.invokeMethod<void>('receiverHeartbeat');
+    _lan.onEnd = () => _channel.invokeMethod<void>('receiverStop');
+    _lan.onConnectionLost = () {
+      if (mounted && _active) {
+        unawaited(
+          _channel.invokeMethod<void>('stop').catchError((Object _) {}),
+        );
+      }
+    };
+    _lan.onCaptureEnded = _lan.onConnectionLost;
     _frames = createTicker((_) => _readPointer());
     _channel.setMethodCallHandler(_onNativeEvent);
     _initialize();
@@ -97,15 +134,61 @@ class _InputPageState extends State<InputPage>
   }
 
   Future<void> _initialize() async {
-    if (defaultTargetPlatform != TargetPlatform.windows) {
-      setState(() => _status = '输入采集目前仅支持 Windows。');
-      return;
-    }
     await _perform(() async {
+      _settings = await _preferences.load();
+      if (defaultTargetPlatform == TargetPlatform.macOS &&
+          !_preferences.restored) {
+        _settings.role = InputRole.receiver;
+      }
+      if (!mounted) return;
+      setState(() {
+        _settingsLoaded = true;
+        _speed = _settings.sensitivity;
+        _step = _settings.step;
+        _speedText.text = _speed.toStringAsFixed(4);
+        _hostText.text = _settings.host;
+        _portText.text = '${_settings.port}';
+        _peerKeyText.text = _settings.peerKey;
+        _listenKeyText.text = _settings.listenKey;
+        _shortcut = _settings.shortcut?.label;
+      });
+      if (defaultTargetPlatform != TargetPlatform.windows &&
+          defaultTargetPlatform != TargetPlatform.macOS) {
+        setState(() => _status = '输入共享目前支持 Windows 控制端和 Windows / macOS 被控端。');
+        return;
+      }
       await _channel.invokeMethod<void>('initialize');
-      await _refresh();
+      if (_captureSupported) {
+        await _refresh();
+        if (_settings.shortcut != null) {
+          await _channel.invokeMethod<void>(
+            'restoreShortcut',
+            _settings.shortcut!.toJson(),
+          );
+        }
+      }
       if (mounted) setState(() => _ready = true);
+      await _saveSettings();
+      unawaited(_readAddresses());
     });
+  }
+
+  Future<void> _readAddresses() async {
+    try {
+      final interfaces = await NetworkInterface.list(
+        type: InternetAddressType.IPv4,
+      );
+      if (mounted) {
+        setState(
+          () => _addresses = interfaces
+              .expand((i) => i.addresses)
+              .map((a) => a.address)
+              .toList(),
+        );
+      }
+    } on SocketException {
+      /* IP entry is still usable without enumeration. */
+    }
   }
 
   Future<void> _refresh() async {
@@ -116,8 +199,12 @@ class _InputPageState extends State<InputPage>
     if (!mounted) return;
     setState(() {
       _devices = devices;
-      if (!devices.any((d) => d['id'] == _keyboard)) _keyboard = null;
-      if (!devices.any((d) => d['id'] == _mouse)) _mouse = null;
+      _keyboard = devices.any((d) => d['id'] == _settings.keyboardId)
+          ? _settings.keyboardId
+          : null;
+      _mouse = devices.any((d) => d['id'] == _settings.mouseId)
+          ? _settings.mouseId
+          : null;
     });
   }
 
@@ -130,6 +217,8 @@ class _InputPageState extends State<InputPage>
       if (mounted) setState(() => _status = error.message ?? error.code);
     } on MissingPluginException {
       if (mounted) setState(() => _status = '当前平台没有输入采集模块。');
+    } catch (error) {
+      if (mounted) setState(() => _status = '$error');
     } finally {
       if (mounted) setState(() => _busy = false);
     }
@@ -143,8 +232,10 @@ class _InputPageState extends State<InputPage>
         setState(() {
           _shortcut = data['label'] as String;
           _recording = false;
+          _settings.shortcut = ExitShortcut.fromJson(data);
           _status = '';
         });
+        await _saveSettings();
       case 'recordingCancelled':
         setState(() {
           _recording = false;
@@ -154,12 +245,15 @@ class _InputPageState extends State<InputPage>
         setState(() {
           if (data['type'] == 'keyboard') {
             _keyboard = data['id'] as String;
+            _settings.keyboardId = _keyboard;
           } else {
             _mouse = data['id'] as String;
+            _settings.mouseId = _mouse;
           }
           _identify = null;
           _status = '';
         });
+        await _saveSettings();
       case 'identificationCancelled':
         setState(() {
           _identify = null;
@@ -170,7 +264,10 @@ class _InputPageState extends State<InputPage>
       case 'stats':
         // Counters/countdown are independent of cursor rendering and settings.
         _stats.value = data;
+      case 'inputFrame':
+        _lan.sendInput(data);
       case 'stopped':
+        unawaited(_lan.endCapture());
         ++_frameGeneration;
         _frames.stop();
         if (data['x'] is num && data['y'] is num) {
@@ -224,11 +321,23 @@ class _InputPageState extends State<InputPage>
 
   Future<void> _start() => _perform(() async {
     FocusManager.instance.primaryFocus?.unfocus();
-    await _channel.invokeMethod<void>('start', {
-      'keyboard': _keyboard,
-      'mouse': _mouse,
-      'speed': _speed,
-    });
+    await _saveSettings();
+    await _preferences.flush();
+    if (_lan.connected) {
+      await _lan.beginCapture();
+    }
+    try {
+      await _channel.invokeMethod<void>('start', {
+        'keyboard': _keyboard,
+        'mouse': _mouse,
+        'speed': _speed,
+        'remote': _lan.capturing,
+        'sendHz': _settings.sendHz,
+      });
+    } catch (_) {
+      await _lan.endCapture();
+      rethrow;
+    }
     if (mounted) {
       _position.value = const Offset(300, 120);
       _stats.value = {};
@@ -248,7 +357,74 @@ class _InputPageState extends State<InputPage>
       _speedError = null;
       _speedText.text = gain.toStringAsFixed(4);
     });
+    _persist();
   }
+
+  Future<void> _saveSettings() async {
+    if (!_settingsLoaded) return;
+    _settings.sensitivity = _speed;
+    _settings.step = _step;
+    _settings.host = _hostText.text.trim();
+    _settings.peerKey = _peerKeyText.text.trim();
+    final port = int.tryParse(_portText.text);
+    if (port != null && port > 0 && port <= 65535) _settings.port = port;
+    await _preferences.save(_settings);
+  }
+
+  void _persist() {
+    unawaited(
+      _saveSettings().catchError((Object error) {
+        if (mounted) setState(() => _status = '设置保存失败：$error');
+      }),
+    );
+  }
+
+  void _connectionChanged() {
+    if (mounted) setState(() {});
+  }
+
+  Future<void> _switchRole(int index) => _perform(() async {
+    if (_active) await _channel.invokeMethod<void>('stop');
+    await _lan.endCapture();
+    await _lan.close();
+    if (_ready) await _channel.invokeMethod<void>('cancelSetup');
+    if (!mounted) return;
+    setState(() {
+      _settings.role = InputRole.values[index];
+      _recording = false;
+      _identify = null;
+      _status = '';
+    });
+    await _saveSettings();
+  });
+  Future<void> _connect() => _perform(() async {
+    final port = int.tryParse(_portText.text);
+    if (port == null || port <= 0 || port > 65535) {
+      throw const FormatException('端口范围为 1～65535。');
+    }
+    await _saveSettings();
+    if (_receiving) {
+      if (_lan.listening) {
+        await _lan.close();
+        return;
+      }
+      await _lan.listen(port: port, key: _settings.listenKey);
+    } else {
+      if (_lan.connected) {
+        await _lan.close();
+        return;
+      }
+      if (_hostText.text.trim().isEmpty) {
+        throw const FormatException('请输入被控端 IP。');
+      }
+      await _lan.connect(
+        host: _hostText.text,
+        port: port,
+        key: _peerKeyText.text,
+      );
+    }
+    if (mounted) setState(() => _status = '');
+  });
 
   @override
   void dispose() {
@@ -259,6 +435,12 @@ class _InputPageState extends State<InputPage>
     _position.dispose();
     _stats.dispose();
     _speedText.dispose();
+    _hostText.dispose();
+    _portText.dispose();
+    _peerKeyText.dispose();
+    _listenKeyText.dispose();
+    _lan.removeListener(_connectionChanged);
+    _lan.dispose();
     super.dispose();
   }
 
@@ -266,6 +448,8 @@ class _InputPageState extends State<InputPage>
   Widget build(BuildContext context) {
     final canStart =
         _ready &&
+        _captureSupported &&
+        !_receiving &&
         !_active &&
         !_recording &&
         _identify == null &&
@@ -283,17 +467,43 @@ class _InputPageState extends State<InputPage>
               child: Column(
                 crossAxisAlignment: CrossAxisAlignment.start,
                 children: [
-                  if (constraints.maxWidth >= 850)
+                  DefaultTabController(
+                    key: ValueKey(_settings.role),
+                    length: 2,
+                    initialIndex: _settings.role.index,
+                    child: IgnorePointer(
+                      ignoring: _busy || _active,
+                      child: TabBar(
+                        onTap: (index) {
+                          if (index != _settings.role.index) _switchRole(index);
+                        },
+                        tabs: const [
+                          Tab(text: '控制端'),
+                          Tab(text: '被控端'),
+                        ],
+                      ),
+                    ),
+                  ),
+                  const SizedBox(height: 20),
+                  if (_receiving)
+                    ConstrainedBox(
+                      constraints: const BoxConstraints(maxWidth: 620),
+                      child: _receiverPanel(),
+                    )
+                  else if (constraints.maxWidth >= 850)
                     Row(
                       crossAxisAlignment: CrossAxisAlignment.start,
                       children: [
-                        SizedBox(width: 300, child: _settings(canStart)),
+                        SizedBox(
+                          width: 300,
+                          child: _controllerSettings(canStart),
+                        ),
                         const SizedBox(width: 28),
                         Expanded(child: _monitor()),
                       ],
                     )
                   else ...[
-                    _settings(canStart),
+                    _controllerSettings(canStart),
                     const SizedBox(height: 28),
                     _monitor(),
                   ],
@@ -317,9 +527,17 @@ class _InputPageState extends State<InputPage>
     );
   }
 
-  Widget _settings(bool canStart) => Column(
+  Widget _controllerSettings(bool canStart) => Column(
     crossAxisAlignment: CrossAxisAlignment.start,
     children: [
+      if (!_captureSupported)
+        const Padding(
+          padding: EdgeInsets.only(bottom: 14),
+          child: Text(
+            '此设备支持被控端；键鼠采集目前在 Windows 上运行。',
+            style: TextStyle(fontSize: 12),
+          ),
+        ),
       Row(
         children: [
           const Expanded(
@@ -375,6 +593,7 @@ class _InputPageState extends State<InputPage>
                 final gain = Sensitivity.parse(text);
                 _speedError = gain == null ? '范围 0.0001～4.0000' : null;
                 if (gain != null) _speed = gain;
+                if (gain != null) _persist();
               }),
               onSubmitted: (_) {
                 if (_speedError == null) _setSpeed(_speed);
@@ -413,7 +632,10 @@ class _InputPageState extends State<InputPage>
             enabled: !_active,
             initialValue: _step,
             tooltip: '调整加减步长',
-            onSelected: (value) => setState(() => _step = value),
+            onSelected: (value) {
+              setState(() => _step = value);
+              _persist();
+            },
             itemBuilder: (_) => [0.0001, 0.001, 0.01, 0.1]
                 .map(
                   (step) => PopupMenuItem(
@@ -433,12 +655,45 @@ class _InputPageState extends State<InputPage>
         ],
       ),
       const SizedBox(height: 26),
+      Row(
+        children: [
+          const Expanded(child: Text('发送频率', style: TextStyle(fontSize: 12))),
+          DropdownButton<int>(
+            value: _settings.sendHz,
+            items: [125, 250, 500, 1000]
+                .map((hz) => DropdownMenuItem(value: hz, child: Text('$hz Hz')))
+                .toList(),
+            onChanged: _active
+                ? null
+                : (hz) {
+                    if (hz != null) {
+                      setState(() => _settings.sendHz = hz);
+                      _persist();
+                    }
+                  },
+          ),
+        ],
+      ),
+      const Padding(
+        padding: EdgeInsets.symmetric(vertical: 10),
+        child: Text(
+          'Win → Command · Ctrl → Control',
+          style: TextStyle(fontSize: 12, color: Color(0xff929aa6)),
+        ),
+      ),
       SizedBox(
         width: double.infinity,
         height: 42,
         child: FilledButton(
+          key: const Key('start-control'),
           onPressed: canStart ? _start : null,
-          child: Text(_active ? '控制中' : '开始控制'),
+          child: Text(
+            _active
+                ? '控制中'
+                : _lan.connected
+                ? '开始控制'
+                : '开始本地预览',
+          ),
         ),
       ),
     ],
@@ -473,9 +728,12 @@ class _InputPageState extends State<InputPage>
                 ? (id) => setState(() {
                     if (type == 'keyboard') {
                       _keyboard = id;
+                      _settings.keyboardId = id;
                     } else {
                       _mouse = id;
+                      _settings.mouseId = id;
                     }
+                    _persist();
                   })
                 : null,
           ),
@@ -491,9 +749,151 @@ class _InputPageState extends State<InputPage>
     );
   }
 
+  Widget _connectionPanel() {
+    final editable =
+        _ready && !_busy && !_active && !_lan.connected && !_lan.listening;
+    return Column(
+      crossAxisAlignment: CrossAxisAlignment.start,
+      children: [
+        Row(
+          children: [
+            if (!_receiving) ...[
+              Expanded(
+                child: TextField(
+                  key: const Key('remote-host'),
+                  controller: _hostText,
+                  enabled: editable,
+                  decoration: const InputDecoration(labelText: '被控端 IP'),
+                  onChanged: (_) => _persist(),
+                ),
+              ),
+              const SizedBox(width: 10),
+            ] else
+              const Expanded(
+                child: Text(
+                  '接收连接',
+                  style: TextStyle(fontWeight: FontWeight.w600),
+                ),
+              ),
+            SizedBox(
+              width: 95,
+              child: TextField(
+                key: const Key('remote-port'),
+                controller: _portText,
+                enabled: editable,
+                keyboardType: TextInputType.number,
+                decoration: const InputDecoration(labelText: '端口'),
+                onChanged: (_) => _persist(),
+              ),
+            ),
+          ],
+        ),
+        const SizedBox(height: 12),
+        Row(
+          children: [
+            Expanded(
+              child: TextField(
+                key: Key(_receiving ? 'listen-key' : 'peer-key'),
+                controller: _receiving ? _listenKeyText : _peerKeyText,
+                enabled: _ready && !_active && !_busy,
+                readOnly: _receiving || _lan.connected,
+                decoration: InputDecoration(
+                  labelText: '连接码',
+                  suffixIcon: _receiving
+                      ? IconButton(
+                          tooltip: '复制连接码',
+                          icon: const Icon(Icons.copy, size: 17),
+                          onPressed: () => Clipboard.setData(
+                            ClipboardData(text: _settings.listenKey),
+                          ),
+                        )
+                      : null,
+                ),
+                onChanged: (_) => _persist(),
+              ),
+            ),
+            const SizedBox(width: 10),
+            FilledButton(
+              key: const Key('connection-action'),
+              onPressed: _ready && !_busy && !_active ? _connect : null,
+              child: Text(
+                _receiving
+                    ? (_lan.listening ? '停止接收' : '开始接收')
+                    : (_lan.connected ? '断开' : '连接'),
+              ),
+            ),
+          ],
+        ),
+        const SizedBox(height: 8),
+        Wrap(
+          spacing: 14,
+          children: [
+            Text(
+              _lan.status,
+              style: const TextStyle(fontSize: 12, color: Color(0xff929aa6)),
+            ),
+            ValueListenableBuilder<(int, int, double?)>(
+              valueListenable: _lan.metrics,
+              builder: (_, metrics, _) => !_lan.connected
+                  ? const SizedBox.shrink()
+                  : Text(
+                      '${_receiving ? '接收 ${metrics.$2}' : '发送 ${metrics.$1}'} 包/s${metrics.$3 == null ? '' : ' · ${metrics.$3!.toStringAsFixed(1)} ms'}',
+                      style: const TextStyle(
+                        fontSize: 11,
+                        color: Color(0xff929aa6),
+                      ),
+                    ),
+            ),
+          ],
+        ),
+      ],
+    );
+  }
+
+  Widget _receiverPanel() => Column(
+    crossAxisAlignment: CrossAxisAlignment.start,
+    children: [
+      const Text('本机 IP', style: TextStyle(fontWeight: FontWeight.w600)),
+      const SizedBox(height: 8),
+      SelectableText(_addresses.isEmpty ? '正在读取…' : _addresses.join(' / ')),
+      const SizedBox(height: 20),
+      _connectionPanel(),
+      const SizedBox(height: 16),
+      Text(
+        _lan.capturing ? '正在接收输入' : '在控制端填写本机 IP、端口和连接码后连接。',
+        style: const TextStyle(fontSize: 12, color: Color(0xff929aa6)),
+      ),
+      if (defaultTargetPlatform == TargetPlatform.macOS)
+        Padding(
+          padding: const EdgeInsets.only(top: 12),
+          child: OutlinedButton(
+            onPressed: _busy
+                ? null
+                : () => _perform(() async {
+                    final allowed =
+                        await _channel.invokeMethod<bool>(
+                          'requestPermissions',
+                        ) ??
+                        false;
+                    if (mounted) {
+                      setState(
+                        () => _status = allowed
+                            ? '已获得辅助功能权限。'
+                            : '请在系统设置 → 隐私与安全性 → 辅助功能中允许 Shared Input。',
+                      );
+                    }
+                  }),
+            child: const Text('辅助功能授权'),
+          ),
+        ),
+    ],
+  );
+
   Widget _monitor() => Column(
     crossAxisAlignment: CrossAxisAlignment.start,
     children: [
+      _connectionPanel(),
+      const SizedBox(height: 16),
       SizedBox(
         height: 36,
         child: Row(
@@ -507,8 +907,10 @@ class _InputPageState extends State<InputPage>
             ValueListenableBuilder<Map<String, dynamic>>(
               valueListenable: _stats,
               builder: (_, stats, _) => Text(
-                _active
+                _active && !_lan.capturing
                     ? '控制中 · ${((stats['remainingMs'] as num? ?? 30000) / 1000).ceil()} s'
+                    : _active
+                    ? '控制中'
                     : '未开始',
                 style: const TextStyle(fontSize: 12, color: Color(0xff929aa6)),
               ),
@@ -524,6 +926,12 @@ class _InputPageState extends State<InputPage>
       Theme(
         data: Theme.of(context).copyWith(dividerColor: Colors.transparent),
         child: ExpansionTile(
+          key: ValueKey('statistics-$_settingsLoaded'),
+          initiallyExpanded: _settings.statisticsExpanded,
+          onExpansionChanged: (value) {
+            _settings.statisticsExpanded = value;
+            _persist();
+          },
           tilePadding: EdgeInsets.zero,
           dense: true,
           title: const Text(

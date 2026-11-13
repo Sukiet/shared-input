@@ -14,6 +14,7 @@
 #include <thread>
 #include <vector>
 #include "safety_policy.h"
+#include "remote_receiver.h"
 
 class InputBridge {
  public:
@@ -44,6 +45,10 @@ class InputBridge {
   void Watchdog();
   // Requires cursor_lease_; do not clear confinement installed by another app.
   void ReleaseCursorIfOwned();
+  static void CALLBACK StreamTick(UINT, UINT, DWORD_PTR user, DWORD_PTR, DWORD_PTR);
+  void FlushStream();
+  void QueueInput(Map event);
+  void StopStream();
   HWND owner_, view_, capture_ = nullptr;
   std::unique_ptr<flutter::MethodChannel<Value>> channel_;
   bool initialized_ = false, active_ = false, recording_ = false;
@@ -64,5 +69,12 @@ class InputBridge {
   std::mutex cursor_lease_;
   RECT owned_clip_{};
   std::thread watchdog_;
+  RemoteReceiver receiver_;
+  UINT stream_timer_ = 0;
+  bool timer_resolution_ = false;
+  std::atomic<bool> stream_posted_{false}, remote_capture_{false};
+  int64_t motion_sequence_ = 0, event_epoch_ = 0, flushed_sequence_ = 0, flushed_epoch_ = 0;
+  double total_x_ = 0, total_y_ = 0;
+  flutter::EncodableList input_events_;
 };
 #endif
