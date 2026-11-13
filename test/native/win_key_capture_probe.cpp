@@ -3,16 +3,20 @@
 #include <vector>
 #include <thread>
 #include "../../windows/runner/keyboard_capture.h"
+#include "../../windows/runner/capture_ime.h"
 
 namespace {
 HWND owner = nullptr;
+HWND child = nullptr;
+bool ime_disabled = false;
+int ime_starts = 0, raw_letter_events = 0;
 bool lost_focus = false;
 bool flags_verified = false;
 bool preserved = false;
 bool released = false;
 bool registration_reset = false;
 int step = 0, raw_events = 0, raw_win_events = 0, raw_r_events = 0, win_events = 0, r_events = 0;
-UINT sent_keys = 0;
+UINT sent_keys = 0, sent_letters = 0;
 
 bool Flags(bool capturing) {
   UINT count = 0;
@@ -47,7 +51,23 @@ void WinKey() {
   sent_keys = SendInput(6, keys, sizeof(INPUT));
 }
 
+void Letters() {
+  INPUT keys[4]{};
+  for (int i = 0; i < 4; ++i) {
+    keys[i].type = INPUT_KEYBOARD;
+    keys[i].ki.wVk = i < 2 ? 'N' : 'I';
+    keys[i].ki.wScan = i < 2 ? 0x31 : 0x17;
+    keys[i].ki.dwFlags = i % 2 ? KEYEVENTF_KEYUP : 0;
+  }
+  sent_letters = SendInput(4, keys, sizeof(INPUT));
+}
+
 LRESULT CALLBACK Proc(HWND window, UINT message, WPARAM wparam, LPARAM lparam) {
+  if (window == child) {
+    if (message == WM_IME_STARTCOMPOSITION) ++ime_starts;
+    const auto result = shared_input::HandleCaptureImeMessage(window, message, wparam, lparam);
+    if (result) return *result;
+  }
   if (message == WM_ACTIVATE && LOWORD(wparam) == WA_INACTIVE) lost_focus = true;
   if (message == WM_INPUT) {
     RAWINPUT input{};
@@ -57,6 +77,7 @@ LRESULT CALLBACK Proc(HWND window, UINT message, WPARAM wparam, LPARAM lparam) {
       ++raw_events;
       if (input.data.keyboard.VKey == VK_LWIN || input.data.keyboard.VKey == VK_RWIN) ++raw_win_events;
       if (input.data.keyboard.VKey == 'R') ++raw_r_events;
+      if (input.data.keyboard.VKey == 'N' || input.data.keyboard.VKey == 'I') ++raw_letter_events;
     }
     return DefWindowProc(window, message, wparam, lparam);
   }
@@ -76,6 +97,7 @@ LRESULT CALLBACK Proc(HWND window, UINT message, WPARAM wparam, LPARAM lparam) {
       flags_verified = Flags(true);
       lost_focus = false;
       WinKey();
+      Letters();
       step = 1;
     } else {
       preserved = !lost_focus && GetForegroundWindow() == owner;
@@ -91,6 +113,9 @@ LRESULT CALLBACK Proc(HWND window, UINT message, WPARAM wparam, LPARAM lparam) {
           << "\nraw_events=" << raw_events << "\nwin_events=" << win_events << '\n';
       out << "sent_keys=" << sent_keys << "\nr_events=" << r_events << '\n';
       out << "raw_win_events=" << raw_win_events << "\nraw_r_events=" << raw_r_events << '\n';
+      out << "capture_ime_disabled=" << ime_disabled << "\nime_compositions=" << ime_starts
+          << "\nsent_letters=" << sent_letters << "\nraw_letter_events=" << raw_letter_events
+          << "\nlanguage=" << LOWORD(reinterpret_cast<ULONG_PTR>(GetKeyboardLayout(0))) << '\n';
       out.close();
       DestroyWindow(owner);
     }
@@ -102,6 +127,17 @@ LRESULT CALLBACK Proc(HWND window, UINT message, WPARAM wparam, LPARAM lparam) {
 }
 
 int WINAPI wWinMain(HINSTANCE instance, HINSTANCE, PWSTR, int) {
+  const HKL original_language = GetKeyboardLayout(0);
+  const int layout_count = GetKeyboardLayoutList(0, nullptr);
+  std::vector<HKL> layouts(layout_count);
+  GetKeyboardLayoutList(layout_count, layouts.data());
+  for (const HKL layout : layouts) {
+    if (PRIMARYLANGID(LOWORD(reinterpret_cast<ULONG_PTR>(layout))) == LANG_CHINESE) {
+      // Affect this probe's UI thread only, never the user's other applications.
+      ActivateKeyboardLayout(layout, 0);
+      break;
+    }
+  }
   WNDCLASSW wc{};
   wc.hInstance = instance; wc.lpfnWndProc = Proc;
   wc.lpszClassName = L"SharedInputWinKeyProbe";
@@ -109,11 +145,22 @@ int WINAPI wWinMain(HINSTANCE instance, HINSTANCE, PWSTR, int) {
   RegisterClassW(&wc);
   owner = CreateWindowW(wc.lpszClassName, L"Shared Input - Win key check", WS_OVERLAPPEDWINDOW,
       CW_USEDEFAULT, CW_USEDEFAULT, 400, 180, nullptr, nullptr, instance, nullptr);
-  if (!owner || !shared_input::RegisterKeyboard(owner, true)) return 2;
+  if (!owner || !shared_input::RegisterKeyboard(owner, true)) {
+    if (owner) DestroyWindow(owner);
+    ActivateKeyboardLayout(original_language, 0);
+    return 2;
+  }
   ShowWindow(owner, SW_SHOW);
   // Match production: a native child owns focus, its parent receives WM_INPUT.
-  const HWND child = CreateWindowW(wc.lpszClassName, L"", WS_CHILD | WS_VISIBLE,
+  child = CreateWindowW(wc.lpszClassName, L"", WS_CHILD | WS_VISIBLE,
       20, 40, 1, 1, owner, nullptr, instance, nullptr);
+  ime_disabled = shared_input::DisableCaptureIme(child);
+  if (!ime_disabled) {
+    shared_input::RegisterKeyboard(owner, false);
+    DestroyWindow(owner);
+    ActivateKeyboardLayout(original_language, 0);
+    return 2;
+  }
   const DWORD foreground_thread = GetWindowThreadProcessId(GetForegroundWindow(), nullptr);
   const bool attached = foreground_thread != GetCurrentThreadId() &&
       AttachThreadInput(GetCurrentThreadId(), foreground_thread, TRUE) != FALSE;
@@ -126,6 +173,8 @@ int WINAPI wWinMain(HINSTANCE instance, HINSTANCE, PWSTR, int) {
   while (GetMessage(&message, nullptr, 0, 0)) {
     TranslateMessage(&message); DispatchMessage(&message);
   }
+  ActivateKeyboardLayout(original_language, 0);
   return flags_verified && preserved && released && registration_reset && sent_keys == 6 &&
-      raw_win_events == 4 && raw_r_events == 2 ? 0 : 1;
+      raw_win_events == 4 && raw_r_events == 2 && ime_disabled && ime_starts == 0 &&
+      sent_letters == 4 && raw_letter_events == 4 ? 0 : 1;
 }

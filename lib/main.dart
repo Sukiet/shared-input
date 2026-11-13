@@ -49,7 +49,7 @@ class InputPage extends StatefulWidget {
 }
 
 class _InputPageState extends State<InputPage>
-    with SingleTickerProviderStateMixin {
+    with SingleTickerProviderStateMixin, WidgetsBindingObserver {
   static const _channel = MethodChannel('shared_input/dry_run');
   final _position = ValueNotifier(const Offset(300, 120));
   final _stats = ValueNotifier<Map<String, dynamic>>({});
@@ -70,14 +70,33 @@ class _InputPageState extends State<InputPage>
   String? _keyboard, _mouse, _shortcut, _identify, _speedError;
   bool _recording = false, _active = false, _ready = false, _busy = false;
   bool _readingPointer = false;
+  bool _spaceArmed = false, _windowActive = true;
+  int _shortcutGeneration = 0;
   int _frameGeneration = 0;
   double _speed = Sensitivity.defaultValue, _step = 0.0001;
   String _status = '';
   Timer? _heartbeat;
 
+  bool get _configuredForControl =>
+      _ready &&
+      _captureSupported &&
+      !_receiving &&
+      !_active &&
+      !_recording &&
+      _identify == null &&
+      _keyboard != null &&
+      _mouse != null &&
+      _shortcut != null &&
+      _speedError == null;
+
+  bool get _canStart => _configuredForControl && !_busy;
+
   @override
   void initState() {
     super.initState();
+    WidgetsBinding.instance.addObserver(this);
+    // Override button activation for Space inside this app, before focus routing.
+    FocusManager.instance.addEarlyKeyEventHandler(_onSpace);
     _preferences = SettingsRepository(widget.store ?? MemorySettingsStore());
     _lan.addListener(_connectionChanged);
     _lan.onBegin = (capture) =>
@@ -320,12 +339,82 @@ class _InputPageState extends State<InputPage>
     }
   });
 
-  Future<void> _start() => _perform(() async {
+  @override
+  void didChangeAppLifecycleState(AppLifecycleState state) {
+    _windowActive = state == AppLifecycleState.resumed;
+    if (!_windowActive) {
+      _spaceArmed = false;
+      ++_shortcutGeneration;
+    }
+  }
+
+  KeyEventResult _onSpace(KeyEvent event) {
+    if (event.logicalKey != LogicalKeyboardKey.space) {
+      return KeyEventResult.ignored;
+    }
+    if (ModalRoute.of(context)?.isCurrent == false) {
+      _spaceArmed = false;
+      return KeyEventResult.ignored;
+    }
+    final editing =
+        FocusManager.instance.primaryFocus?.context
+            ?.findAncestorStateOfType<EditableTextState>() !=
+        null;
+    if (event is KeyUpEvent) {
+      // Native capture rejects held keys, so start only after releasing Space.
+      final armed = _spaceArmed;
+      _spaceArmed = false;
+      if (!armed) return KeyEventResult.ignored;
+      if (!event.synthesized &&
+          _canStart &&
+          _windowActive &&
+          !editing &&
+          HardwareKeyboard.instance.logicalKeysPressed.isEmpty) {
+        unawaited(_connectAndStart());
+      }
+      return KeyEventResult.handled;
+    }
+    if (_spaceArmed) return KeyEventResult.handled;
+    if (event is KeyDownEvent &&
+        !event.synthesized &&
+        _canStart &&
+        _windowActive &&
+        !editing &&
+        HardwareKeyboard.instance.logicalKeysPressed.length == 1) {
+      _spaceArmed = true;
+      return KeyEventResult.handled;
+    }
+    return KeyEventResult.ignored;
+  }
+
+  Future<void> _connectAndStart() async {
+    if (!_canStart) return;
+    final generation = _shortcutGeneration;
+    bool allowed() =>
+        mounted &&
+        _windowActive &&
+        generation == _shortcutGeneration &&
+        _configuredForControl &&
+        _lan.connected;
+    await _perform(() async {
+      if (!_lan.connected) await _changeConnection();
+      if (allowed()) await _startCapture(allowed: allowed);
+    });
+  }
+
+  Future<void> _start() => _perform(_startCapture);
+
+  Future<void> _startCapture({bool Function()? allowed}) async {
     FocusManager.instance.primaryFocus?.unfocus();
     await _saveSettings();
     await _preferences.flush();
+    if (allowed != null && !allowed()) return;
     if (_lan.connected) {
       await _lan.beginCapture();
+    }
+    if (allowed != null && !allowed()) {
+      await _lan.endCapture();
+      return;
     }
     try {
       await _channel.invokeMethod<void>('start', {
@@ -349,7 +438,7 @@ class _InputPageState extends State<InputPage>
       });
       _frames.start();
     }
-  });
+  }
 
   void _setSpeed(double value) {
     final gain = Sensitivity.quantize(value);
@@ -398,7 +487,9 @@ class _InputPageState extends State<InputPage>
     });
     await _saveSettings();
   });
-  Future<void> _connect() => _perform(() async {
+  Future<void> _connect() => _perform(_changeConnection);
+
+  Future<void> _changeConnection() async {
     final port = int.tryParse(_portText.text);
     if (port == null || port <= 0 || port > 65535) {
       throw const FormatException('端口范围为 1～65535。');
@@ -425,10 +516,12 @@ class _InputPageState extends State<InputPage>
       );
     }
     if (mounted) setState(() => _status = '');
-  });
+  }
 
   @override
   void dispose() {
+    FocusManager.instance.removeEarlyKeyEventHandler(_onSpace);
+    WidgetsBinding.instance.removeObserver(this);
     ++_frameGeneration;
     _frames.dispose();
     _heartbeat?.cancel();
@@ -447,18 +540,7 @@ class _InputPageState extends State<InputPage>
 
   @override
   Widget build(BuildContext context) {
-    final canStart =
-        _ready &&
-        _captureSupported &&
-        !_receiving &&
-        !_active &&
-        !_recording &&
-        _identify == null &&
-        !_busy &&
-        _keyboard != null &&
-        _mouse != null &&
-        _shortcut != null &&
-        _speedError == null;
+    final canStart = _canStart;
     return Scaffold(
       body: SafeArea(
         child: LayoutBuilder(
@@ -697,6 +779,14 @@ class _InputPageState extends State<InputPage>
           ),
         ),
       ),
+      if (!_active)
+        const Padding(
+          padding: EdgeInsets.only(top: 7),
+          child: Text(
+            'Space 连接并开始控制',
+            style: TextStyle(fontSize: 11, color: Color(0xff929aa6)),
+          ),
+        ),
     ],
   );
 

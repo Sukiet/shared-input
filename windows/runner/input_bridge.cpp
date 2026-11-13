@@ -1,6 +1,7 @@
 #include "input_bridge.h"
 #include "pointer_motion.h"
 #include "keyboard_capture.h"
+#include "capture_ime.h"
 
 #include <cfgmgr32.h>
 #include <setupapi.h>
@@ -154,7 +155,8 @@ bool InputBridge::Initialize() {
   // controls, while Flutter continues rendering the simulated desktop.
   capture_ = CreateWindowExW(0, kCaptureClass, L"", WS_CHILD,
       0, 0, 1, 1, owner_, nullptr, wc.hInstance, this);
-  if (!capture_ || !SetTimer(owner_, kStatsTimer, 100, nullptr)) {
+  if (!capture_ || !shared_input::DisableCaptureIme(capture_) ||
+      !SetTimer(owner_, kStatsTimer, 100, nullptr)) {
     RAWINPUTDEVICE remove[] = {{0x01, 0x06, RIDEV_REMOVE, nullptr},
                                {0x01, 0x02, RIDEV_REMOVE, nullptr}};
     RegisterRawInputDevices(remove, 2, sizeof(RAWINPUTDEVICE));
@@ -332,6 +334,11 @@ void InputBridge::Start(const Map& args, std::unique_ptr<Result> result) {
   RECT client{};
   GetClientRect(owner_, &client);
   POINT center{(client.right - client.left) / 2, (client.bottom - client.top) / 2};
+  if (!shared_input::DisableCaptureIme(capture_)) {
+    remote_capture_ = false;
+    result->Error("ime_disable_failed", "无法暂停采集窗口的本地输入法，已取消控制。");
+    return;
+  }
   SetWindowPos(capture_, HWND_TOP, center.x, center.y, 1, 1, SWP_SHOWWINDOW);
   active_ = true;
   SetFocus(capture_);
@@ -599,6 +606,9 @@ LRESULT CALLBACK InputBridge::CaptureProc(HWND window, UINT message, WPARAM wpar
   }
   auto self = reinterpret_cast<InputBridge*>(GetWindowLongPtr(window, GWLP_USERDATA));
   if (self) {
+    if (const auto result = shared_input::HandleCaptureImeMessage(window, message, wparam, lparam)) {
+      return *result;
+    }
     if (message == WM_KILLFOCUS && self->active_) self->Stop("focus_lost");
     if (message == WM_SETCURSOR && self->active_) { SetCursor(nullptr); return TRUE; }
     // Independent legacy-message fallback for the exit chord, including

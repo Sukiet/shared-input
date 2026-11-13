@@ -5,6 +5,7 @@ import 'package:flutter/services.dart';
 import 'package:flutter_test/flutter_test.dart';
 import 'package:shared_input/main.dart';
 import 'package:shared_input/pointer_preview.dart';
+import 'package:shared_input/remote/lan_session.dart';
 import 'package:shared_input/settings.dart';
 
 void main() {
@@ -252,6 +253,150 @@ void main() {
   windowsTest('compact window scrolls without overflow', (tester) async {
     await open(tester, width: 420);
     expect(tester.takeException(), isNull);
+    await tester.pumpWidget(const SizedBox());
+  });
+
+  windowsTest('space connects then starts remotely on release and can resume', (
+    tester,
+  ) async {
+    const key = '0123456789abcdef0123456789abcdef';
+    final receiver = LanSession();
+    var begins = 0;
+    receiver.onBegin = (_) async => ++begins;
+    addTearDown(() async {
+      await receiver.close();
+      receiver.dispose();
+    });
+    await tester.runAsync(
+      () => receiver.listen(port: 0, key: key, bindAddress: '127.0.0.1'),
+    );
+    final saved = AppSettings()
+      ..keyboardId = 'keyboard-1'
+      ..mouseId = 'mouse-1'
+      ..shortcut = const ExitShortcut(0x77)
+      ..host = '127.0.0.1'
+      ..port = receiver.port
+      ..peerKey = key;
+    await open(
+      tester,
+      store: MemorySettingsStore()..value = jsonEncode(saved.toJson()),
+    );
+    Future<void> releaseAndWait(int starts) async {
+      await tester.runAsync(() async {
+        await tester.sendKeyUpEvent(LogicalKeyboardKey.space);
+        final deadline = DateTime.now().add(const Duration(seconds: 5));
+        while (calls.where((call) => call.method == 'start').length < starts) {
+          if (DateTime.now().isAfter(deadline)) {
+            fail('Space did not start remote capture');
+          }
+          await Future<void>.delayed(const Duration(milliseconds: 5));
+        }
+      });
+      await tester.pump();
+    }
+
+    await tester.sendKeyDownEvent(LogicalKeyboardKey.space);
+    await tester.sendKeyRepeatEvent(LogicalKeyboardKey.space);
+    await tester.pump();
+    expect(receiver.connected, isFalse);
+    expect(calls.where((call) => call.method == 'start'), isEmpty);
+    await releaseAndWait(1);
+    final arguments =
+        calls.singleWhere((call) => call.method == 'start').arguments as Map;
+    expect(arguments['remote'], isTrue);
+    expect(begins, 1);
+    await tester.sendKeyEvent(LogicalKeyboardKey.space);
+    await tester.pump();
+    expect(calls.where((call) => call.method == 'start').length, 1);
+    await tester.runAsync(() => native('stopped', {'reason': 'shortcut'}));
+    await tester.pumpAndSettle();
+
+    // A focused connection button must not consume Space and disconnect.
+    final buttonFocus = FocusManager.instance.rootScope.descendants.firstWhere(
+      (node) =>
+          node.canRequestFocus &&
+          node.context?.findAncestorWidgetOfExactType<FilledButton>()?.key ==
+              const Key('connection-action'),
+    );
+    buttonFocus.requestFocus();
+    await tester.pump();
+    await tester.sendKeyDownEvent(LogicalKeyboardKey.space);
+    await releaseAndWait(2);
+    expect(begins, 2);
+    await tester.runAsync(() => native('stopped', {'reason': 'shortcut'}));
+    await tester.pumpAndSettle();
+
+    // Losing the window during receiver authorization cancels automatic start,
+    // even if focus returns before the authorization finishes.
+    final authorization = Completer<void>();
+    receiver.onBegin = (_) async {
+      ++begins;
+      await authorization.future;
+    };
+    await tester.sendKeyDownEvent(LogicalKeyboardKey.space);
+    await tester.runAsync(() async {
+      await tester.sendKeyUpEvent(LogicalKeyboardKey.space);
+      final deadline = DateTime.now().add(const Duration(seconds: 5));
+      while (begins < 3) {
+        if (DateTime.now().isAfter(deadline)) fail('No receiver authorization');
+        await Future<void>.delayed(const Duration(milliseconds: 5));
+      }
+    });
+    await tester.pump();
+    await tester.sendKeyEvent(LogicalKeyboardKey.space);
+    tester.binding.handleAppLifecycleStateChanged(AppLifecycleState.inactive);
+    tester.binding.handleAppLifecycleStateChanged(AppLifecycleState.resumed);
+    await tester.runAsync(() async {
+      authorization.complete();
+      final deadline = DateTime.now().add(const Duration(seconds: 5));
+      while (receiver.capturing) {
+        if (DateTime.now().isAfter(deadline)) fail('Capture was not cancelled');
+        await Future<void>.delayed(const Duration(milliseconds: 5));
+      }
+    });
+    await tester.pumpAndSettle();
+    expect(calls.where((call) => call.method == 'start').length, 2);
+    await tester.pumpWidget(const SizedBox());
+  });
+
+  windowsTest('space respects setup, text editing and connection failures', (
+    tester,
+  ) async {
+    await open(tester);
+    await tester.sendKeyEvent(LogicalKeyboardKey.space);
+    await tester.pumpAndSettle();
+    expect(calls.where((call) => call.method == 'start'), isEmpty);
+    await configure(tester);
+    for (final key in [
+      'remote-host',
+      'peer-key',
+      'remote-port',
+      'sensitivity',
+    ]) {
+      await tester.tap(find.byKey(Key(key)));
+      await tester.pumpAndSettle();
+      await tester.sendKeyEvent(LogicalKeyboardKey.space);
+      await tester.pumpAndSettle();
+      expect(find.textContaining('请输入被控端 IP'), findsNothing);
+      expect(calls.where((call) => call.method == 'start'), isEmpty);
+    }
+    FocusManager.instance.primaryFocus?.unfocus();
+    await tester.pumpAndSettle();
+    await tester.sendKeyDownEvent(LogicalKeyboardKey.controlLeft);
+    await tester.sendKeyEvent(LogicalKeyboardKey.space);
+    await tester.sendKeyUpEvent(LogicalKeyboardKey.controlLeft);
+    await tester.pumpAndSettle();
+    expect(find.textContaining('请输入被控端 IP'), findsNothing);
+    await tester.sendKeyEvent(LogicalKeyboardKey.space);
+    await tester.pumpAndSettle();
+    expect(find.textContaining('请输入被控端 IP'), findsOneWidget);
+    expect(calls.where((call) => call.method == 'start'), isEmpty);
+    await tester.tap(find.text('被控端'));
+    await tester.pumpAndSettle();
+    await tester.sendKeyEvent(LogicalKeyboardKey.space);
+    await tester.pumpAndSettle();
+    expect(find.text('开始接收'), findsOneWidget);
+    expect(calls.where((call) => call.method == 'start'), isEmpty);
     await tester.pumpWidget(const SizedBox());
   });
 
