@@ -32,6 +32,50 @@ void main() {
   }
 
   test(
+    'scroll speed travels with wheel input without changing signed raw deltas',
+    () async {
+      final delivered = <Map<String, dynamic>>[];
+      receiver.onInput = (_, frames) async {
+        delivered.addAll(frames.where((frame) => frame['kind'] != 'motion'));
+      };
+      await connect();
+      await controller.beginCapture();
+      var sequence = 0;
+      Future<void> send(Map<String, dynamic> event) async {
+        ++sequence;
+        controller.sendInput({
+          'sequence': sequence,
+          'epoch': sequence,
+          'x': 0.0,
+          'y': 0.0,
+          'events': [
+            {
+              ...event,
+              'sequence': sequence,
+              'epoch': sequence,
+              'x': 0.0,
+              'y': 0.0,
+            },
+          ],
+        });
+        await eventually(() => delivered.length == sequence);
+      }
+
+      controller.scrollSpeed = 20;
+      await send({'kind': 'wheel', 'delta': -32768, 'horizontal': false});
+      expect(delivered.last['delta'], -32768);
+      expect(delivered.last['scrollSpeed'], 20);
+      controller.scrollSpeed = 0.01;
+      await send({'kind': 'wheel', 'delta': 30, 'horizontal': true});
+      expect(delivered.last['delta'], 30);
+      expect(delivered.last['scrollSpeed'], 0.01);
+      expect(delivered.last['horizontal'], isTrue);
+      await send({'kind': 'key', 'code': 30, 'down': true, 'extended': false});
+      expect(delivered.last.containsKey('scrollSpeed'), isFalse);
+    },
+  );
+
+  test(
     'authenticated loopback delivers input, preserves latest motion and releases on stop',
     () async {
       final tracker = MotionTracker();

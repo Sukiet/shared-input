@@ -7,6 +7,7 @@ import 'package:flutter/services.dart';
 import 'pointer_preview.dart';
 import 'private_text_field.dart';
 import 'sensitivity.dart';
+import 'scroll_speed.dart';
 import 'settings.dart';
 import 'remote/lan_session.dart';
 
@@ -54,6 +55,7 @@ class _InputPageState extends State<InputPage>
   final _position = ValueNotifier(const Offset(300, 120));
   final _stats = ValueNotifier<Map<String, dynamic>>({});
   final _speedText = TextEditingController(text: '0.1000');
+  final _scrollSpeedText = TextEditingController(text: '3.00');
   final _hostText = TextEditingController();
   final _portText = TextEditingController(text: '45831');
   final _peerKeyText = TextEditingController();
@@ -77,6 +79,7 @@ class _InputPageState extends State<InputPage>
   double _speed = Sensitivity.defaultValue, _step = 0.0001;
   String _status = '';
   Timer? _heartbeat;
+  String? _scrollSpeedError;
 
   bool get _configuredForControl =>
       _ready &&
@@ -87,7 +90,8 @@ class _InputPageState extends State<InputPage>
       _identify == null &&
       (_settings.edgeSwitchEnabled || (_keyboard != null && _mouse != null)) &&
       _shortcut != null &&
-      _speedError == null;
+      _speedError == null &&
+      _scrollSpeedError == null;
 
   bool get _canStart => _configuredForControl && !_busy;
 
@@ -177,6 +181,7 @@ class _InputPageState extends State<InputPage>
         _speed = _settings.sensitivity;
         _step = _settings.step;
         _speedText.text = _speed.toStringAsFixed(4);
+        _scrollSpeedText.text = _settings.scrollSpeed.toStringAsFixed(2);
         _hostText.text = _settings.host;
         _portText.text = '${_settings.port}';
         _peerKeyText.text = _settings.peerKey;
@@ -533,6 +538,7 @@ class _InputPageState extends State<InputPage>
 
   Future<void> _saveSettings() async {
     if (!_settingsLoaded) return;
+    _lan.scrollSpeed = _settings.scrollSpeed;
     _settings.sensitivity = _speed;
     _settings.step = _step;
     _settings.host = _hostText.text.trim();
@@ -612,6 +618,7 @@ class _InputPageState extends State<InputPage>
     _position.dispose();
     _stats.dispose();
     _speedText.dispose();
+    _scrollSpeedText.dispose();
     _hostText.dispose();
     _portText.dispose();
     _peerKeyText.dispose();
@@ -833,6 +840,65 @@ class _InputPageState extends State<InputPage>
             ),
           ),
         ],
+      ),
+      const SizedBox(height: 20),
+      Row(
+        children: [
+          const Expanded(
+            child: Text('滚轮速度', style: TextStyle(fontWeight: FontWeight.w600)),
+          ),
+          SizedBox(
+            width: 100,
+            child: TextField(
+              key: const Key('scroll-speed'),
+              controller: _scrollSpeedText,
+              enabled: _ready && !_busy && !_active,
+              keyboardType: const TextInputType.numberWithOptions(
+                decimal: true,
+              ),
+              decoration: InputDecoration(
+                suffixText: '×',
+                errorText: _scrollSpeedError,
+              ),
+              onChanged: (text) {
+                final value = ScrollSpeed.parse(text);
+                setState(() {
+                  _scrollSpeedError = value == null ? '0.01～20' : null;
+                  if (value != null) _settings.scrollSpeed = value;
+                });
+                if (value != null) _persist();
+              },
+              onSubmitted: (_) {
+                if (_scrollSpeedError == null) {
+                  _scrollSpeedText.text = _settings.scrollSpeed.toStringAsFixed(
+                    2,
+                  );
+                }
+              },
+            ),
+          ),
+        ],
+      ),
+      Slider(
+        key: const Key('scroll-speed-slider'),
+        value: ScrollSpeed.toSlider(_settings.scrollSpeed),
+        label: '${_settings.scrollSpeed.toStringAsFixed(2)}×',
+        onChanged: _ready && !_busy && !_active
+            ? (position) {
+                setState(() {
+                  _settings.scrollSpeed = ScrollSpeed.fromSlider(position);
+                  _scrollSpeedText.text = _settings.scrollSpeed.toStringAsFixed(
+                    2,
+                  );
+                  _scrollSpeedError = null;
+                });
+                _persist();
+              }
+            : null,
+      ),
+      const Text(
+        'Mac · 0.01× — 20×',
+        style: TextStyle(fontSize: 11, color: Color(0xff929aa6)),
       ),
       const SizedBox(height: 26),
       Row(

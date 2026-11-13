@@ -3,6 +3,7 @@ import 'dart:convert';
 import 'dart:io';
 import 'package:flutter/foundation.dart';
 import '../settings.dart';
+import '../scroll_speed.dart';
 import 'protocol.dart';
 import 'input_diagnostics.dart';
 
@@ -82,6 +83,7 @@ class _Wire {
 
 class LanSession extends ChangeNotifier {
   final diagnostics = InputDiagnostics();
+  double scrollSpeed = ScrollSpeed.defaultValue;
   Future<void> Function(String capture)? onBegin;
   Future<void> Function(String capture, Map<String, dynamic> options)?
   onBeginWithOptions;
@@ -520,7 +522,13 @@ class LanSession extends ChangeNotifier {
       (frame['y'] as num).toDouble(),
       frame['epoch'] as int,
     );
-    final events = (frame['events'] as List?) ?? [];
+    final events = [
+      for (final event in (frame['events'] as List?) ?? [])
+        if (event is Map && event['kind'] == 'wheel')
+          {...event, 'scrollSpeed': scrollSpeed}
+        else
+          event,
+    ];
     _latestMotion = motion;
     if (events.isNotEmpty) {
       // Every reliable event includes its preceding motion and an epoch barrier.

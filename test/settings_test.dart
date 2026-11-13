@@ -28,6 +28,7 @@ void main() {
       ..mouseId = 'mouse-path'
       ..shortcut = const ExitShortcut(0x77, shift: true)
       ..sensitivity = 0.0017
+      ..scrollSpeed = 12.34
       ..step = 0.001
       ..sendHz = 1000
       ..smoothingEnabled = false
@@ -40,6 +41,7 @@ void main() {
     final restored = await SettingsRepository(store).load();
     expect(restored.toJson(), saved.toJson());
     expect(restored.shortcut!.label, 'Ctrl + Alt + Shift + F8');
+    expect(restored.scrollSpeed, 12.34);
     expect(restored.toJson().containsKey('active'), isFalse);
     expect(restored.toJson().containsKey('connected'), isFalse);
   });
@@ -75,6 +77,17 @@ void main() {
     final settings = AppSettings.fromJson({'ctrlToCommand': true});
     expect(settings.toJson().containsKey('ctrlToCommand'), isFalse);
   });
+  test(
+    'scroll speed restores defaults and rejects invalid persisted values',
+    () {
+      expect(AppSettings.fromJson({}).scrollSpeed, 3.0);
+      for (final value in [0, -1, 20.01, 'NaN', 'Infinity', 'bad']) {
+        expect(AppSettings.fromJson({'scrollSpeed': value}).scrollSpeed, 3.0);
+      }
+      expect(AppSettings.fromJson({'scrollSpeed': 0.01}).scrollSpeed, 0.01);
+      expect(AppSettings.fromJson({'scrollSpeed': 20}).scrollSpeed, 20.0);
+    },
+  );
   test(
     'rapid writes coalesce and the latest snapshot is durable when awaited',
     () async {

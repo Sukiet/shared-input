@@ -292,8 +292,17 @@ final class RemoteInputBridge {
       post(event)
     case "wheel":
       guard let raw = frame["delta"] as? NSNumber, abs(raw.doubleValue) <= 32768 else { return false }
-      if frame["horizontal"] as? Bool ?? false { wheelX += raw.doubleValue / 120 * 24 }
-      else { wheelY += raw.doubleValue / 120 * 24 }
+      let speed: Double
+      if let value = frame["scrollSpeed"] {
+        guard let number = value as? NSNumber, number.doubleValue.isFinite,
+              (0.01...20).contains(number.doubleValue) else { return false }
+        speed = number.doubleValue
+      } else {
+        speed = 1 // Preserve existing behavior with older controllers.
+      }
+      let pixels = raw.doubleValue / 120 * 24 * speed
+      if frame["horizontal"] as? Bool ?? false { wheelX += pixels }
+      else { wheelY += pixels }
       let x = Int32(wheelX.rounded()), y = Int32(wheelY.rounded())
       wheelX -= Double(x); wheelY -= Double(y)
       if x != 0 || y != 0 {

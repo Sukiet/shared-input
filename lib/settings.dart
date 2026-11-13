@@ -2,6 +2,7 @@ import 'dart:convert';
 import 'dart:math';
 import 'package:shared_preferences/shared_preferences.dart';
 import 'sensitivity.dart';
+import 'scroll_speed.dart';
 
 enum InputRole { controller, receiver }
 
@@ -41,6 +42,7 @@ class AppSettings {
   String? keyboardId, mouseId;
   ExitShortcut? shortcut;
   double sensitivity = Sensitivity.defaultValue;
+  double scrollSpeed = ScrollSpeed.defaultValue;
   double step = 0.0001;
   int sendHz = 500;
   bool smoothingEnabled = true;
@@ -68,6 +70,7 @@ class AppSettings {
     'mouseId': mouseId,
     'shortcut': shortcut?.toJson(),
     'sensitivity': sensitivity,
+    'scrollSpeed': scrollSpeed,
     'step': step,
     'sendHz': sendHz,
     'smoothingEnabled': smoothingEnabled,
@@ -103,6 +106,8 @@ class AppSettings {
     result.shortcut = ExitShortcut.fromJson(json['shortcut']);
     final sensitivity = Sensitivity.parse('${json['sensitivity']}');
     if (sensitivity != null) result.sensitivity = sensitivity;
+    result.scrollSpeed =
+        ScrollSpeed.parse('${json['scrollSpeed']}') ?? ScrollSpeed.defaultValue;
     if ([0.0001, 0.001, 0.01, 0.1].contains(json['step'])) {
       result.step = (json['step'] as num).toDouble();
     }

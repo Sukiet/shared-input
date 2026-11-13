@@ -7,6 +7,7 @@ import 'package:shared_input/main.dart';
 import 'package:shared_input/pointer_preview.dart';
 import 'package:shared_input/remote/lan_session.dart';
 import 'package:shared_input/settings.dart';
+import 'package:shared_input/scroll_speed.dart';
 
 void main() {
   TestWidgetsFlutterBinding.ensureInitialized();
@@ -232,6 +233,51 @@ void main() {
       expect(args['speed'], 0.0001);
       await native('stopped', {'reason': 'shortcut', 'held': 0});
       await tester.pumpAndSettle();
+      await tester.pumpWidget(const SizedBox());
+    },
+  );
+
+  windowsTest(
+    'scroll speed slider and exact input persist independently of pointer gain',
+    (tester) async {
+      final saved = AppSettings()
+        ..keyboardId = 'keyboard-1'
+        ..mouseId = 'mouse-1'
+        ..shortcut = const ExitShortcut(0x77)
+        ..sensitivity = 0.0017;
+      final store = MemorySettingsStore()..value = jsonEncode(saved.toJson());
+      await open(tester, store: store);
+      TextField field() =>
+          tester.widget<TextField>(find.byKey(const Key('scroll-speed')));
+      expect(field().controller!.text, '3.00');
+      tester
+          .widget<Slider>(find.byKey(const Key('scroll-speed-slider')))
+          .onChanged!(ScrollSpeed.toSlider(12.34));
+      await tester.pumpAndSettle();
+      expect(field().controller!.text, '12.34');
+      expect(jsonDecode(store.value!)['scrollSpeed'], 12.34);
+      expect(jsonDecode(store.value!)['sensitivity'], 0.0017);
+      await tester.enterText(find.byKey(const Key('scroll-speed')), '0.01');
+      await tester.pumpAndSettle();
+      expect(jsonDecode(store.value!)['scrollSpeed'], 0.01);
+      await tester.enterText(find.byKey(const Key('scroll-speed')), '0');
+      await tester.pumpAndSettle();
+      expect(start(tester).onPressed, isNull);
+      tester
+          .widget<Slider>(find.byKey(const Key('scroll-speed-slider')))
+          .onChanged!(1);
+      await tester.pumpAndSettle();
+      expect(start(tester).onPressed, isNotNull);
+      expect(jsonDecode(store.value!)['scrollSpeed'], 20.0);
+      await tester.pumpWidget(const SizedBox());
+      await open(tester, store: store);
+      expect(field().controller!.text, '20.00');
+      expect(
+        tester
+            .widget<Slider>(find.byKey(const Key('scroll-speed-slider')))
+            .value,
+        1,
+      );
       await tester.pumpWidget(const SizedBox());
     },
   );
