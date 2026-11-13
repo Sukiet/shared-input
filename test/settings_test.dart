@@ -30,6 +30,10 @@ void main() {
       ..sensitivity = 0.0017
       ..step = 0.001
       ..sendHz = 1000
+      ..smoothingEnabled = false
+      ..smoothingDurationMs = 32
+      ..smoothingIntervalMs = 2
+      ..smoothingLeewayUs = 100
       ..statisticsExpanded = true;
     await SettingsRepository(store).save(saved);
     final restored = await SettingsRepository(store).load();
@@ -48,6 +52,10 @@ void main() {
       'shortcut': {'key': 0x7b},
       'step': -1,
       'listenKey': 'short',
+      'smoothingEnabled': 'false',
+      'smoothingDurationMs': 0,
+      'smoothingIntervalMs': 17,
+      'smoothingLeewayUs': -1,
     });
     final settings = await SettingsRepository(store).load();
     expect(settings.port, 45831);
@@ -55,6 +63,12 @@ void main() {
     expect(settings.shortcut, isNull);
     expect(settings.sensitivity, 0.1);
     expect(settings.listenKey.length, 32);
+    expect(settings.smoothingOptions, {
+      'enabled': true,
+      'durationMs': 12,
+      'intervalMs': 4,
+      'leewayUs': 500,
+    });
   });
   test('legacy Ctrl-to-Command preference is discarded', () {
     final settings = AppSettings.fromJson({'ctrlToCommand': true});

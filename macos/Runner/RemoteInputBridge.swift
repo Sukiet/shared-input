@@ -8,6 +8,20 @@ final class RemoteInputBridge {
   private let channel: FlutterMethodChannel
   private let lock = NSLock()
   private var timer: DispatchSourceTimer?
+  private var motionTimer: DispatchSourceTimer?
+  private var interpolator = PointerInterpolator()
+  private var smoothingEnabled = true
+  private var motionIntervalMs = 4
+  private var motionLeewayUs = 500
+
+  private func scheduleMotionLocked() {
+    if capture != nil && smoothingEnabled {
+      motionTimer?.schedule(deadline: .now(), repeating: .milliseconds(motionIntervalMs),
+                            leeway: .microseconds(motionLeewayUs))
+    } else {
+      motionTimer?.schedule(deadline: .distantFuture)
+    }
+  }
   private var activity: NSObjectProtocol?
   private var capture: String?
   private var lastReceived = ProcessInfo.processInfo.systemUptime
@@ -22,6 +36,18 @@ final class RemoteInputBridge {
   private var clickTime = 0.0
   private var clickPosition = CGPoint.zero
   private let source = CGEventSource(stateID: .privateState)
+  private var diagnosticsEnabled = false
+  private var diagnosticStats: [String: Double] = [:]
+  private var lastInputTime: UInt64?
+  private func tick() -> UInt64 { DispatchTime.now().uptimeNanoseconds }
+  // Called under lock (except initialize, which runs on the same main queue).
+  private func measure(_ name: String, _ started: UInt64) {
+    guard diagnosticsEnabled else { return }
+    let elapsed = Double(tick() - started) / 1000
+    diagnosticStats[name + "Count", default: 0] += 1
+    diagnosticStats[name + "TotalUs", default: 0] += elapsed
+    diagnosticStats[name + "MaxUs"] = max(diagnosticStats[name + "MaxUs", default: 0], elapsed)
+  }
 
   init(messenger: FlutterBinaryMessenger) {
     channel = FlutterMethodChannel(name: "shared_input/dry_run", binaryMessenger: messenger)
@@ -38,8 +64,25 @@ final class RemoteInputBridge {
     }
     timer.resume()
     self.timer = timer
+    // A separate native clock keeps smoothing independent of network bursts
+    // and Flutter frames. The watchdog retains its own queue.
+    let motionTimer = DispatchSource.makeTimerSource(
+      queue: DispatchQueue(label: "shared-input-motion", qos: .userInteractive))
+    motionTimer.schedule(deadline: .distantFuture)
+    motionTimer.setEventHandler { [weak self] in
+      guard let self = self else { return }
+      self.lock.lock()
+      defer { self.lock.unlock() }
+      guard self.capture != nil else { return }
+      // Do not emit delayed motion after a stalled connection has timed out.
+      let now = ProcessInfo.processInfo.systemUptime
+      if now - self.lastReceived >= 1.5 { self.releaseLocked(); return }
+      self.emitMotionLocked(self.interpolator.value(at: now))
+    }
+    motionTimer.resume()
+    self.motionTimer = motionTimer
   }
-  deinit { timer?.cancel(); stop() }
+  deinit { motionTimer?.cancel(); timer?.cancel(); stop() }
   func stop() {
     lock.lock(); defer { lock.unlock() }
     releaseLocked()
@@ -48,7 +91,39 @@ final class RemoteInputBridge {
   private func handle(_ call: FlutterMethodCall, _ result: @escaping FlutterResult) {
     let args = call.arguments as? [String: Any] ?? [:]
     switch call.method {
-    case "initialize": stop(); result(nil)
+    case "initialize":
+      stop()
+      diagnosticsEnabled = args["diagnostics"] as? Bool ?? false
+      result(nil)
+    case "receiverConfigureSmoothing":
+      guard let enabled = args["enabled"] as? Bool,
+            let duration = args["durationMs"] as? Int, (1...100).contains(duration),
+            let interval = args["intervalMs"] as? Int, (1...16).contains(interval),
+            let leeway = args["leewayUs"] as? Int, (0...2000).contains(leeway) else {
+        result(FlutterError(code: "invalid_smoothing", message: "平滑参数超出范围。", details: nil)); return
+      }
+      lock.lock()
+      let now = ProcessInfo.processInfo.systemUptime
+      if capture != nil {
+        emitMotionLocked(enabled ? interpolator.value(at: now) : interpolator.target)
+      }
+      if interpolator.duration != Double(duration) / 1000 {
+        interpolator.setDuration(Double(duration) / 1000, at: now)
+      }
+      if !enabled || capture == nil { interpolator.reset(position, at: now) }
+      smoothingEnabled = enabled
+      motionIntervalMs = interval
+      motionLeewayUs = leeway
+      scheduleMotionLocked()
+      lock.unlock()
+      result(nil)
+    case "receiverDiagnostics":
+      lock.lock()
+      let snapshot = diagnosticStats
+      diagnosticStats.removeAll(keepingCapacity: true)
+      let active = capture != nil
+      lock.unlock()
+      result(["active": active, "timings": snapshot])
     case "heartbeat", "restoreShortcut", "cancelSetup": result(nil)
     case "devices": result([])
     case "permissions": result(CGPreflightPostEventAccess())
@@ -68,6 +143,8 @@ final class RemoteInputBridge {
         reason: "Receiving keyboard and mouse input")
       position = CGEvent(source: nil)?.location ?? .zero
       lastReceived = ProcessInfo.processInfo.systemUptime
+      interpolator.reset(position, at: lastReceived)
+      scheduleMotionLocked()
       lock.unlock()
       result(nil)
     case "receiverHeartbeat":
@@ -79,7 +156,13 @@ final class RemoteInputBridge {
       else { result(FlutterError(code: "receiver_stopped", message: "接收已停止。", details: nil)) }
     case "receiverStop": stop(); result(nil)
     case "receiverInput":
-      lock.lock(); defer { lock.unlock() }
+      let entered = tick()
+      lock.lock()
+      measure("lockWait", entered)
+      let started = tick()
+      if let previous = lastInputTime { measure("inputGap", previous) }
+      lastInputTime = started
+      defer { measure("input", started); lock.unlock() }
       guard let id = args["capture"] as? String, id == capture,
             let frames = args["frames"] as? [[String: Any]], frames.count <= 256 else {
         result(FlutterError(code: "invalid_input", message: "输入会话已停止。", details: nil)); return
@@ -106,10 +189,14 @@ final class RemoteInputBridge {
     return flags
   }
   private func post(_ event: CGEvent?) {
+    let started = tick()
+    defer { measure("post", started) }
     event?.flags = flags
     event?.post(tap: .cghidEventTap)
   }
   private func constrained(_ point: CGPoint) -> CGPoint {
+    let started = tick()
+    defer { measure("displayQuery", started) }
     var displays = [CGDirectDisplayID](repeating: 0, count: 32)
     var count: UInt32 = 0
     guard CGGetActiveDisplayList(32, &displays, &count) == .success else { return point }
@@ -128,18 +215,36 @@ final class RemoteInputBridge {
     let dx = value.x - total.x, dy = value.y - total.y
     total = value; sequence = next.int64Value
     if dx == 0 && dy == 0 { return true }
-    if let current = CGEvent(source: nil)?.location, hypot(current.x - position.x, current.y - position.y) > 1.5 {
-      position = current
+    // Accumulate onto the destination, not the partly interpolated cursor.
+    // Reading the hardware position here would mistake our own delayed motion
+    // for local input and repeatedly pull the smoothed cursor backwards.
+    let target = interpolator.target
+    interpolator.retarget(constrained(CGPoint(x: target.x + dx, y: target.y + dy)),
+                          at: ProcessInfo.processInfo.systemUptime)
+    if !smoothingEnabled {
+      emitMotionLocked(interpolator.target)
+      interpolator.reset(position, at: ProcessInfo.processInfo.systemUptime)
     }
-    position = constrained(CGPoint(x: position.x + dx, y: position.y + dy))
+    return true
+  }
+  private func emitMotionLocked(_ point: CGPoint) {
+    let point = constrained(point)
+    guard point != position else { return }
+    position = point
     let button = heldButtons.contains(0) ? 0 : heldButtons.contains(1) ? 1 : heldButtons.sorted().first ?? 0
     let type: CGEventType = heldButtons.isEmpty ? .mouseMoved : button == 0 ? .leftMouseDragged : button == 1 ? .rightMouseDragged : .otherMouseDragged
     post(CGEvent(mouseEventSource: source, mouseType: type, mouseCursorPosition: position,
       mouseButton: CGMouseButton(rawValue: UInt32(button))!))
-    return true
   }
   private func apply(_ frame: [String: Any]) -> Bool {
     guard motion(frame), let kind = frame["kind"] as? String else { return false }
+    if kind != "motion" {
+      // Reach this reliable event's location under the previous button/key
+      // state, then apply the transition. In particular, finish a drag before
+      // button-up; no old interpolation may cross a click or modifier change.
+      emitMotionLocked(interpolator.target)
+      interpolator.reset(position, at: ProcessInfo.processInfo.systemUptime)
+    }
     switch kind {
     case "motion": return true
     case "key":
@@ -185,6 +290,9 @@ final class RemoteInputBridge {
     return true
   }
   private func releaseLocked() {
+    motionTimer?.schedule(deadline: .distantFuture)
+    // Cancel pending movement on stop/disconnect instead of replaying it.
+    interpolator.reset(position, at: ProcessInfo.processInfo.systemUptime)
     for key in heldKeys.sorted() {
       heldKeys.remove(key)
       let event = CGEvent(keyboardEventSource: source, virtualKey: key, keyDown: false)
@@ -197,6 +305,7 @@ final class RemoteInputBridge {
         mouseButton: CGMouseButton(rawValue: UInt32(button))!))
     }
     heldButtons.removeAll(); capture = nil; sequence = -1; total = .zero
+    lastInputTime = nil
     wheelX = 0; wheelY = 0; caps = false
     if let token = activity { ProcessInfo.processInfo.endActivity(token); activity = nil }
   }

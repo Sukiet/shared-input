@@ -4,6 +4,7 @@ import 'dart:io';
 import 'package:flutter/foundation.dart';
 import '../settings.dart';
 import 'protocol.dart';
+import 'input_diagnostics.dart';
 
 class _Wire {
   _Wire(this.socket) {
@@ -80,6 +81,7 @@ class _Wire {
 }
 
 class LanSession extends ChangeNotifier {
+  final diagnostics = InputDiagnostics();
   Future<void> Function(String capture)? onBegin;
   Future<void> Function(String capture, List<Map<String, dynamic>> frames)?
   onInput;
@@ -99,6 +101,7 @@ class LanSession extends ChangeNotifier {
   bool _receiver = false, _disposed = false, _closing = false;
   bool _sendingMouse = false, _handlingEvents = false;
   MotionFrame? _pendingSend, _pendingReceive;
+  int _pendingReceiveAt = 0;
   MotionFrame? _latestMotion;
   Future<void> _delivery = Future.value();
   int _generation = 0, _appliedEpoch = 0;
@@ -265,6 +268,7 @@ class LanSession extends ChangeNotifier {
   }
 
   void _activate(_Wire wire) {
+    unawaited(diagnostics.start());
     latencyMs = null;
     sentPackets = receivedPackets = _previousSent = _previousReceived = 0;
     _rateSince = DateTime.now();
@@ -316,6 +320,7 @@ class LanSession extends ChangeNotifier {
           case 'ping':
             if (_receiver && capturing) await onHeartbeat?.call();
             if (_receiver && json['motion'] is Map) {
+              diagnostics.count('tcpMotionFallback');
               _acceptMotion(
                 MotionFrame.fromJson(
                   Map<String, dynamic>.from(json['motion'] as Map),
@@ -468,29 +473,40 @@ class LanSession extends ChangeNotifier {
     Datagram? packet;
     while ((packet = _udp?.receive()) != null) {
       final data = packet!;
+      diagnostics.count('udpRead');
+      diagnostics.gap('udpArrivalGapUs');
       if (!connected ||
           !_receiver ||
           !capturing ||
           data.address.address != _remoteAddress?.address ||
           data.port != _remoteUdpPort ||
           data.data.length != 76) {
+        diagnostics.count('udpFiltered');
         continue;
+      }
+      if (InputDiagnostics.enabled) {
+        diagnostics.udpCounter(ByteData.sublistView(data.data).getUint64(4));
       }
       final generation = _generation;
       final capture = _capture;
       final cipher = _mouseCipher!;
       unawaited(() async {
+        final started = diagnostics.now;
         try {
           final plain = await cipher.decrypt(data.data);
+          diagnostics.timing('decryptUs', diagnostics.now - started);
           if (plain == null ||
               generation != _generation ||
               capture != _capture) {
+            diagnostics.count('udpReplayOrSessionRejected');
             return;
           }
           final motion = MotionFrame.decode(plain);
           ++receivedPackets;
+          diagnostics.count('udpAccepted');
           _acceptMotion(motion);
         } catch (_) {
+          diagnostics.count('udpDecryptOrDecodeError');
           /* Unauthenticated/corrupt datagrams never change state. */
         }
       }());
@@ -499,10 +515,18 @@ class LanSession extends ChangeNotifier {
 
   bool _delivering = false;
   void _acceptMotion(MotionFrame motion) {
-    if (motion.capture != _capture || motion.epoch < _appliedEpoch) return;
+    if (motion.capture != _capture || motion.epoch < _appliedEpoch) {
+      diagnostics.count('motionStaleSessionOrEpoch');
+      return;
+    }
+    if (motion.epoch > _appliedEpoch) {
+      diagnostics.count('motionWaitingForTcpEpoch');
+    }
+    if (_pendingReceive != null) diagnostics.count('motionCoalesced');
     if (_pendingReceive == null ||
         motion.sequence > _pendingReceive!.sequence) {
       _pendingReceive = motion;
+      _pendingReceiveAt = diagnostics.now;
     }
     _flushReceive();
   }
@@ -515,15 +539,23 @@ class LanSession extends ChangeNotifier {
       return;
     }
     final motion = _pendingReceive!;
+    diagnostics.timing(
+      'pendingToDeliveryUs',
+      diagnostics.now - _pendingReceiveAt,
+    );
     final generation = _generation;
     _pendingReceive = null;
     _delivering = true;
     _delivery = () async {
       try {
         if (_capture == motion.capture) {
+          final started = diagnostics.now;
+          diagnostics.gap('deliveryStartGapUs');
           await onInput?.call(motion.capture, [
             {...motion.toJson(), 'kind': 'motion'},
           ]);
+          diagnostics.timing('platformRoundTripUs', diagnostics.now - started);
+          diagnostics.count('motionDelivered');
         }
       } catch (_) {
         if (generation == _generation && _capture == motion.capture) {
@@ -569,6 +601,7 @@ class LanSession extends ChangeNotifier {
   Future<void> close({bool keepListener = false}) async {
     if (_closing) return;
     _closing = true;
+    diagnostics.stop();
     ++_generation;
     _heartbeat?.cancel();
     _heartbeat = null;
