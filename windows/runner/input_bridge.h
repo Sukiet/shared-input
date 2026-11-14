@@ -91,6 +91,7 @@ class InputBridge {
   std::atomic<bool> stream_posted_{false}, remote_capture_{false};
   int64_t motion_sequence_ = 0, event_epoch_ = 0, flushed_sequence_ = 0, flushed_epoch_ = 0;
   double total_x_ = 0, total_y_ = 0;
+  int64_t last_motion_us_ = 0, last_stream_us_ = 0;
   flutter::EncodableList input_events_;
 };
 #endif

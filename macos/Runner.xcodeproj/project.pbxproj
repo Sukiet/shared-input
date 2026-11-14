@@ -21,6 +21,7 @@
 /* End PBXAggregateTarget section */
 
 /* Begin PBXBuildFile section */
+        AB0010010000000000000007 /* PointerPredictor.swift in Sources */ = {isa = PBXBuildFile; fileRef = AB0010020000000000000005 /* PointerPredictor.swift */; };
 		AB0010010000000000000006 /* ClipboardBridge.swift in Test Sources */ = {isa = PBXBuildFile; fileRef = AB0010020000000000000004 /* ClipboardBridge.swift */; };
 		AB0010010000000000000005 /* ClipboardBridge.swift in Sources */ = {isa = PBXBuildFile; fileRef = AB0010020000000000000004 /* ClipboardBridge.swift */; };
 		AB0010010000000000000004 /* PointerInterpolator.swift in Sources */ = {isa = PBXBuildFile; fileRef = AB0010020000000000000003 /* PointerInterpolator.swift */; };
@@ -67,6 +68,7 @@
 /* End PBXCopyFilesBuildPhase section */
 
 /* Begin PBXFileReference section */
+        AB0010020000000000000005 /* PointerPredictor.swift */ = {isa = PBXFileReference; lastKnownFileType = sourcecode.swift; path = PointerPredictor.swift; sourceTree = "<group>"; };
 		AB0010020000000000000004 /* ClipboardBridge.swift */ = {isa = PBXFileReference; lastKnownFileType = sourcecode.swift; path = ClipboardBridge.swift; sourceTree = "<group>"; };
 		AB0010020000000000000003 /* PointerInterpolator.swift */ = {isa = PBXFileReference; lastKnownFileType = sourcecode.swift; path = PointerInterpolator.swift; sourceTree = "<group>"; };
 		AB0010020000000000000001 /* RemoteInputBridge.swift */ = {isa = PBXFileReference; lastKnownFileType = sourcecode.swift; path = RemoteInputBridge.swift; sourceTree = "<group>"; };
@@ -181,6 +183,7 @@
 				AB0010020000000000000001 /* RemoteInputBridge.swift */,
 				AB0010020000000000000004 /* ClipboardBridge.swift */,
 				AB0010020000000000000003 /* PointerInterpolator.swift */,
+                AB0010020000000000000005 /* PointerPredictor.swift */,
 				AB0010020000000000000002 /* MacKeyMap.swift */,
 				33E51913231747F40026EE4D /* DebugProfile.entitlements */,
 				33E51914231749380026EE4D /* Release.entitlements */,
@@ -374,6 +377,7 @@
 				AB0010010000000000000001 /* RemoteInputBridge.swift in Sources */,
 				AB0010010000000000000005 /* ClipboardBridge.swift in Sources */,
 				AB0010010000000000000004 /* PointerInterpolator.swift in Sources */,
+                AB0010010000000000000007 /* PointerPredictor.swift in Sources */,
 				AB0010010000000000000002 /* MacKeyMap.swift in Sources */,
 				33CC10F12044A3C60003C045 /* AppDelegate.swift in Sources */,
 				335BBD1B22A9A15E00E9071D /* GeneratedPluginRegistrant.swift in Sources */,

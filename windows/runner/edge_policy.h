@@ -19,7 +19,7 @@ class EdgeReturnPolicy {
   }
   bool Return(double x, double y, double left, double top, double width, double height,
               int64_t sequence, bool held, uint64_t now) const {
-    return !held && outward_ && now >= moved_ && now - moved_ <= 250 &&
+    return sequence >= 0 && !held && outward_ && now >= moved_ && now - moved_ <= 250 &&
         now >= started_ && now - started_ >= 200 && sequence >= sequence_ &&
         width > 1 && height > 1 && OnEdge(edge_, x, y, left, top, width, height);
   }

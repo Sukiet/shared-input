@@ -17,6 +17,7 @@ int main() {
   Check(!leave(2, false, 1150), "entry cooldown prevents immediate bounce");
   Check(!leave(1, false, 1250), "old position feedback cannot complete a new motion");
   Check(!leave(2, true, 1250), "held buttons or keys defer switching");
+  Check(!leave(-1, false, 1250), "predicted feedback must not switch screens");
   Check(leave(2, false, 1250), "fresh leftward motion at left boundary returns");
   edge.Motion(-5, 3, 1300);
   Check(leave(2, false, 1300), "continuous motion must tolerate feedback latency");

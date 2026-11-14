@@ -16,6 +16,28 @@ class SlowStore implements SettingsStore {
 }
 
 void main() {
+  test(
+    'prediction mode is exclusive, durable, and rejects invalid parameters',
+    () {
+      final saved = AppSettings()
+        ..pointerMode = 'prediction'
+        ..predictionHorizonMs = 80;
+      final restored = AppSettings.fromJson(saved.toJson());
+      expect(restored.effectivePointerMode, 'prediction');
+      expect(restored.smoothingOptions['enabled'], false);
+      expect(restored.predictionHorizonMs, 80);
+      expect(
+        AppSettings.fromJson({'smoothingEnabled': false}).effectivePointerMode,
+        'direct',
+      );
+      final invalid = AppSettings.fromJson({
+        'pointerMode': 'prediction',
+        'prediction': {'horizonMs': 1000, 'maxDistance': -1},
+      });
+      expect(invalid.predictionHorizonMs, 60);
+      expect(invalid.predictionMaxDistance, 32);
+    },
+  );
   test('all settings restore from a newly created repository', () async {
     final store = MemorySettingsStore();
     final saved = AppSettings()

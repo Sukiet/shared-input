@@ -12,11 +12,14 @@ final class RemoteInputBridge {
   private var motionTimer: DispatchSourceTimer?
   private var interpolator = PointerInterpolator()
   private var smoothingEnabled = true
+  private var predictionEnabled = false
+  private var predictor = PointerPredictor()
+  private var lastPredictionSource: Int64 = 0
   private var motionIntervalMs = 4
   private var motionLeewayUs = 500
 
   private func scheduleMotionLocked() {
-    if capture != nil && smoothingEnabled {
+    if capture != nil && (smoothingEnabled || predictionEnabled) {
       motionTimer?.schedule(deadline: .now(), repeating: .milliseconds(motionIntervalMs),
                             leeway: .microseconds(motionLeewayUs))
     } else {
@@ -78,7 +81,9 @@ final class RemoteInputBridge {
       // Do not emit delayed motion after a stalled connection has timed out.
       let now = ProcessInfo.processInfo.systemUptime
       if now - self.lastReceived >= 1.5 { self.releaseLocked(); return }
-      self.emitMotionLocked(self.interpolator.value(at: now))
+      let point = self.predictionEnabled && self.heldButtons.isEmpty
+          ? self.predictor.value(at: now) : self.interpolator.value(at: now)
+      self.emitMotionLocked(point)
     }
     motionTimer.resume()
     self.motionTimer = motionTimer
@@ -106,16 +111,34 @@ final class RemoteInputBridge {
             let leeway = args["leewayUs"] as? Int, (0...2000).contains(leeway) else {
         result(FlutterError(code: "invalid_smoothing", message: "平滑参数超出范围。", details: nil)); return
       }
+      let prediction = args["mode"] as? String == "prediction"
+      let config = args["prediction"] as? [String: Any] ?? [:]
+      let trigger = (config["triggerMs"] as? NSNumber)?.doubleValue ?? 8
+      let horizon = (config["horizonMs"] as? NSNumber)?.doubleValue ?? 60
+      let decay = (config["decayMs"] as? NSNumber)?.doubleValue ?? 40
+      let history = (config["historyMs"] as? NSNumber)?.doubleValue ?? 20
+      let distance = (config["maxDistance"] as? NSNumber)?.doubleValue ?? 32
+      guard trigger.isFinite, (1...50).contains(trigger), horizon.isFinite, (1...100).contains(horizon),
+            decay.isFinite, (1...200).contains(decay), history.isFinite, (4...100).contains(history),
+            distance.isFinite, (1...200).contains(distance) else {
+        result(FlutterError(code: "invalid_prediction", message: "预测参数超出范围。", details: nil)); return
+      }
       lock.lock()
       let now = ProcessInfo.processInfo.systemUptime
       if capture != nil {
-        emitMotionLocked(enabled ? interpolator.value(at: now) : interpolator.target)
+        emitMotionLocked(interpolator.target)
       }
       if interpolator.duration != Double(duration) / 1000 {
         interpolator.setDuration(Double(duration) / 1000, at: now)
       }
       if !enabled || capture == nil { interpolator.reset(position, at: now) }
-      smoothingEnabled = enabled
+      smoothingEnabled = enabled && !prediction
+      predictionEnabled = prediction
+      predictor.reset(interpolator.target)
+      predictor.trigger = trigger / 1000; predictor.horizon = horizon / 1000
+      predictor.decay = decay / 1000; predictor.history = history / 1000
+      predictor.maxDistance = distance
+      lastPredictionSource = 0
       motionIntervalMs = interval
       motionLeewayUs = leeway
       scheduleMotionLocked()
@@ -131,11 +154,14 @@ final class RemoteInputBridge {
     case "heartbeat", "restoreShortcut", "cancelSetup": result(nil)
     case "receiverPointer":
       lock.lock()
-      let actual = CGEvent(source: nil)?.location ?? position
+      // System cursor queries can still return a previous predicted post while
+      // its correction is in flight. Edge decisions use authoritative samples.
+      let actual = predictionEnabled ? predictor.confirmed : (CGEvent(source: nil)?.location ?? position)
+      let predicted = predictionEnabled && predictor.value(at: ProcessInfo.processInfo.systemUptime) != predictor.confirmed
       let bounds = CGDisplayBounds(CGMainDisplayID())
       let snapshot: [String: Any] = ["x": actual.x, "y": actual.y,
         "left": bounds.minX, "top": bounds.minY, "width": bounds.width,
-        "height": bounds.height, "sequence": sequence]
+        "height": bounds.height, "sequence": predicted ? -1 : sequence, "predicted": predicted]
       lock.unlock()
       result(snapshot)
     case "devices": result([])
@@ -177,6 +203,7 @@ final class RemoteInputBridge {
       }
       lastReceived = ProcessInfo.processInfo.systemUptime
       interpolator.reset(position, at: lastReceived)
+      predictor.reset(position); lastPredictionSource = 0
       scheduleMotionLocked()
       lock.unlock()
       result(nil)
@@ -244,19 +271,30 @@ final class RemoteInputBridge {
           let nx = frame["x"] as? NSNumber, let ny = frame["y"] as? NSNumber else { return false }
     let value = CGPoint(x: nx.doubleValue, y: ny.doubleValue)
     guard value.x.isFinite && value.y.isFinite && abs(value.x) <= 1e12 && abs(value.y) <= 1e12 else { return false }
-    if next.int64Value <= sequence { return true }
+    let sourceUs = (frame["sampleTimeUs"] as? NSNumber)?.int64Value ?? 0
+    if next.int64Value < sequence { return true }
+    if next.int64Value == sequence && (sourceUs <= lastPredictionSource || sourceUs == 0) { return true }
+    if sourceUs > 0 && sourceUs <= lastPredictionSource { return true }
     let dx = value.x - total.x, dy = value.y - total.y
     total = value; sequence = next.int64Value
-    if dx == 0 && dy == 0 { return true }
-    // Accumulate onto the destination, not the partly interpolated cursor.
-    // Reading the hardware position here would mistake our own delayed motion
-    // for local input and repeatedly pull the smoothed cursor backwards.
+    let now = ProcessInfo.processInfo.systemUptime
     let target = interpolator.target
-    interpolator.retarget(constrained(CGPoint(x: target.x + dx, y: target.y + dy)),
-                          at: ProcessInfo.processInfo.systemUptime)
-    if !smoothingEnabled {
-      emitMotionLocked(interpolator.target)
-      interpolator.reset(position, at: ProcessInfo.processInfo.systemUptime)
+    let confirmed = constrained(CGPoint(x: target.x + dx, y: target.y + dy))
+    if predictionEnabled {
+      interpolator.reset(confirmed, at: now)
+      if sourceUs > 0 {
+        lastPredictionSource = sourceUs
+        predictor.observe(confirmed, cumulative: value, sourceUs: sourceUs,
+          moving: (frame["moving"] as? Bool ?? false) && heldButtons.isEmpty, at: now)
+      } else { predictor.reset(confirmed) }
+      emitMotionLocked(confirmed)
+    } else {
+      if dx == 0 && dy == 0 { return true }
+      interpolator.retarget(confirmed, at: now)
+      if !smoothingEnabled {
+        emitMotionLocked(interpolator.target)
+        interpolator.reset(position, at: now)
+      }
     }
     return true
   }
@@ -272,6 +310,7 @@ final class RemoteInputBridge {
   private func apply(_ frame: [String: Any]) -> Bool {
     guard motion(frame), let kind = frame["kind"] as? String else { return false }
     if kind != "motion" {
+      predictor.reset(interpolator.target)
       // Reach this reliable event's location under the previous button/key
       // state, then apply the transition. In particular, finish a drag before
       // button-up; no old interpolation may cross a click or modifier change.
@@ -332,6 +371,7 @@ final class RemoteInputBridge {
     return true
   }
   private func releaseLocked() {
+    predictor.reset(position); lastPredictionSource = 0
     motionTimer?.schedule(deadline: .distantFuture)
     // Cancel pending movement on stop/disconnect instead of replaying it.
     interpolator.reset(position, at: ProcessInfo.processInfo.systemUptime)

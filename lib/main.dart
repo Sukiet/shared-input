@@ -1210,6 +1210,7 @@ class _InputPageState extends State<InputPage>
     required int min,
     required int max,
     int step = 1,
+    bool? active,
     required ValueChanged<int> onChanged,
   }) => Column(
     crossAxisAlignment: CrossAxisAlignment.start,
@@ -1227,7 +1228,9 @@ class _InputPageState extends State<InputPage>
         max: max.toDouble(),
         divisions: (max - min) ~/ step,
         label: valueLabel,
-        onChanged: _ready && _settings.smoothingEnabled
+        onChanged:
+            _ready &&
+                (active ?? (_settings.effectivePointerMode == 'interpolation'))
             ? (v) => onChanged((v / step).round() * step)
             : null,
       ),
@@ -1264,6 +1267,12 @@ class _InputPageState extends State<InputPage>
                   ? null
                   : () => _updateSmoothing(() {
                       _settings.smoothingEnabled = true;
+                      _settings.pointerMode = 'interpolation';
+                      _settings.predictionTriggerMs = 8;
+                      _settings.predictionHorizonMs = 60;
+                      _settings.predictionDecayMs = 40;
+                      _settings.predictionHistoryMs = 20;
+                      _settings.predictionMaxDistance = 32;
                       _settings.smoothingDurationMs = 12;
                       _settings.smoothingIntervalMs = 4;
                       _settings.smoothingLeewayUs = 500;
@@ -1272,38 +1281,58 @@ class _InputPageState extends State<InputPage>
             ),
           ],
         ),
-        Material(
-          color: Colors.transparent,
-          child: SwitchListTile(
-            key: const Key('smoothing-enabled'),
-            contentPadding: EdgeInsets.zero,
-            title: const Text('启用平滑插值'),
-            subtitle: const Text(
-              '调整立即生效，自动保存；关闭后直接跟随收到的位移。',
-              style: TextStyle(fontSize: 11),
-            ),
-            value: _settings.smoothingEnabled,
-            onChanged: !_ready
-                ? null
-                : (value) => _updateSmoothing(
-                    () => _settings.smoothingEnabled = value,
-                  ),
-          ),
+        DropdownButtonFormField<String>(
+          key: ValueKey('pointer-mode-${_settings.effectivePointerMode}'),
+          initialValue: _settings.effectivePointerMode,
+          decoration: const InputDecoration(labelText: '鼠标处理模式'),
+          items: const [
+            DropdownMenuItem(value: 'direct', child: Text('直接跟随')),
+            DropdownMenuItem(value: 'interpolation', child: Text('平滑插值')),
+            DropdownMenuItem(value: 'prediction', child: Text('预测补偿')),
+          ],
+          onChanged: !_ready
+              ? null
+              : (mode) => _updateSmoothing(() {
+                  _settings.pointerMode = mode!;
+                  _settings.smoothingEnabled = mode == 'interpolation';
+                }),
         ),
         const SizedBox(height: 12),
-        _smoothingSlider(
-          label: '平滑时长',
-          valueLabel: '${_settings.smoothingDurationMs} ms',
-          hint: '1–100 ms；越大越平滑，跟手延迟也越大。默认 12 ms。',
-          id: 'smoothing-duration',
-          value: _settings.smoothingDurationMs,
-          min: 1,
-          max: 100,
-          onChanged: (v) =>
-              _updateSmoothing(() => _settings.smoothingDurationMs = v),
-        ),
+        if (_settings.effectivePointerMode != 'prediction')
+          Material(
+            color: Colors.transparent,
+            child: SwitchListTile(
+              key: const Key('smoothing-enabled'),
+              contentPadding: EdgeInsets.zero,
+              title: const Text('启用平滑插值'),
+              subtitle: const Text(
+                '调整立即生效，自动保存；关闭后直接跟随收到的位移。',
+                style: TextStyle(fontSize: 11),
+              ),
+              value: _settings.smoothingEnabled,
+              onChanged: !_ready
+                  ? null
+                  : (value) => _updateSmoothing(
+                      () => _settings.smoothingEnabled = value,
+                    ),
+            ),
+          ),
+        const SizedBox(height: 12),
+        if (_settings.effectivePointerMode != 'prediction')
+          _smoothingSlider(
+            label: '平滑时长',
+            valueLabel: '${_settings.smoothingDurationMs} ms',
+            hint: '1–100 ms；越大越平滑，跟手延迟也越大。默认 12 ms。',
+            id: 'smoothing-duration',
+            value: _settings.smoothingDurationMs,
+            min: 1,
+            max: 100,
+            onChanged: (v) =>
+                _updateSmoothing(() => _settings.smoothingDurationMs = v),
+          ),
         _smoothingSlider(
           label: '更新间隔',
+          active: _settings.effectivePointerMode != 'direct',
           valueLabel: '${_settings.smoothingIntervalMs} ms',
           hint: '1–16 ms；越小更新越频繁、开销越高。默认 4 ms。',
           id: 'smoothing-interval',
@@ -1315,6 +1344,7 @@ class _InputPageState extends State<InputPage>
         ),
         _smoothingSlider(
           label: '调度容差',
+          active: _settings.effectivePointerMode != 'direct',
           valueLabel:
               '${(_settings.smoothingLeewayUs / 1000).toStringAsFixed(1)} ms',
           hint: '0–2 ms；允许系统合并定时唤醒的余量，越小越严格。默认 0.5 ms。',
@@ -1326,6 +1356,75 @@ class _InputPageState extends State<InputPage>
           onChanged: (v) =>
               _updateSmoothing(() => _settings.smoothingLeewayUs = v),
         ),
+        if (_settings.effectivePointerMode == 'prediction') ...[
+          Text(
+            _lan.connected && !_lan.supportsPrediction
+                ? '对端不支持预测时间戳，请更新 Windows 控制端；当前仅直接跟随。'
+                : '与插值互斥。预测可能过冲；收到真实数据后立即纠偏，拖拽时不预测。',
+            style: const TextStyle(fontSize: 12),
+          ),
+          const SizedBox(height: 12),
+          _smoothingSlider(
+            label: '空窗触发阈值',
+            valueLabel: '${_settings.predictionTriggerMs} ms',
+            hint: '默认 8 ms；超过此空窗后才开始预测。',
+            id: 'prediction-trigger',
+            value: _settings.predictionTriggerMs,
+            min: 1,
+            max: 50,
+            active: true,
+            onChanged: (v) =>
+                _updateSmoothing(() => _settings.predictionTriggerMs = v),
+          ),
+          _smoothingSlider(
+            label: '最大预测时长',
+            valueLabel: '${_settings.predictionHorizonMs} ms',
+            hint: '默认 60 ms；达到上限后保持当前位置。',
+            id: 'prediction-horizon',
+            value: _settings.predictionHorizonMs,
+            min: 1,
+            max: 100,
+            active: true,
+            onChanged: (v) =>
+                _updateSmoothing(() => _settings.predictionHorizonMs = v),
+          ),
+          _smoothingSlider(
+            label: '速度衰减时间',
+            valueLabel: '${_settings.predictionDecayMs} ms',
+            hint: '默认 40 ms；越大保持动量越久。',
+            id: 'prediction-decay',
+            value: _settings.predictionDecayMs,
+            min: 1,
+            max: 200,
+            active: true,
+            onChanged: (v) =>
+                _updateSmoothing(() => _settings.predictionDecayMs = v),
+          ),
+          _smoothingSlider(
+            label: '估速历史窗口',
+            valueLabel: '${_settings.predictionHistoryMs} ms',
+            hint: '默认 20 ms；按发送端时间估算近期速度。',
+            id: 'prediction-history',
+            value: _settings.predictionHistoryMs,
+            min: 4,
+            max: 100,
+            active: true,
+            onChanged: (v) =>
+                _updateSmoothing(() => _settings.predictionHistoryMs = v),
+          ),
+          _smoothingSlider(
+            label: '最大预测距离',
+            valueLabel: '${_settings.predictionMaxDistance} ',
+            hint: '默认 32 个光标坐标单位；限制过冲距离。',
+            id: 'prediction-distance',
+            value: _settings.predictionMaxDistance,
+            min: 1,
+            max: 200,
+            active: true,
+            onChanged: (v) =>
+                _updateSmoothing(() => _settings.predictionMaxDistance = v),
+          ),
+        ],
         const Text(
           '点击和拖拽状态切换前会立即到达目标；停止控制时取消剩余插值。',
           style: TextStyle(fontSize: 11, color: Color(0xff929aa6)),

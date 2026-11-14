@@ -4,6 +4,24 @@ import 'package:shared_input/remote/protocol.dart';
 
 void main() {
   const id = '0123456789abcdef0123456789abcdef';
+  test(
+    'prediction metadata negotiates separately from legacy mouse frames',
+    () {
+      const frame = MotionFrame(id, 5, 12, 34, 2, 123456, false);
+      expect(frame.encode().length, 48);
+      expect(MotionFrame.decode(frame.encode()).sampleTimeUs, 0);
+      final extended = frame.encode(prediction: true);
+      expect(extended.length, 64);
+      expect(MotionFrame.decode(extended).toJson(), frame.toJson());
+      expect(MotionFrame.fromJson(frame.toJson()).moving, false);
+      ByteData.sublistView(extended).setUint64(56, 2);
+      expect(() => MotionFrame.decode(extended), throwsFormatException);
+      expect(
+        () => const MotionFrame(id, 1, 0, 0, 0, -1).encode(prediction: true),
+        throwsFormatException,
+      );
+    },
+  );
   test('TCP decoder handles fragmented headers and coalesced messages', () {
     final first = Uint8List.fromList(List.filled(35, 7));
     final second = Uint8List.fromList(List.filled(40, 9));

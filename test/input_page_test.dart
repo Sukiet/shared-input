@@ -118,70 +118,109 @@ void main() {
   }
 
   testWidgets(
-    'Mac receiver smoothing applies live, persists and resets',
+    'prediction mode excludes interpolation and saves live parameters',
     (tester) async {
-      final settings = AppSettings()
-        ..role = InputRole.receiver
-        ..smoothingDurationMs = 25
-        ..smoothingIntervalMs = 8
-        ..smoothingLeewayUs = 1000;
       final store = MemorySettingsStore()
-        ..value = jsonEncode(settings.toJson());
+        ..value = jsonEncode(
+          (AppSettings()..role = InputRole.receiver).toJson(),
+        );
       await open(tester, width: 600, store: store);
       Map<dynamic, dynamic> applied() =>
           calls
                   .lastWhere((c) => c.method == 'receiverConfigureSmoothing')
                   .arguments
               as Map;
-      expect(applied()['durationMs'], 25);
-      expect(applied()['intervalMs'], 8);
-      expect(applied()['leewayUs'], 1000);
-      expect(find.text('鼠标平滑设置'), findsOneWidget);
-      for (final entry in {
-        'smoothing-duration': 40.0,
-        'smoothing-interval': 2.0,
-        'smoothing-leeway': 200.0,
-      }.entries) {
-        tester.widget<Slider>(find.byKey(Key(entry.key))).onChanged!(
-          entry.value,
-        );
-        await tester.pumpAndSettle();
-      }
-      expect(applied(), {
-        'enabled': true,
-        'durationMs': 40,
-        'intervalMs': 2,
-        'leewayUs': 200,
-      });
-      await tester.tap(find.byKey(const Key('smoothing-enabled')));
+      tester
+          .widget<DropdownButtonFormField<String>>(
+            find.byKey(const ValueKey('pointer-mode-interpolation')),
+          )
+          .onChanged!('prediction');
       await tester.pumpAndSettle();
+      expect(applied()['mode'], 'prediction');
       expect(applied()['enabled'], false);
-      expect(
-        tester
-            .widget<Slider>(find.byKey(const Key('smoothing-duration')))
-            .onChanged,
-        isNull,
-      );
+      expect(find.byKey(const Key('smoothing-duration')), findsNothing);
+      tester
+          .widget<Slider>(find.byKey(const Key('prediction-horizon')))
+          .onChanged!(80);
+      await tester.pumpAndSettle();
+      expect((applied()['prediction'] as Map)['horizonMs'], 80);
       await tester.pumpWidget(const SizedBox.shrink());
       await open(tester, width: 600, store: store);
-      expect(applied(), {
-        'enabled': false,
-        'durationMs': 40,
-        'intervalMs': 2,
-        'leewayUs': 200,
-      });
-      await tester.tap(find.byKey(const Key('reset-smoothing')));
+      expect(applied()['mode'], 'prediction');
+      expect((applied()['prediction'] as Map)['horizonMs'], 80);
+      tester
+          .widget<DropdownButtonFormField<String>>(
+            find.byKey(const ValueKey('pointer-mode-prediction')),
+          )
+          .onChanged!('direct');
       await tester.pumpAndSettle();
-      expect(applied(), {
-        'enabled': true,
-        'durationMs': 12,
-        'intervalMs': 4,
-        'leewayUs': 500,
-      });
+      expect(applied()['enabled'], false);
+      expect(applied().containsKey('mode'), false);
       expect(tester.takeException(), isNull);
     },
     variant: TargetPlatformVariant.only(TargetPlatform.macOS),
   );
+
+  testWidgets('Mac receiver smoothing applies live, persists and resets', (
+    tester,
+  ) async {
+    final settings = AppSettings()
+      ..role = InputRole.receiver
+      ..smoothingDurationMs = 25
+      ..smoothingIntervalMs = 8
+      ..smoothingLeewayUs = 1000;
+    final store = MemorySettingsStore()..value = jsonEncode(settings.toJson());
+    await open(tester, width: 600, store: store);
+    Map<dynamic, dynamic> applied() =>
+        calls
+                .lastWhere((c) => c.method == 'receiverConfigureSmoothing')
+                .arguments
+            as Map;
+    expect(applied()['durationMs'], 25);
+    expect(applied()['intervalMs'], 8);
+    expect(applied()['leewayUs'], 1000);
+    expect(find.text('鼠标平滑设置'), findsOneWidget);
+    for (final entry in {
+      'smoothing-duration': 40.0,
+      'smoothing-interval': 2.0,
+      'smoothing-leeway': 200.0,
+    }.entries) {
+      tester.widget<Slider>(find.byKey(Key(entry.key))).onChanged!(entry.value);
+      await tester.pumpAndSettle();
+    }
+    expect(applied(), {
+      'enabled': true,
+      'durationMs': 40,
+      'intervalMs': 2,
+      'leewayUs': 200,
+    });
+    await tester.tap(find.byKey(const Key('smoothing-enabled')));
+    await tester.pumpAndSettle();
+    expect(applied()['enabled'], false);
+    expect(
+      tester
+          .widget<Slider>(find.byKey(const Key('smoothing-duration')))
+          .onChanged,
+      isNull,
+    );
+    await tester.pumpWidget(const SizedBox.shrink());
+    await open(tester, width: 600, store: store);
+    expect(applied(), {
+      'enabled': false,
+      'durationMs': 40,
+      'intervalMs': 2,
+      'leewayUs': 200,
+    });
+    await tester.tap(find.byKey(const Key('reset-smoothing')));
+    await tester.pumpAndSettle();
+    expect(applied(), {
+      'enabled': true,
+      'durationMs': 12,
+      'intervalMs': 4,
+      'leewayUs': 500,
+    });
+    expect(tester.takeException(), isNull);
+  }, variant: TargetPlatformVariant.only(TargetPlatform.macOS));
 
   windowsTest(
     'devices and a recorded exit are required; configuration never starts capture',

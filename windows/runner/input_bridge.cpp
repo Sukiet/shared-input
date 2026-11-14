@@ -13,6 +13,10 @@
 #include <utility>
 
 namespace {
+int64_t MotionTimeUs() {
+  return std::chrono::duration_cast<std::chrono::microseconds>(
+      std::chrono::steady_clock::now().time_since_epoch()).count();
+}
 constexpr UINT kWatchdogMessage = WM_APP + 0x142;
 constexpr UINT kRestoreFocusMessage = WM_APP + 0x143;
 constexpr UINT kStreamMessage = WM_APP + 0x144;
@@ -397,6 +401,7 @@ void InputBridge::Start(const Map& args, std::unique_ptr<Result> result) {
     return;
   }
   motion_sequence_ = event_epoch_ = flushed_sequence_ = flushed_epoch_ = 0;
+  last_motion_us_ = last_stream_us_ = 0;
   total_x_ = total_y_ = 0;
   input_events_.clear();
   keys_ = moves_ = buttons_ = ignored_ = released_ = 0;
@@ -616,6 +621,7 @@ void InputBridge::ProcessInput(const RAWINPUT& raw, UINT bytes) {
       total_x_ += mouse.lLastX * speed_;
       total_y_ += mouse.lLastY * speed_;
       ++motion_sequence_;
+      last_motion_us_ = MotionTimeUs();
       if (background_capture_) edge_return_.Motion(mouse.lLastX, motion_sequence_, now, mouse.lLastY);
     }
     if (mouse.usButtonFlags) ++buttons_;
@@ -880,9 +886,14 @@ void InputBridge::QueueInput(Map event) {
   input_events_.emplace_back(std::move(event));
 }
 void InputBridge::FlushStream() {
-  if (motion_sequence_ == flushed_sequence_ && event_epoch_ == flushed_epoch_) return;
+  const auto now = MotionTimeUs();
+  // A 16 ms idle status distinguishes a stopped mouse from an input gap.
+  if (motion_sequence_ == flushed_sequence_ && event_epoch_ == flushed_epoch_ &&
+      now - last_stream_us_ < 16000) return;
+  last_stream_us_ = now;
   Emit("inputFrame", {{Value("sequence"), Value(motion_sequence_)}, {Value("epoch"), Value(event_epoch_)},
-      {Value("x"), Value(total_x_)}, {Value("y"), Value(total_y_)}, {Value("events"), Value(std::move(input_events_))}});
+      {Value("x"), Value(total_x_)}, {Value("y"), Value(total_y_)},
+      {Value("sampleTimeUs"), Value(now)}, {Value("moving"), Value(last_motion_us_ > 0 && now - last_motion_us_ <= 8000)}, {Value("events"), Value(std::move(input_events_))}});
   input_events_.clear();
   flushed_sequence_ = motion_sequence_;
   flushed_epoch_ = event_epoch_;

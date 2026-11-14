@@ -23,6 +23,7 @@ class LanSession extends ChangeNotifier {
   onBeginWithOptions;
   Future<Map<String, dynamic>?> Function()? onPointerInfo;
   Future<void> Function(Map<String, dynamic> pointer)? onPointerFeedback;
+  bool supportsPrediction = false;
   bool supportsEdge = false;
   bool supportsLayout = false;
   Map<String, dynamic>? remoteDisplay;
@@ -130,6 +131,7 @@ class LanSession extends ChangeNotifier {
               'nonce': base64Encode(serverNonce),
               'udpPort': _udp!.port,
               'capabilities': [
+                'motion-prediction-v1',
                 if (clipboardSupported) 'clipboard-v1',
                 if (onPointerInfo != null) 'edge-pointer-v1',
                 if (display != null && onBeginWithOptions != null)
@@ -154,6 +156,11 @@ class LanSession extends ChangeNotifier {
             throw const SocketException('监听已停止。');
           }
           _wire = wire;
+          supportsPrediction =
+              (hello['capabilities'] as List?)?.contains(
+                'motion-prediction-v1',
+              ) ==
+              true;
           supportsClipboard =
               clipboardSupported &&
               (hello['capabilities'] as List?)?.contains('clipboard-v1') ==
@@ -211,7 +218,10 @@ class LanSession extends ChangeNotifier {
           'version': protocolVersion,
           'nonce': base64Encode(clientNonce),
           'udpPort': _udp!.port,
-          'capabilities': [if (clipboardSupported) 'clipboard-v1'],
+          'capabilities': [
+            'motion-prediction-v1',
+            if (clipboardSupported) 'clipboard-v1',
+          ],
         }, master),
       );
       final ack = await openHandshake(await wire.next(), master);
@@ -222,6 +232,9 @@ class LanSession extends ChangeNotifier {
       }
       supportsEdge =
           (ack['capabilities'] as List?)?.contains('edge-pointer-v1') == true;
+      supportsPrediction =
+          (ack['capabilities'] as List?)?.contains('motion-prediction-v1') ==
+          true;
       supportsClipboard =
           clipboardSupported &&
           (ack['capabilities'] as List?)?.contains('clipboard-v1') == true;
@@ -543,7 +556,10 @@ class LanSession extends ChangeNotifier {
         await wire.send({
           'type': 'pointer',
           'capture': capture,
-          'pointer': pointer,
+          'pointer': {
+            ...pointer,
+            if (pointer['predicted'] == true) 'sequence': -1,
+          },
         });
       }
     } catch (_) {
@@ -561,6 +577,8 @@ class LanSession extends ChangeNotifier {
       (frame['x'] as num).toDouble(),
       (frame['y'] as num).toDouble(),
       frame['epoch'] as int,
+      frame['sampleTimeUs'] as int? ?? 0,
+      frame['moving'] as bool? ?? true,
     );
     final events = [
       for (final event in (frame['events'] as List?) ?? [])
@@ -592,7 +610,9 @@ class LanSession extends ChangeNotifier {
         final motion = _pendingSend!;
         _pendingSend = null;
         final cipher = _mouseCipher!;
-        final packet = await cipher.encrypt(motion.encode());
+        final packet = await cipher.encrypt(
+          motion.encode(prediction: supportsPrediction),
+        );
         if (generation != _generation || motion.capture != _capture) break;
         _udp?.send(packet, _remoteAddress!, _remoteUdpPort);
         ++sentPackets;
@@ -619,7 +639,8 @@ class LanSession extends ChangeNotifier {
           !capturing ||
           data.address.address != _remoteAddress?.address ||
           data.port != _remoteUdpPort ||
-          data.data.length != 76) {
+          (data.data.length != 76 &&
+              !(supportsPrediction && data.data.length == 92))) {
         diagnostics.count('udpFiltered');
         continue;
       }
@@ -663,7 +684,9 @@ class LanSession extends ChangeNotifier {
     }
     if (_pendingReceive != null) diagnostics.count('motionCoalesced');
     if (_pendingReceive == null ||
-        motion.sequence > _pendingReceive!.sequence) {
+        motion.sequence > _pendingReceive!.sequence ||
+        (motion.sequence == _pendingReceive!.sequence &&
+            motion.sampleTimeUs > _pendingReceive!.sampleTimeUs)) {
       _pendingReceive = motion;
       _pendingReceiveAt = diagnostics.now;
     }

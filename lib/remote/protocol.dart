@@ -112,10 +112,14 @@ class MotionFrame {
     this.x,
     this.y, [
     this.epoch = 0,
+    this.sampleTimeUs = 0,
+    this.moving = true,
   ]);
   final String capture;
   final int sequence;
   final int epoch;
+  final int sampleTimeUs;
+  final bool moving;
   final double x, y;
   Map<String, dynamic> toJson() => {
     'capture': capture,
@@ -123,6 +127,8 @@ class MotionFrame {
     'x': x,
     'y': y,
     'epoch': epoch,
+    if (sampleTimeUs > 0) 'sampleTimeUs': sampleTimeUs,
+    if (sampleTimeUs > 0) 'moving': moving,
   };
   static MotionFrame fromJson(Map<String, dynamic> json) {
     final frame = MotionFrame(
@@ -131,6 +137,8 @@ class MotionFrame {
       (json['x'] as num).toDouble(),
       (json['y'] as num).toDouble(),
       json['epoch'] as int? ?? 0,
+      json['sampleTimeUs'] as int? ?? 0,
+      json['moving'] as bool? ?? true,
     );
     frame.validate();
     return frame;
@@ -140,6 +148,8 @@ class MotionFrame {
     if (!RegExp(r'^[a-f0-9]{32}$').hasMatch(capture) ||
         sequence < 0 ||
         epoch < 0 ||
+        sampleTimeUs < 0 ||
+        sampleTimeUs > 9007199254740991 ||
         !x.isFinite ||
         !y.isFinite ||
         x.abs() > 1e12 ||
@@ -148,9 +158,9 @@ class MotionFrame {
     }
   }
 
-  Uint8List encode() {
+  Uint8List encode({bool prediction = false}) {
     validate();
-    final data = ByteData(48);
+    final data = ByteData(prediction ? 64 : 48);
     for (var i = 0; i < 16; i++) {
       data.setUint8(
         i,
@@ -161,14 +171,21 @@ class MotionFrame {
     data.setFloat64(24, x);
     data.setFloat64(32, y);
     data.setUint64(40, epoch);
+    if (prediction) {
+      data.setUint64(48, sampleTimeUs);
+      data.setUint64(56, moving ? 1 : 0);
+    }
     return data.buffer.asUint8List();
   }
 
   static MotionFrame decode(Uint8List bytes) {
-    if (bytes.length != 48) {
+    if (bytes.length != 48 && bytes.length != 64) {
       throw const FormatException('Invalid mouse frame size');
     }
     final data = ByteData.sublistView(bytes);
+    if (bytes.length == 64 && data.getUint64(56) > 1) {
+      throw const FormatException('Invalid motion state');
+    }
     final id = bytes
         .take(16)
         .map((v) => v.toRadixString(16).padLeft(2, '0'))
@@ -179,6 +196,8 @@ class MotionFrame {
       data.getFloat64(24),
       data.getFloat64(32),
       data.getUint64(40),
+      bytes.length == 64 ? data.getUint64(48) : 0,
+      bytes.length == 64 ? data.getUint64(56) == 1 : true,
     );
     frame.validate();
     return frame;

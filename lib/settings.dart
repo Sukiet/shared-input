@@ -47,6 +47,24 @@ class AppSettings {
   double step = 0.0001;
   int sendHz = 500;
   bool smoothingEnabled = true;
+  String pointerMode = 'interpolation';
+  String get effectivePointerMode => pointerMode == 'prediction'
+      ? 'prediction'
+      : smoothingEnabled
+      ? 'interpolation'
+      : 'direct';
+  int predictionTriggerMs = 8,
+      predictionHorizonMs = 60,
+      predictionDecayMs = 40,
+      predictionHistoryMs = 20,
+      predictionMaxDistance = 32;
+  Map<String, dynamic> get predictionOptions => {
+    'triggerMs': predictionTriggerMs,
+    'horizonMs': predictionHorizonMs,
+    'decayMs': predictionDecayMs,
+    'historyMs': predictionHistoryMs,
+    'maxDistance': predictionMaxDistance,
+  };
   int smoothingDurationMs = 12;
   int smoothingIntervalMs = 4;
   int smoothingLeewayUs = 500;
@@ -56,7 +74,9 @@ class AppSettings {
   DisplayLayout displayLayout = const DisplayLayout();
 
   Map<String, dynamic> get smoothingOptions => {
-    'enabled': smoothingEnabled,
+    'enabled': effectivePointerMode == 'interpolation',
+    if (effectivePointerMode == 'prediction') 'mode': 'prediction',
+    if (effectivePointerMode == 'prediction') 'prediction': predictionOptions,
     'durationMs': smoothingDurationMs,
     'intervalMs': smoothingIntervalMs,
     'leewayUs': smoothingLeewayUs,
@@ -77,6 +97,8 @@ class AppSettings {
     'step': step,
     'sendHz': sendHz,
     'smoothingEnabled': smoothingEnabled,
+    'pointerMode': effectivePointerMode,
+    'prediction': predictionOptions,
     'smoothingDurationMs': smoothingDurationMs,
     'smoothingIntervalMs': smoothingIntervalMs,
     'smoothingLeewayUs': smoothingLeewayUs,
@@ -133,6 +155,24 @@ class AppSettings {
       return value is int && value >= min && value <= max ? value : fallback;
     }
 
+    final mode = json['pointerMode'];
+    if (['direct', 'interpolation', 'prediction'].contains(mode)) {
+      result.pointerMode = mode as String;
+      result.smoothingEnabled = mode == 'interpolation';
+    }
+    final prediction = json['prediction'];
+    if (prediction is Map) {
+      int param(String key, int min, int max, int fallback) {
+        final value = prediction[key];
+        return value is int && value >= min && value <= max ? value : fallback;
+      }
+
+      result.predictionTriggerMs = param('triggerMs', 1, 50, 8);
+      result.predictionHorizonMs = param('horizonMs', 1, 100, 60);
+      result.predictionDecayMs = param('decayMs', 1, 200, 40);
+      result.predictionHistoryMs = param('historyMs', 4, 100, 20);
+      result.predictionMaxDistance = param('maxDistance', 1, 200, 32);
+    }
     result.smoothingDurationMs = validInt('smoothingDurationMs', 1, 100, 12);
     result.smoothingIntervalMs = validInt('smoothingIntervalMs', 1, 16, 4);
     result.smoothingLeewayUs = validInt('smoothingLeewayUs', 0, 2000, 500);

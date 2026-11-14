@@ -14,6 +14,93 @@ Future<void> eventually(bool Function() condition) async {
 }
 
 void main() {
+  test(
+    'predicted pointer feedback keeps liveness but cannot authorize an edge return',
+    () async {
+      final receiver = LanSession(), controller = LanSession();
+      var predicted = true;
+      final feedback = <Map<String, dynamic>>[];
+      receiver.onBegin = (_) async {};
+      receiver.onPointerInfo = () async => {
+        'x': 0.0,
+        'y': 200.0,
+        'left': 0.0,
+        'top': 0.0,
+        'width': 1000.0,
+        'height': 800.0,
+        'sequence': 10,
+        'predicted': predicted,
+      };
+      controller.onPointerFeedback = (value) async {
+        feedback.add(value);
+      };
+      try {
+        await receiver.listen(port: 0, key: 'b' * 32, bindAddress: '127.0.0.1');
+        await controller.connect(
+          host: '127.0.0.1',
+          port: receiver.port,
+          key: 'b' * 32,
+        );
+        await controller.beginCapture(edgeEntryY: 0.5);
+        await eventually(() => feedback.isNotEmpty);
+        expect(feedback.last['sequence'], -1);
+        predicted = false;
+        await eventually(() => feedback.last['sequence'] == 10);
+      } finally {
+        await controller.close();
+        await receiver.close();
+        controller.dispose();
+        receiver.dispose();
+      }
+    },
+  );
+  test(
+    'prediction peers deliver newer idle status with unchanged motion sequence',
+    () async {
+      final receiver = LanSession(), controller = LanSession();
+      final frames = <Map<String, dynamic>>[];
+      receiver.onBegin = (_) async {};
+      receiver.onInput = (_, batch) async {
+        frames.addAll(batch);
+      };
+      try {
+        await receiver.listen(port: 0, key: 'a' * 32, bindAddress: '127.0.0.1');
+        await controller.connect(
+          host: '127.0.0.1',
+          port: receiver.port,
+          key: 'a' * 32,
+        );
+        expect(receiver.supportsPrediction, true);
+        expect(controller.supportsPrediction, true);
+        await controller.beginCapture();
+        controller.sendInput({
+          'sequence': 1,
+          'epoch': 0,
+          'x': 10.0,
+          'y': 0.0,
+          'sampleTimeUs': 10000,
+          'moving': true,
+        });
+        await eventually(() => frames.any((f) => f['sampleTimeUs'] == 10000));
+        controller.sendInput({
+          'sequence': 1,
+          'epoch': 0,
+          'x': 10.0,
+          'y': 0.0,
+          'sampleTimeUs': 26000,
+          'moving': false,
+        });
+        await eventually(() => frames.any((f) => f['sampleTimeUs'] == 26000));
+        expect(frames.last['moving'], false);
+        expect(frames.last['sequence'], 1);
+      } finally {
+        await controller.close();
+        await receiver.close();
+        controller.dispose();
+        receiver.dispose();
+      }
+    },
+  );
   const key = '0123456789abcdef0123456789abcdef';
   late LanSession receiver, controller;
   setUp(() {
