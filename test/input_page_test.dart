@@ -352,10 +352,10 @@ void main() {
       await native('stats', {'keys': 4, 'held': 2, 'remainingMs': 29000});
       await tester.pump(const Duration(milliseconds: 16));
       expect(identical(painter(tester), originalPainter), isTrue);
-      await native('stopped', {'reason': 'shake', 'held': 0});
+      await native('stopped', {'reason': 'shortcut', 'held': 0});
       await tester.pumpAndSettle();
       expect(start(tester).onPressed, isNotNull);
-      expect(find.text('已通过晃动鼠标退出。'), findsOneWidget);
+      expect(find.text('已通过快捷键退出。'), findsOneWidget);
       await tester.pumpWidget(const SizedBox());
     },
   );
@@ -463,7 +463,7 @@ void main() {
   });
 
   windowsTest(
-    'edge switching starts in background and retains both emergency exits',
+    'edge switching retains shortcut exit and edge return',
     (tester) async {
       const key = '0123456789abcdef0123456789abcdef';
       final receiver = LanSession();
@@ -510,7 +510,7 @@ void main() {
       );
       tester.binding.handleAppLifecycleStateChanged(AppLifecycleState.inactive);
       var starts = 0;
-      for (final reason in ['shake', 'shortcut']) {
+      for (final reason in ['shortcut', 'edge']) {
         ++starts;
         await tester.runAsync(() async {
           await native('edgeEnter', {'entryY': 0.25});

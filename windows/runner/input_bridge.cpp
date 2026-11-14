@@ -406,7 +406,7 @@ void InputBridge::Start(const Map& args, std::unique_ptr<Result> result) {
   input_events_.clear();
   keys_ = moves_ = buttons_ = ignored_ = released_ = 0;
   x_ = 300; y_ = 120;
-  held_keys_.clear(); held_buttons_.clear(); physical_keys_.clear(); shakes_.clear();
+  held_keys_.clear(); held_buttons_.clear(); physical_keys_.clear();
   started_ = GetTickCount64();
   background_capture_ = background;
   if (background) {
@@ -491,7 +491,7 @@ void InputBridge::Stop(const std::string& reason, bool notify) {
   StopStream();
   if (!was_active) return;
   released_ = static_cast<int>(held_keys_.size() + held_buttons_.size());
-  held_keys_.clear(); held_buttons_.clear(); physical_keys_.clear(); shakes_.clear();
+  held_keys_.clear(); held_buttons_.clear(); physical_keys_.clear();
   if (was_background) {
     edge_cooldown_ = GetTickCount64() + 500;
     const auto bounds = PrimaryBounds();
@@ -610,9 +610,6 @@ void InputBridge::ProcessInput(const RAWINPUT& raw, UINT bytes) {
     if (!active_) return;
     // Absolute devices (some touchpads) are not interpreted as relative counts.
     const bool relative = (mouse.usFlags & MOUSE_MOVE_ABSOLUTE) == 0;
-    if (relative && shakes_[raw.header.hDevice].Add(mouse.lLastX, mouse.lLastY, now)) {
-      Stop("shake"); return;
-    }
     if (!background_capture_ && raw.header.hDevice != mouse_) { ++ignored_; return; }
     if (relative && (mouse.lLastX || mouse.lLastY)) {
       ++moves_;
@@ -725,7 +722,6 @@ std::optional<LRESULT> InputBridge::HandleMessage(UINT message, WPARAM wparam, L
       if (wparam == GIDC_REMOVAL) {
         const auto device = reinterpret_cast<HANDLE>(lparam);
         physical_keys_.erase(device);
-        shakes_.erase(device);
         if (active_ && (device == keyboard_ || device == mouse_)) Stop("device_removed");
       }
       Emit("devicesChanged");

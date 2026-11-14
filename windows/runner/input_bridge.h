@@ -70,7 +70,6 @@ class InputBridge {
   int keys_ = 0, moves_ = 0, buttons_ = 0, ignored_ = 0, released_ = 0;
   std::map<HANDLE, std::set<int>> physical_keys_;
   std::set<int> held_keys_, held_buttons_;
-  std::map<HANDLE, shared_input::ShakeDetector> shakes_;
   std::atomic<bool> closing_{false}, armed_{false};
   std::atomic<uint64_t> watch_started_{0}, heartbeat_{0};
   std::atomic<unsigned> generation_{0};
