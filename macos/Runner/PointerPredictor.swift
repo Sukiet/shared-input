@@ -1,6 +1,28 @@
 import Foundation
 import CoreGraphics
 
+/// Output-only smoothing. Never feeds rendered positions back into prediction.
+struct PredictionOutput {
+  private var segment = PointerInterpolator(duration: 0.008)
+  private(set) var enabled = true
+
+  mutating func configure(enabled: Bool, duration: TimeInterval, point: CGPoint, at time: TimeInterval) {
+    self.enabled = enabled
+    segment = PointerInterpolator(duration: duration)
+    segment.reset(point, at: time)
+  }
+
+  mutating func reset(_ point: CGPoint, at time: TimeInterval) {
+    segment.reset(point, at: time)
+  }
+
+  mutating func update(_ target: CGPoint, at time: TimeInterval) -> CGPoint {
+    guard enabled else { segment.reset(target, at: time); return target }
+    segment.retarget(target, at: time)
+    return segment.value(at: time)
+  }
+}
+
 /// Sender-time velocity estimation with bounded, exponentially damped extrapolation.
 /// Predictions never enter the sample history or authoritative position.
 struct PointerPredictor {

@@ -21,21 +21,32 @@ void main() {
     () {
       final saved = AppSettings()
         ..pointerMode = 'prediction'
-        ..predictionHorizonMs = 80;
+        ..predictionHorizonMs = 80
+        ..predictionOutputSmoothing = false
+        ..predictionOutputDurationMs = 16;
       final restored = AppSettings.fromJson(saved.toJson());
       expect(restored.effectivePointerMode, 'prediction');
       expect(restored.smoothingOptions['enabled'], false);
       expect(restored.predictionHorizonMs, 80);
+      expect(restored.predictionOutputSmoothing, false);
+      expect(restored.predictionOutputDurationMs, 16);
       expect(
         AppSettings.fromJson({'smoothingEnabled': false}).effectivePointerMode,
         'direct',
       );
       final invalid = AppSettings.fromJson({
         'pointerMode': 'prediction',
-        'prediction': {'horizonMs': 1000, 'maxDistance': -1},
+        'prediction': {
+          'horizonMs': 1000,
+          'maxDistance': -1,
+          'outputDurationMs': 99,
+          'outputSmoothing': 'false',
+        },
       });
       expect(invalid.predictionHorizonMs, 60);
       expect(invalid.predictionMaxDistance, 32);
+      expect(invalid.predictionOutputDurationMs, 8);
+      expect(invalid.predictionOutputSmoothing, true);
     },
   );
   test('all settings restore from a newly created repository', () async {

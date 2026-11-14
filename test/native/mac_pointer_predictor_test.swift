@@ -15,6 +15,27 @@ struct PointerPredictorTests {
     return p
   }
   static func main() {
+    var output = PredictionOutput()
+    output.reset(.zero, at: 0)
+    near(output.update(CGPoint(x: 16, y: 0), at: 0).x, 0)
+    near(output.update(CGPoint(x: 16, y: 0), at: 0.004).x, 8)
+    near(output.update(CGPoint(x: 16, y: 0), at: 0.008).x, 16)
+    // A new prediction redirects continuously from the current rendered value.
+    near(output.update(CGPoint(x: 32, y: 0), at: 0.008).x, 16)
+    near(output.update(CGPoint(x: 32, y: 0), at: 0.012).x, 24)
+    // A real correction is smoothed instead of snapping backwards.
+    near(output.update(CGPoint(x: 20, y: 0), at: 0.012).x, 24)
+    near(output.update(CGPoint(x: 20, y: 0), at: 0.016).x, 22)
+    near(output.update(CGPoint(x: 20, y: 0), at: 0.020).x, 20)
+    // Click/drag/stop barriers cancel the previous segment immediately.
+    output.reset(CGPoint(x: 4, y: 3), at: 0.021)
+    near(output.update(CGPoint(x: 4, y: 3), at: 1).x, 4)
+    output.configure(enabled: false, duration: 0.020, point: .zero, at: 2)
+    near(output.update(CGPoint(x: 40, y: 0), at: 2).x, 40)
+    output.configure(enabled: true, duration: 0.020, point: .zero, at: 3)
+    near(output.update(CGPoint(x: 40, y: 0), at: 3).x, 0)
+    near(output.update(CGPoint(x: 40, y: 0), at: 3.01).x, 20)
+    near(output.update(CGPoint(x: 40, y: 0), at: 3.02).x, 40)
     var p = trained()
     near(p.value(at: 0.010).x, 16) // below trigger
     near(p.value(at: 0.022).x, 16 + 40 * (1 - exp(-0.25)))

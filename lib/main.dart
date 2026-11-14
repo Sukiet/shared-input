@@ -1267,6 +1267,8 @@ class _InputPageState extends State<InputPage>
                       _settings.predictionDecayMs = 40;
                       _settings.predictionHistoryMs = 20;
                       _settings.predictionMaxDistance = 32;
+                      _settings.predictionOutputSmoothing = true;
+                      _settings.predictionOutputDurationMs = 8;
                       _settings.smoothingDurationMs = 12;
                       _settings.smoothingIntervalMs = 4;
                       _settings.smoothingLeewayUs = 500;
@@ -1354,10 +1356,41 @@ class _InputPageState extends State<InputPage>
           Text(
             _lan.connected && !_lan.supportsPrediction
                 ? '对端不支持预测时间戳，请更新 Windows 控制端；当前仅直接跟随。'
-                : '与插值互斥。预测可能过冲；收到真实数据后立即纠偏，拖拽时不预测。',
+                : '预测可叠加输出平滑，减轻跳变但增加跟随延迟；拖拽时直接跟随。',
             style: const TextStyle(fontSize: 12),
           ),
           const SizedBox(height: 12),
+          Material(
+            color: Colors.transparent,
+            child: SwitchListTile(
+              key: const Key('prediction-output-smoothing'),
+              contentPadding: EdgeInsets.zero,
+              title: const Text('预测输出平滑'),
+              subtitle: const Text(
+                '平滑预测点和真实数据纠偏，关闭后保留原来的直接输出。',
+                style: TextStyle(fontSize: 11),
+              ),
+              value: _settings.predictionOutputSmoothing,
+              onChanged: !_ready
+                  ? null
+                  : (v) => _updateSmoothing(
+                      () => _settings.predictionOutputSmoothing = v,
+                    ),
+            ),
+          ),
+          _smoothingSlider(
+            label: '预测平滑时长',
+            valueLabel: '${_settings.predictionOutputDurationMs} ms',
+            hint: '1–40 ms；默认 8 ms。越大越柔和，跟手延迟也越大。',
+            id: 'prediction-output-duration',
+            value: _settings.predictionOutputDurationMs,
+            min: 1,
+            max: 40,
+            active: _settings.predictionOutputSmoothing,
+            onChanged: (v) => _updateSmoothing(
+              () => _settings.predictionOutputDurationMs = v,
+            ),
+          ),
           _smoothingSlider(
             label: '空窗触发阈值',
             valueLabel: '${_settings.predictionTriggerMs} ms',

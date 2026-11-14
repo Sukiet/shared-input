@@ -62,7 +62,7 @@ macOS 被控端默认使用 12 毫秒线性插值，由独立原生定时器每 
 
 ### 预测补偿模式
 
-Mac 被控端的“鼠标处理模式”可选择直接跟随、平滑插值或预测补偿，三者互斥。预测模式下真实鼠标数据立即生效，空窗超过阈值后按近期速度进行指数衰减外推；新真实数据立即纠偏，不再串联插值器。默认触发 8 ms、预测上限 60 ms、衰减时间 40 ms、估速窗口 20 ms、位移上限 32 个光标坐标单位；界面中均可调整，更新间隔与调度容差也可调整，设置即时生效并持久保存。
+Mac 被控端的“鼠标处理模式”可选择直接跟随、平滑插值或预测补偿，三者互斥。预测模式下空窗超过阈值后按近期速度进行指数衰减外推，真实累计位置始终独立保存。可在预测内部启用“预测输出平滑”（默认开启，时长默认 8 ms、范围 1–40 ms），对正常移动、外推点和真实数据恢复后的纠偏做短时线性追赶；关闭后恢复原来的直接输出。此开关独立于“平滑插值”模式，开启会增加跟随延迟。默认触发 8 ms、预测上限 60 ms、衰减时间 40 ms、估速窗口 20 ms、位移上限 32 个光标坐标单位；界面中均可调整，更新间隔与调度容差也可调整，设置即时生效并持久保存。
 
 预测可能在突然停手、转向时过冲或回跳。点击、按键、滚轮事件先回到真实位置并清除预测；鼠标按钮按住期间直接跟随；模式切换、停止、断线和看门狗结束时清空历史。预测坐标的指针反馈使用无效序号，不触发自动跨屏切回。
 
@@ -72,7 +72,7 @@ Mac 被控端的“鼠标处理模式”可选择直接跟随、平滑插值或�
 
 ```sh
 mkdir -p build/native
-xcrun swiftc macos/Runner/PointerPredictor.swift test/native/mac_pointer_predictor_test.swift -o build/native/mac_pointer_predictor_test
+xcrun swiftc macos/Runner/PointerInterpolator.swift macos/Runner/PointerPredictor.swift test/native/mac_pointer_predictor_test.swift -o build/native/mac_pointer_predictor_test
 build/native/mac_pointer_predictor_test
 ```
 
