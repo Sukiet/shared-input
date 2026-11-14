@@ -144,10 +144,31 @@ void main() {
           .onChanged!(80);
       await tester.pumpAndSettle();
       expect((applied()['prediction'] as Map)['horizonMs'], 80);
+      expect((applied()['prediction'] as Map)['outputSmoothing'], true);
+      tester
+          .widget<Slider>(find.byKey(const Key('prediction-output-duration')))
+          .onChanged!(16);
+      await tester.pumpAndSettle();
+      expect((applied()['prediction'] as Map)['outputDurationMs'], 16);
+      tester
+          .widget<SwitchListTile>(
+            find.byKey(const Key('prediction-output-smoothing')),
+          )
+          .onChanged!(false);
+      await tester.pumpAndSettle();
+      expect((applied()['prediction'] as Map)['outputSmoothing'], false);
+      expect(
+        tester
+            .widget<Slider>(find.byKey(const Key('prediction-output-duration')))
+            .onChanged,
+        isNull,
+      );
       await tester.pumpWidget(const SizedBox.shrink());
       await open(tester, width: 600, store: store);
       expect(applied()['mode'], 'prediction');
       expect((applied()['prediction'] as Map)['horizonMs'], 80);
+      expect((applied()['prediction'] as Map)['outputSmoothing'], false);
+      expect((applied()['prediction'] as Map)['outputDurationMs'], 16);
       tester
           .widget<DropdownButtonFormField<String>>(
             find.byKey(const ValueKey('pointer-mode-prediction')),

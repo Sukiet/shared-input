@@ -58,12 +58,16 @@ class AppSettings {
       predictionDecayMs = 40,
       predictionHistoryMs = 20,
       predictionMaxDistance = 32;
+  bool predictionOutputSmoothing = true;
+  int predictionOutputDurationMs = 8;
   Map<String, dynamic> get predictionOptions => {
     'triggerMs': predictionTriggerMs,
     'horizonMs': predictionHorizonMs,
     'decayMs': predictionDecayMs,
     'historyMs': predictionHistoryMs,
     'maxDistance': predictionMaxDistance,
+    'outputSmoothing': predictionOutputSmoothing,
+    'outputDurationMs': predictionOutputDurationMs,
   };
   int smoothingDurationMs = 12;
   int smoothingIntervalMs = 4;
@@ -172,6 +176,11 @@ class AppSettings {
       result.predictionDecayMs = param('decayMs', 1, 200, 40);
       result.predictionHistoryMs = param('historyMs', 4, 100, 20);
       result.predictionMaxDistance = param('maxDistance', 1, 200, 32);
+      if (prediction['outputSmoothing'] is bool) {
+        result.predictionOutputSmoothing =
+            prediction['outputSmoothing'] as bool;
+      }
+      result.predictionOutputDurationMs = param('outputDurationMs', 1, 40, 8);
     }
     result.smoothingDurationMs = validInt('smoothingDurationMs', 1, 100, 12);
     result.smoothingIntervalMs = validInt('smoothingIntervalMs', 1, 16, 4);
