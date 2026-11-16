@@ -5,6 +5,9 @@ import 'package:flutter/material.dart';
 import 'package:flutter/services.dart';
 import 'control_return_log.dart';
 import 'control_return_log_panel.dart';
+import 'audio_output_panel.dart';
+import 'audio_sync.dart';
+import 'audio_sync_mode.dart';
 import 'private_text_field.dart';
 import 'sensitivity.dart';
 import 'scroll_speed.dart';
@@ -67,6 +70,8 @@ class _ControlRun {
 class _InputPageState extends State<InputPage> with WidgetsBindingObserver {
   static const _channel = MethodChannel('shared_input/dry_run');
   final _stats = ValueNotifier<Map<String, dynamic>>({});
+  final _audioOutput = ValueNotifier(const AudioOutputInfo());
+  bool _readingAudioOutput = false;
   final _speedText = TextEditingController(text: '0.1000');
   final _scrollSpeedText = TextEditingController(text: '3.00');
   final _hostText = TextEditingController();
@@ -75,6 +80,7 @@ class _InputPageState extends State<InputPage> with WidgetsBindingObserver {
   final _listenKeyText = TextEditingController();
   final _lan = LanSession();
   late final ClipboardSync _clipboard;
+  late final AudioSync _audioSync;
   late final SettingsRepository _preferences;
   AppSettings _settings = AppSettings();
   bool _settingsLoaded = false;
@@ -119,6 +125,7 @@ class _InputPageState extends State<InputPage> with WidgetsBindingObserver {
       widget.returnLogStore ?? MemorySettingsStore(),
     );
     _clipboard = ClipboardSync(_lan, _channel);
+    _audioSync = AudioSync(_lan, _channel);
     _lan.addListener(_connectionChanged);
     _lan.onBeginWithOptions = (capture, options) => _channel.invokeMethod<void>(
       'receiverBegin',
@@ -193,6 +200,9 @@ class _InputPageState extends State<InputPage> with WidgetsBindingObserver {
         _settings.role = InputRole.receiver;
       }
       if (!mounted) return;
+      _audioSync.configure(_settings.audioSyncMode, _settings.role, _audioOutput.value);
+      await _audioSync.initialize();
+      if (!mounted) return;
       setState(() {
         _settingsLoaded = true;
         _speed = _settings.sensitivity;
@@ -210,6 +220,7 @@ class _InputPageState extends State<InputPage> with WidgetsBindingObserver {
         setState(() => _status = '输入共享目前支持 Windows 控制端和 Windows / macOS 被控端。');
         return;
       }
+      if (_captureSupported && !_receiving) unawaited(_readAudioOutput());
       await _channel.invokeMethod<void>('initialize', {
         'diagnostics': const bool.fromEnvironment('INPUT_DIAGNOSTICS'),
       });
@@ -232,6 +243,44 @@ class _InputPageState extends State<InputPage> with WidgetsBindingObserver {
       await _saveSettings();
       unawaited(_readAddresses());
     });
+  }
+
+  void _setAudioOutput(Map<String, dynamic> data) {
+    if (!mounted) return;
+    final info = AudioOutputInfo.fromMap(data);
+    if (info.revision >= _audioOutput.value.revision) _audioOutput.value = info;
+    _audioSync.configure(_settings.audioSyncMode, _settings.role, _audioOutput.value);
+  }
+
+  Future<void> _readAudioOutput() async {
+    if (!_captureSupported || _receiving || _readingAudioOutput) return;
+    _readingAudioOutput = true;
+    try {
+      final data = await _channel.invokeMapMethod<String, dynamic>(
+        'audioOutput',
+      );
+      if (data != null) _setAudioOutput(data);
+    } on PlatformException catch (error) {
+      if (mounted) {
+        _audioOutput.value = AudioOutputInfo(
+          status: 'error',
+          error: error.code,
+          revision: _audioOutput.value.revision,
+        );
+        _audioSync.configure(_settings.audioSyncMode, _settings.role, _audioOutput.value);
+      }
+    } on MissingPluginException {
+      if (mounted) {
+        _audioOutput.value = AudioOutputInfo(
+          status: 'error',
+          error: '请更新 Windows 程序',
+          revision: _audioOutput.value.revision,
+        );
+        _audioSync.configure(_settings.audioSyncMode, _settings.role, _audioOutput.value);
+      }
+    } finally {
+      _readingAudioOutput = false;
+    }
   }
 
   Future<void> _readAddresses() async {
@@ -289,6 +338,11 @@ class _InputPageState extends State<InputPage> with WidgetsBindingObserver {
     if (!mounted) return;
     final data = Map<String, dynamic>.from(call.arguments as Map? ?? {});
     switch (call.method) {
+      case 'audioOutputChanged':
+        _setAudioOutput(data);
+      case 'audioPlaybackState':
+      case 'audioCaptureState':
+        _audioSync.onNativeEvent(call.method, data);
       case 'edgeEnter':
         if (_settings.edgeSwitchEnabled && _canStart) {
           unawaited(_beginEdge(triggered: true));
@@ -408,6 +462,7 @@ class _InputPageState extends State<InputPage> with WidgetsBindingObserver {
   @override
   void didChangeAppLifecycleState(AppLifecycleState state) {
     _windowActive = state == AppLifecycleState.resumed;
+    if (_windowActive && _ready && !_receiving) unawaited(_readAudioOutput());
     if (!_windowActive) {
       _spaceArmed = false;
       ++_shortcutGeneration;
@@ -670,6 +725,8 @@ class _InputPageState extends State<InputPage> with WidgetsBindingObserver {
     });
     await _saveSettings();
     await _configureEdge();
+    _audioSync.configure(_settings.audioSyncMode, _settings.role, _audioOutput.value);
+    if (!_receiving) unawaited(_readAudioOutput());
   });
   Future<void> _connect() => _perform(_changeConnection);
 
@@ -711,6 +768,7 @@ class _InputPageState extends State<InputPage> with WidgetsBindingObserver {
     _heartbeat?.cancel();
     _channel.setMethodCallHandler(null);
     _stats.dispose();
+    _audioOutput.dispose();
     _returnHistory.dispose();
     _speedText.dispose();
     _scrollSpeedText.dispose();
@@ -719,6 +777,7 @@ class _InputPageState extends State<InputPage> with WidgetsBindingObserver {
     _peerKeyText.dispose();
     _listenKeyText.dispose();
     _lan.removeListener(_connectionChanged);
+    _audioSync.dispose();
     _clipboard.dispose();
     _lan.dispose();
     super.dispose();
@@ -1508,6 +1567,14 @@ class _InputPageState extends State<InputPage> with WidgetsBindingObserver {
       SelectableText(_addresses.isEmpty ? '正在读取…' : _addresses.join(' / ')),
       const SizedBox(height: 20),
       _connectionPanel(),
+      if (defaultTargetPlatform == TargetPlatform.macOS) ...[
+        const SizedBox(height: 12),
+        ListenableBuilder(
+          listenable: _audioSync,
+          builder: (_, _) => Text(_audioSync.status,
+            style: const TextStyle(fontSize: 12, color: Color(0xff929aa6))),
+        ),
+      ],
       const SizedBox(height: 16),
       Text(
         _lan.capturing ? '正在接收输入' : '在控制端填写本机 IP、端口和连接码后连接。',
@@ -1543,6 +1610,27 @@ class _InputPageState extends State<InputPage> with WidgetsBindingObserver {
     crossAxisAlignment: CrossAxisAlignment.start,
     children: [
       _connectionPanel(),
+      if (_captureSupported) ...[
+        const SizedBox(height: 16),
+        ValueListenableBuilder<AudioOutputInfo>(
+          valueListenable: _audioOutput,
+          builder: (_, info, _) => ListenableBuilder(
+            listenable: _audioSync,
+            builder: (_, _) => AudioOutputPanel(
+              info: info,
+              onRefresh: () => unawaited(_readAudioOutput()),
+              mode: _settings.audioSyncMode,
+              onModeChanged: (AudioSyncMode value) {
+                setState(() => _settings.audioSyncMode = value);
+                _persist();
+                _audioSync.configure(value, _settings.role, info);
+              },
+              syncStatus: _audioSync.status,
+              onRetry: _audioSync.failed ? _audioSync.retry : null,
+            ),
+          ),
+        ),
+      ],
       const SizedBox(height: 16),
       ControlReturnLogPanel(
         history: _returnHistory,

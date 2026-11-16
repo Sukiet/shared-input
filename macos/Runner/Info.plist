@@ -28,6 +28,8 @@
 	<string>MainMenu</string>
 	<key>NSPrincipalClass</key>
 	<string>NSApplication</string>
+	<key>NSAudioCaptureUsageDescription</key>
+	<string>将本机系统声音回传到已连接的 Windows 控制端播放；停止同步或断开连接后恢复本机输出。</string>
 	<key>NSLocalNetworkUsageDescription</key>
 	<string>用于在局域网连接另一台电脑并共享键盘和鼠标。</string>
 </dict>

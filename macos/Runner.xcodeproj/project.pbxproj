@@ -21,6 +21,8 @@
 /* End PBXAggregateTarget section */
 
 /* Begin PBXBuildFile section */
+		AB001001000000000000000A /* AudioPacket.swift in Sources */ = {isa = PBXBuildFile; fileRef = AB0010020000000000000008 /* AudioPacket.swift */; };
+		AB0010010000000000000009 /* AudioCaptureBridge.swift in Sources */ = {isa = PBXBuildFile; fileRef = AB0010020000000000000007 /* AudioCaptureBridge.swift */; };
 		AB0010010000000000000008 /* ReceiverCursor.swift in Sources */ = {isa = PBXBuildFile; fileRef = AB0010020000000000000006 /* ReceiverCursor.swift */; };
         AB0010010000000000000007 /* PointerPredictor.swift in Sources */ = {isa = PBXBuildFile; fileRef = AB0010020000000000000005 /* PointerPredictor.swift */; };
 		AB0010010000000000000006 /* ClipboardBridge.swift in Test Sources */ = {isa = PBXBuildFile; fileRef = AB0010020000000000000004 /* ClipboardBridge.swift */; };
@@ -69,6 +71,8 @@
 /* End PBXCopyFilesBuildPhase section */
 
 /* Begin PBXFileReference section */
+		AB0010020000000000000008 /* AudioPacket.swift */ = {isa = PBXFileReference; lastKnownFileType = sourcecode.swift; path = AudioPacket.swift; sourceTree = "<group>"; };
+		AB0010020000000000000007 /* AudioCaptureBridge.swift */ = {isa = PBXFileReference; lastKnownFileType = sourcecode.swift; path = AudioCaptureBridge.swift; sourceTree = "<group>"; };
 		AB0010020000000000000006 /* ReceiverCursor.swift */ = {isa = PBXFileReference; lastKnownFileType = sourcecode.swift; path = ReceiverCursor.swift; sourceTree = "<group>"; };
         AB0010020000000000000005 /* PointerPredictor.swift */ = {isa = PBXFileReference; lastKnownFileType = sourcecode.swift; path = PointerPredictor.swift; sourceTree = "<group>"; };
 		AB0010020000000000000004 /* ClipboardBridge.swift */ = {isa = PBXFileReference; lastKnownFileType = sourcecode.swift; path = ClipboardBridge.swift; sourceTree = "<group>"; };
@@ -183,6 +187,8 @@
 				33CC10F02044A3C60003C045 /* AppDelegate.swift */,
 				33CC11122044BFA00003C045 /* MainFlutterWindow.swift */,
 				AB0010020000000000000001 /* RemoteInputBridge.swift */,
+				AB0010020000000000000007 /* AudioCaptureBridge.swift */,
+				AB0010020000000000000008 /* AudioPacket.swift */,
 				AB0010020000000000000006 /* ReceiverCursor.swift */,
 				AB0010020000000000000004 /* ClipboardBridge.swift */,
 				AB0010020000000000000003 /* PointerInterpolator.swift */,
@@ -378,6 +384,8 @@
 			files = (
 				33CC11132044BFA00003C045 /* MainFlutterWindow.swift in Sources */,
 				AB0010010000000000000001 /* RemoteInputBridge.swift in Sources */,
+				AB0010010000000000000009 /* AudioCaptureBridge.swift in Sources */,
+				AB001001000000000000000A /* AudioPacket.swift in Sources */,
 				AB0010010000000000000008 /* ReceiverCursor.swift in Sources */,
 				AB0010010000000000000005 /* ClipboardBridge.swift in Sources */,
 				AB0010010000000000000004 /* PointerInterpolator.swift in Sources */,

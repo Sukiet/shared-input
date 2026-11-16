@@ -11,6 +11,14 @@ import 'input_diagnostics.dart';
 
 class LanSession extends ChangeNotifier {
   final clipboard = ClipboardChannel();
+  bool audioCaptureSupported = false, audioRenderSupported = false, supportsAudio = false;
+  void Function(Map<String, dynamic>)? onAudioControl;
+  String? get remoteHost => _wire?.socket.remoteAddress.address;
+  Future<void> sendAudioControl(Map<String, dynamic> message) async {
+    final wire = _wire;
+    if (wire == null || !connected || !supportsAudio) throw StateError('音频连接不可用');
+    await wire.send(message);
+  }
   bool clipboardSupported = false, supportsClipboard = false;
   bool _clipboardOpening = false;
   void Function(Map<String, dynamic> message)? onClipboardControl;
@@ -133,6 +141,8 @@ class LanSession extends ChangeNotifier {
               'capabilities': [
                 'motion-prediction-v1',
                 if (clipboardSupported) 'clipboard-v1',
+                if (audioCaptureSupported) 'audio-capture-pcm-v1',
+                if (audioRenderSupported) 'audio-render-pcm-v1',
                 if (onPointerInfo != null) 'edge-pointer-v1',
                 if (display != null && onBeginWithOptions != null)
                   'edge-layout-v1',
@@ -165,6 +175,8 @@ class LanSession extends ChangeNotifier {
               clipboardSupported &&
               (hello['capabilities'] as List?)?.contains('clipboard-v1') ==
                   true;
+          supportsAudio = audioCaptureSupported &&
+              (hello['capabilities'] as List?)?.contains('audio-render-pcm-v1') == true;
           _mouseCipher = PacketCipher(keys.mouse);
           _remoteAddress = socket.remoteAddress;
           _remoteUdpPort = udpPort;
@@ -221,6 +233,8 @@ class LanSession extends ChangeNotifier {
           'capabilities': [
             'motion-prediction-v1',
             if (clipboardSupported) 'clipboard-v1',
+                if (audioCaptureSupported) 'audio-capture-pcm-v1',
+                if (audioRenderSupported) 'audio-render-pcm-v1',
           ],
         }, master),
       );
@@ -238,6 +252,8 @@ class LanSession extends ChangeNotifier {
       supportsClipboard =
           clipboardSupported &&
           (ack['capabilities'] as List?)?.contains('clipboard-v1') == true;
+      supportsAudio = audioRenderSupported &&
+          (ack['capabilities'] as List?)?.contains('audio-capture-pcm-v1') == true;
       remoteDisplay = _displayInfo(ack['display']);
       supportsLayout =
           remoteDisplay != null &&
@@ -340,6 +356,12 @@ class LanSession extends ChangeNotifier {
         );
         _lastReceived = DateTime.now();
         switch (json['type']) {
+          case 'audioStart':
+          case 'audioStarted':
+          case 'audioStop':
+          case 'audioLease':
+          case 'audioError':
+            if (supportsAudio) onAudioControl?.call(json);
           case 'clipboardPort':
             if (!_receiver && supportsClipboard && !_clipboardOpening) {
               final port = json['port'], key = json['key'];
@@ -769,6 +791,7 @@ class LanSession extends ChangeNotifier {
     supportsEdge = false;
     supportsLayout = false;
     supportsClipboard = false;
+    supportsAudio = false;
     _clipboardOpening = false;
     clipboard.close();
     remoteDisplay = null;

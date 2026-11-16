@@ -18,6 +18,8 @@
 #include "background_hooks.h"
 #include "edge_policy.h"
 #include "clipboard_bridge.h"
+#include "audio_output_monitor.h"
+#include "audio_playback_bridge.h"
 
 class InputBridge {
  public:
@@ -46,6 +48,7 @@ class InputBridge {
   void Stop(const std::string& reason, bool notify = true);
   void CancelSetup();
   void Emit(const std::string& method, Map data = {});
+  Map AudioOutput() const;
   Map Stats() const;
   bool Down(int key) const;
   bool MatchesShortcut(int key) const;
@@ -59,6 +62,8 @@ class InputBridge {
   HWND owner_, view_, capture_ = nullptr;
   std::unique_ptr<flutter::MethodChannel<Value>> channel_;
   std::unique_ptr<ClipboardBridge> clipboard_;
+  std::unique_ptr<AudioOutputMonitor> audio_output_;
+  std::unique_ptr<AudioPlaybackBridge> audio_playback_;
   bool initialized_ = false, active_ = false, recording_ = false;
   std::string identifying_;
   uint64_t setup_since_ = 0, started_ = 0;

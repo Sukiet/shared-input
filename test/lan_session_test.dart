@@ -14,6 +14,26 @@ Future<void> eventually(bool Function() condition) async {
 }
 
 void main() {
+  test('audio capabilities and controls work independently of mouse capture', () async {
+    final receiver = LanSession()..audioCaptureSupported = true;
+    final controller = LanSession()..audioRenderSupported = true;
+    final messages = <Map<String, dynamic>>[];
+    receiver.onAudioControl = messages.add;
+    try {
+      await receiver.listen(port: 0, key: 'd' * 32, bindAddress: '127.0.0.1');
+      await controller.connect(host: '127.0.0.1', port: receiver.port, key: 'd' * 32);
+      expect(controller.supportsAudio, true);
+      expect(receiver.supportsAudio, true);
+      expect(controller.capturing, false);
+      await controller.sendAudioControl({'type': 'audioStart', 'session': 'e' * 32});
+      await eventually(() => messages.isNotEmpty);
+      expect(messages.single['type'], 'audioStart');
+      expect(controller.connected, true);
+    } finally {
+      await controller.close(); await receiver.close();
+      controller.dispose(); receiver.dispose();
+    }
+  });
   test(
     'predicted pointer feedback keeps liveness but cannot authorize an edge return',
     () async {

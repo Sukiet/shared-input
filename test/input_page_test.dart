@@ -10,6 +10,7 @@ import 'package:shared_input/control_return_log_panel.dart';
 import 'package:shared_input/remote/lan_session.dart';
 import 'package:shared_input/settings.dart';
 import 'package:shared_input/scroll_speed.dart';
+import 'package:shared_input/audio_sync_mode.dart';
 
 void main() {
   TestWidgetsFlutterBinding.ensureInitialized();
@@ -20,6 +21,7 @@ void main() {
   var devices = <Map<String, dynamic>>[];
   var rejectStart = false;
   String? stopDuringStart;
+  Completer<Object?>? pendingAudioOutput;
 
   void windowsTest(String description, WidgetTesterCallback callback) {
     testWidgets(
@@ -53,9 +55,16 @@ void main() {
     ];
     rejectStart = false;
     stopDuringStart = null;
+    pendingAudioOutput = null;
     messenger.setMockMethodCallHandler(channel, (call) async {
       calls.add(call);
       if (call.method == 'devices') return devices;
+      if (call.method == 'audioOutput') {
+        return pendingAudioOutput?.future ?? {
+          'status': 'ready', 'name': 'Speakers (Test Audio)', 'id': 'render-test',
+          'automatic': true, 'revision': 1,
+        };
+      }
       if (call.method == 'edgeState') {
         return {'atEdge': true, 'entryY': 0.25, 'ready': true};
       }
@@ -112,6 +121,115 @@ void main() {
     });
     await tester.pumpAndSettle();
   }
+
+  windowsTest(
+    'current default audio output is between clipboard and return logs and updates live',
+    (tester) async {
+      await open(tester);
+      expect(find.text('Speakers (Test Audio)'), findsOneWidget);
+      final clipboardY = tester
+          .getTopLeft(find.byKey(const Key('clipboard-sync')))
+          .dy;
+      final audioY = tester
+          .getTopLeft(find.byKey(const Key('audio-output-panel')))
+          .dy;
+      final logsY = tester.getTopLeft(find.text('断联日志')).dy;
+      expect(audioY, greaterThan(clipboardY));
+      expect(audioY, lessThan(logsY));
+      await native('audioOutputChanged', {
+        'status': 'ready',
+        'name': 'USB Headphones',
+        'id': 'render-usb',
+        'automatic': true,
+        'revision': 2,
+      });
+      await tester.pumpAndSettle();
+      expect(find.text('USB Headphones'), findsOneWidget);
+      await native('audioOutputChanged', {
+        'status': 'none',
+        'revision': 3,
+        'automatic': true,
+      });
+      await tester.pumpAndSettle();
+      expect(find.text('未检测到音频输出设备'), findsOneWidget);
+      await native('audioOutputChanged', {
+        'status': 'error',
+        'error': '0x80004005',
+        'revision': 4,
+      });
+      await tester.pumpAndSettle();
+      expect(find.text('无法读取音频输出设备'), findsOneWidget);
+      expect(find.textContaining('0x80004005'), findsOneWidget);
+      final previousReads = calls
+          .where((c) => c.method == 'audioOutput')
+          .length;
+      await tester.tap(find.byKey(const Key('refresh-audio-output')));
+      await tester.pumpAndSettle();
+      expect(
+        calls.where((c) => c.method == 'audioOutput').length,
+        previousReads + 1,
+      );
+      expect(
+        find.text('Speakers (Test Audio)'),
+        findsNothing,
+      ); // older cached revision is ignored
+      await tester.tap(find.text('被控端'));
+      await tester.pumpAndSettle();
+      expect(find.byKey(const Key('audio-output-panel')), findsNothing);
+      await tester.pumpWidget(const SizedBox());
+    },
+  );
+
+  windowsTest('late audio read cannot overwrite a newer device notification', (
+    tester,
+  ) async {
+    pendingAudioOutput = Completer<Object?>();
+    await open(tester);
+    expect(find.text('正在识别输出设备…'), findsOneWidget);
+    await native('audioOutputChanged', {
+      'status': 'ready',
+      'name': 'Bluetooth Headphones',
+      'id': 'render-bluetooth',
+      'automatic': true,
+      'revision': 5,
+    });
+    await tester.pumpAndSettle();
+    pendingAudioOutput!.complete({
+      'status': 'ready',
+      'name': 'Old speakers',
+      'revision': 1,
+    });
+    await tester.pumpAndSettle();
+    expect(find.text('Bluetooth Headphones'), findsOneWidget);
+    expect(find.text('Old speakers'), findsNothing);
+    await tester.pumpWidget(const SizedBox());
+    await native('audioOutputChanged', {'status': 'none', 'revision': 6});
+    expect(tester.takeException(), isNull);
+  });
+
+  windowsTest('audio mode selector persists through role switch and restart', (tester) async {
+    final store = MemorySettingsStore();
+    await open(tester, store: store);
+    final selector = find.byKey(const Key('audio-sync-mode'));
+    await tester.ensureVisible(selector);
+    await tester.tap(selector);
+    await tester.pumpAndSettle();
+    await tester.tap(find.text('耳机插入时自动同步').last);
+    await tester.pumpAndSettle();
+    expect(jsonDecode(store.value!)['audioSyncMode'], 'headphones');
+    await tester.ensureVisible(find.text('被控端'));
+    await tester.tap(find.text('被控端'));
+    await tester.pumpAndSettle();
+    expect(selector, findsNothing);
+    await tester.tap(find.text('控制端'));
+    await tester.pumpAndSettle();
+    expect(tester.widget<DropdownButtonFormField<AudioSyncMode>>(selector).initialValue, AudioSyncMode.headphones);
+    await tester.pumpWidget(const SizedBox());
+    await open(tester, store: store);
+    expect(tester.widget<DropdownButtonFormField<AudioSyncMode>>(selector).initialValue, AudioSyncMode.headphones);
+    expect(tester.takeException(), isNull);
+    await tester.pumpWidget(const SizedBox());
+  });
 
   testWidgets(
     'prediction mode excludes interpolation and saves live parameters',

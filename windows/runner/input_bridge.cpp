@@ -151,6 +151,8 @@ InputBridge::InputBridge(HWND owner, HWND view, flutter::BinaryMessenger* messen
 
 InputBridge::~InputBridge() {
   Stop("shutdown", false);
+  audio_playback_.reset();
+  audio_output_.reset();
   background_.Close();
   receiver_.Stop();
   clipboard_.reset();
@@ -222,6 +224,30 @@ std::vector<InputBridge::Device> InputBridge::Enumerate() {
 void InputBridge::OnMethod(const flutter::MethodCall<Value>& call,
                            std::unique_ptr<Result> result) {
   const auto& method = call.method_name();
+  if (method == "audioCapabilities") {
+    result->Success(Value(Map{{Value("render"), Value(true)}, {Value("capture"), Value(false)}})); return;
+  }
+  if (method == "audioPlaybackStart") {
+    const auto args = call.arguments() ? std::get_if<Map>(call.arguments()) : nullptr;
+    if (!args) { result->Error("invalid_audio", "音频参数无效"); return; }
+    if (!audio_playback_) audio_playback_ = std::make_unique<AudioPlaybackBridge>(owner_);
+    audio_playback_->Start(*args, std::move(result)); return;
+  }
+  if (method == "audioPlaybackStop" || method == "audioPlaybackStatus") {
+    if (method == "audioPlaybackStop") {
+      const auto args = call.arguments() ? std::get_if<Map>(call.arguments()) : nullptr;
+      if (audio_playback_ && args) audio_playback_->Stop(StringArg(*args, "session"));
+      result->Success();
+    } else {
+      result->Success(Value(audio_playback_ ? audio_playback_->Snapshot() : Map{}));
+    }
+    return;
+  }
+  if (method == "audioOutput") {
+    if (!audio_output_) audio_output_ = std::make_unique<AudioOutputMonitor>(owner_);
+    audio_output_->Refresh();
+    result->Success(Value(AudioOutput())); return;
+  }
   if (method.rfind("clipboard", 0) == 0) {
     clipboard_->Handle(call, std::move(result)); return;
   }
@@ -729,7 +755,24 @@ void InputBridge::CancelSetup() {
   if (!identifying_.empty()) { identifying_.clear(); Emit("identificationCancelled"); }
 }
 
+InputBridge::Map InputBridge::AudioOutput() const {
+  const auto state = audio_output_->Snapshot();
+  return {{Value("status"), Value(state.status)}, {Value("id"), Value(state.id)},
+      {Value("name"), Value(state.name)}, {Value("error"), Value(state.error)},
+      {Value("kind"), Value(state.kind)}, {Value("headphones"), Value(state.headphones)},
+      {Value("automatic"), Value(state.automatic)}, {Value("revision"), Value(state.revision)}};
+}
+
 std::optional<LRESULT> InputBridge::HandleMessage(UINT message, WPARAM wparam, LPARAM lparam) {
+  if (audio_playback_ && message == AudioPlaybackBridge::kResultMessage) {
+    audio_playback_->Complete(); return 0;
+  }
+  if (audio_playback_ && message == AudioPlaybackBridge::kStateMessage) {
+    Emit("audioPlaybackState", audio_playback_->Snapshot()); return 0;
+  }
+  if (audio_output_ && message == AudioOutputMonitor::kChangedMessage) {
+    Emit("audioOutputChanged", AudioOutput()); return 0;
+  }
   if (clipboard_ && message == ClipboardBridge::kResultMessage) { clipboard_->Complete(); return 0; }
   switch (message) {
     case kStreamMessage:

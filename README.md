@@ -111,6 +111,14 @@ flutter run -d windows
 
 上述路径是本机独立安装位置，其他机器请换成自己的 Flutter SDK 路径。
 
+## 当前音频输出
+
+Windows 控制端在“剪贴板同步”和“断联日志”之间显示本机当前系统默认播放设备的名称，例如扬声器、USB 耳机或蓝牙耳机。通过 Windows Core Audio 的 `eRender / eConsole` 读取系统默认输出，设备切换、插拔或属性变化时自动更新，也可点击刷新按钮重新识别。无设备、读取失败时显示明确状态，不保留旧设备名称冒充当前设备。
+
+设备查询与通知注册运行在独立 COM 工作线程，主线程只读取缓存并更新界面；没有高频设备轮询，不阻塞键鼠转发。此处是设备识别，不会切换系统设备、修改音量或传输音频，也不表示某个应用单独指定的输出或默认通信设备。当前输出由系统实时决定，不写入本应用设置。
+
+接口依据：[GetDefaultAudioEndpoint](https://learn.microsoft.com/en-us/windows/win32/api/mmdeviceapi/nf-mmdeviceapi-immdeviceenumerator-getdefaultaudioendpoint)、[IMMNotificationClient](https://learn.microsoft.com/en-us/windows/win32/api/mmdeviceapi/nn-mmdeviceapi-immnotificationclient)。
+
 ## 断联日志
 
 控制端原“模拟桌面”区域改为“断联日志”；`lib/pointer_preview.dart` 组件继续保留，但不再挂载到控制端，也不再逐帧轮询预览坐标。
@@ -175,6 +183,12 @@ USB 标记来自设备的 USB 父级链路，**不等同于外接设备**。内�
 模拟指针灵敏度范围为 **0.0001～4 倍**，默认 **0.1000 倍**。可输入四位小数；加减步长默认为 **0.0001**，可选 0.001、0.01 或 0.1。滑块采用对数刻度，低倍率区间也有足够的调节空间。原生侧始终累加浮点位移，例如 10,000 次单计数位移在 0.0001 倍下累计移动 1 个模拟坐标单位，不会逐次取整丢失。此设置不改变本机鼠标速度。
 
 指针显示不再依赖每 100 ms 一次的统计消息。Flutter 在每个显示帧通过 `pointer` 读取原生最新位置，同一时间最多一个请求，避免排队播放过期位置。位置通过 ValueNotifier 驱动 CustomPainter，只重绘指针，不触发整页重建，也不使用补间动画；统计数据仍以 10 Hz 单独刷新。模拟桌面按相同的 X/Y 比例显示，窗口变化不会拉伸鼠标运动方向。实际帧率取决于显示器刷新率和设备运行状况。
+
+## 音频回传（首版待 Mac 联调）
+
+Windows 的音频输出区增加“不同步 / 同步 / 耳机插入时自动同步”，设置会保存，默认不同步。自动档以系统当前默认输出的 Headphones / Headset 类型判断，设备类型未知时可手动选择“同步”。连接期间可持续接收 Mac 系统声音，鼠标切回 Windows 后继续；同步时 Mac 本机静音，停止或断开后恢复。
+
+Mac 14.2+ 使用系统 Core Audio Tap 与私有聚合设备，不需安装额外虚拟声卡；首次需要允许系统音频录制。音频通过独立加密 UDP 通道传输。实现与测试范围、Mac 构建和真机检查见[音频回传报告](docs/reports/2026-11-16-audio-return.md)。当前 Windows 构建与播放链路已验证，Mac 构建和双机效果尚未验证。
 
 ## 自动检查
 

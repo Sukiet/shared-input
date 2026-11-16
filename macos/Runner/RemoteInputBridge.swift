@@ -7,6 +7,7 @@ import ApplicationServices
 final class RemoteInputBridge {
   private let channel: FlutterMethodChannel
   private let clipboard = ClipboardBridge()
+  private lazy var audioCapture = AudioCaptureBridge(channel: channel)
   private let cursorVisibility = ReceiverCursorVisibility()
   private var edgeExit = ReceiverEdgeExit()
   private let lock = NSLock()
@@ -95,13 +96,16 @@ final class RemoteInputBridge {
     self.motionTimer = motionTimer
   }
   deinit { motionTimer?.cancel(); timer?.cancel(); clipboard.reset(); stop() }
-  func shutdown() { clipboard.reset(); stop() }
+  func shutdown() { clipboard.reset(); stop(); audioCapture.shutdown() }
   func stop(hideCursor: Bool = false) {
     lock.lock(); defer { lock.unlock() }
     releaseLocked(hideCursor: hideCursor)
   }
 
   private func handle(_ call: FlutterMethodCall, _ result: @escaping FlutterResult) {
+    if call.method == "audioCapabilities" || call.method.hasPrefix("audioCapture") {
+      audioCapture.handle(call, result); return
+    }
     if call.method.hasPrefix("clipboard") { clipboard.handle(call, result); return }
     let args = call.arguments as? [String: Any] ?? [:]
     switch call.method {

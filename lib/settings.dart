@@ -4,6 +4,7 @@ import 'package:shared_preferences/shared_preferences.dart';
 import 'sensitivity.dart';
 import 'scroll_speed.dart';
 import 'display_layout.dart';
+import 'audio_sync_mode.dart';
 
 enum InputRole { controller, receiver }
 
@@ -75,6 +76,7 @@ class AppSettings {
   bool statisticsExpanded = false;
   bool edgeSwitchEnabled = false;
   bool clipboardEnabled = true;
+  AudioSyncMode audioSyncMode = AudioSyncMode.off;
   DisplayLayout displayLayout = const DisplayLayout();
 
   Map<String, dynamic> get smoothingOptions => {
@@ -109,6 +111,7 @@ class AppSettings {
     'statisticsExpanded': statisticsExpanded,
     'edgeSwitchEnabled': edgeSwitchEnabled,
     'clipboardEnabled': clipboardEnabled,
+    'audioSyncMode': audioSyncMode.name,
     'displayLayout': displayLayout.toJson(),
   };
 
@@ -150,6 +153,7 @@ class AppSettings {
     if (json['clipboardEnabled'] is bool) {
       result.clipboardEnabled = json['clipboardEnabled'] as bool;
     }
+    result.audioSyncMode = AudioSyncMode.parse(json['audioSyncMode']);
     result.displayLayout = DisplayLayout.fromJson(json['displayLayout']);
     if (json['smoothingEnabled'] is bool) {
       result.smoothingEnabled = json['smoothingEnabled'] as bool;
