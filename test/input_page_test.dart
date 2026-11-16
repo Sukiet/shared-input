@@ -5,6 +5,8 @@ import 'package:flutter/services.dart';
 import 'package:flutter_test/flutter_test.dart';
 import 'package:shared_input/main.dart';
 import 'package:shared_input/pointer_preview.dart';
+import 'package:shared_input/control_return_log.dart';
+import 'package:shared_input/control_return_log_panel.dart';
 import 'package:shared_input/remote/lan_session.dart';
 import 'package:shared_input/settings.dart';
 import 'package:shared_input/scroll_speed.dart';
@@ -17,8 +19,7 @@ void main() {
   final calls = <MethodCall>[];
   var devices = <Map<String, dynamic>>[];
   var rejectStart = false;
-  var pointer = const Offset(123.4567, 67.8912);
-  Completer<Object?>? pendingPointer;
+  String? stopDuringStart;
 
   void windowsTest(String description, WidgetTesterCallback callback) {
     testWidgets(
@@ -51,8 +52,7 @@ void main() {
       {'id': 'mouse-1', 'name': 'Test mouse', 'type': 'mouse', 'usb': true},
     ];
     rejectStart = false;
-    pointer = const Offset(123.4567, 67.8912);
-    pendingPointer = null;
+    stopDuringStart = null;
     messenger.setMockMethodCallHandler(channel, (call) async {
       calls.add(call);
       if (call.method == 'devices') return devices;
@@ -60,7 +60,10 @@ void main() {
         return {'atEdge': true, 'entryY': 0.25, 'ready': true};
       }
       if (call.method == 'pointer') {
-        return pendingPointer?.future ?? [pointer.dx, pointer.dy, true];
+        return [123.4567, 67.8912, true];
+      }
+      if (call.method == 'start' && stopDuringStart != null) {
+        await native('stopped', {'reason': stopDuringStart});
       }
       if (call.method == 'start' && rejectStart) {
         throw PlatformException(
@@ -77,27 +80,20 @@ void main() {
     WidgetTester tester, {
     double width = 1100,
     SettingsStore? store,
+    SettingsStore? returnLogStore,
   }) async {
     tester.view.physicalSize = Size(width, 900);
     tester.view.devicePixelRatio = 1;
     addTearDown(tester.view.resetPhysicalSize);
     addTearDown(tester.view.resetDevicePixelRatio);
-    await tester.pumpWidget(SharedInputApp(store: store));
+    await tester.pumpWidget(SharedInputApp(store: store, returnLogStore: returnLogStore));
     await tester.pumpAndSettle();
   }
 
   FilledButton start(WidgetTester tester) =>
       tester.widget<FilledButton>(find.byKey(const Key('start-control')));
-  PointerPainter painter(WidgetTester tester) =>
-      tester
-              .widget<CustomPaint>(
-                find.byWidgetPredicate(
-                  (widget) =>
-                      widget is CustomPaint && widget.painter is PointerPainter,
-                ),
-              )
-              .painter!
-          as PointerPainter;
+  ControlReturnHistory history(WidgetTester tester) => tester
+      .widget<ControlReturnLogPanel>(find.byType(ControlReturnLogPanel)).history;
 
   Future<void> selectDevices(WidgetTester tester) async {
     await native('identified', {'type': 'keyboard', 'id': 'keyboard-1'});
@@ -357,52 +353,69 @@ void main() {
   });
 
   windowsTest(
-    'cursor updates on frames without stats or rebuilding its widget',
+    'return logs replace preview, deduplicate, filter, clear and restore',
     (tester) async {
-      await open(tester);
+      final logStore = MemorySettingsStore();
+      await open(tester, returnLogStore: logStore);
       await configure(tester);
-      await tester.tap(find.byKey(const Key('start-control')));
-      await tester.pump();
-      final originalPainter = painter(tester);
-      for (var i = 0; i < 4; i++) {
-        pointer = Offset(123 + i * 0.0001, 67.8912);
-        await tester.pump(const Duration(milliseconds: 16));
-        expect(originalPainter.position.value, pointer);
-        expect(identical(painter(tester), originalPainter), isTrue);
+      expect(find.byType(PointerPreview), findsNothing);
+      expect(find.text('断联日志'), findsOneWidget);
+      expect(find.text('暂无返回记录'), findsOneWidget);
+      expect(
+        tester
+            .widget<TextButton>(find.byKey(const Key('clear-return-logs')))
+            .onPressed,
+        isNull,
+      );
+      await native('stopped', {'reason': 'shortcut'});
+      expect(history(tester).entries, isEmpty);
+      for (final reason in ['shortcut', 'input_overflow', 'future_exit']) {
+        await tester.tap(find.byKey(const Key('start-control')));
+        await tester.pump();
+        await tester.pump(const Duration(milliseconds: 80));
+        await native('stopped', {'reason': reason});
+        await native('stopped', {'reason': reason});
+        await tester.pumpAndSettle();
       }
-      await native('stats', {'keys': 4, 'held': 2, 'remainingMs': 29000});
-      await tester.pump(const Duration(milliseconds: 16));
-      expect(identical(painter(tester), originalPainter), isTrue);
-      await native('stopped', {'reason': 'shake', 'held': 0});
+      expect(history(tester).entries.length, 3);
+      expect(history(tester).entries.first.type, ControlReturnType.other);
+      expect(history(tester).entries.first.connected, isFalse);
+      expect(history(tester).entries.first.mode, ControlMode.local);
+      expect(calls.where((c) => c.method == 'pointer'), isEmpty);
+      tester
+          .widget<DropdownButtonFormField<String>>(
+            find.byKey(const Key('return-log-filter')),
+          )
+          .onChanged!('protection');
       await tester.pumpAndSettle();
-      expect(start(tester).onPressed, isNotNull);
-      expect(find.text('已通过晃动鼠标退出。'), findsOneWidget);
+      expect(find.text('待发送输入队列溢出'), findsOneWidget);
+      expect(find.text('退出快捷键触发'), findsNothing);
+      await tester.pumpWidget(const SizedBox());
+      await open(tester, returnLogStore: logStore);
+      expect(history(tester).entries.length, 3);
+      await tester.tap(find.byKey(const Key('clear-return-logs')));
+      await tester.pumpAndSettle();
+      expect(history(tester).entries, isEmpty);
+      expect(jsonDecode(logStore.value!), isEmpty);
+      await tester.pumpWidget(const SizedBox());
+      await open(tester, returnLogStore: logStore);
+      expect(history(tester).entries, isEmpty);
       await tester.pumpWidget(const SizedBox());
     },
   );
 
   windowsTest(
-    'slow pointer responses cannot queue requests or move cursor after stop',
+    'native exit before the start reply is recorded without reactivating',
     (tester) async {
       await open(tester);
       await configure(tester);
-      pendingPointer = Completer<Object?>();
+      stopDuringStart = 'heartbeat';
       await tester.tap(find.byKey(const Key('start-control')));
-      await tester.pump();
-      for (var i = 0; i < 8; i++) {
-        await tester.pump(const Duration(milliseconds: 16));
-      }
-      expect(calls.where((call) => call.method == 'pointer').length, 1);
-      await native('stopped', {
-        'reason': 'shortcut',
-        'x': 80.0001,
-        'y': 90.0002,
-        'held': 0,
-      });
-      await tester.pump();
-      pendingPointer!.complete([500.0, 200.0, true]);
       await tester.pumpAndSettle();
-      expect(painter(tester).position.value, const Offset(80.0001, 90.0002));
+      expect(history(tester).entries.single.reason, 'heartbeat');
+      expect(start(tester).onPressed, isNotNull);
+      expect(find.text('界面心跳超时'), findsOneWidget);
+      expect(find.text('控制中'), findsNothing);
       await tester.pumpWidget(const SizedBox());
     },
   );
@@ -416,6 +429,7 @@ void main() {
       await tester.tap(find.byKey(const Key('start-control')));
       await tester.pumpAndSettle();
       expect(find.text('请松开所有键盘按键，再点击开始控制。'), findsOneWidget);
+      expect(history(tester).entries, isEmpty);
       expect(start(tester).onPressed, isNotNull);
       devices = [];
       await native('devicesChanged');
@@ -484,7 +498,7 @@ void main() {
   });
 
   windowsTest(
-    'edge switching starts in background and retains both emergency exits',
+    'edge switching retains shortcut exit and edge return',
     (tester) async {
       const key = '0123456789abcdef0123456789abcdef';
       final receiver = LanSession();
@@ -531,7 +545,7 @@ void main() {
       );
       tester.binding.handleAppLifecycleStateChanged(AppLifecycleState.inactive);
       var starts = 0;
-      for (final reason in ['shake', 'shortcut']) {
+      for (final reason in ['shortcut', 'edge', 'pointer_timeout']) {
         ++starts;
         await tester.runAsync(() async {
           await native('edgeEnter', {'entryY': 0.25});
@@ -564,11 +578,86 @@ void main() {
         await tester.pumpAndSettle();
         expect(start(tester).onPressed, isNotNull);
         expect(jsonDecode(store.value!)['edgeSwitchEnabled'], isTrue);
+        expect(history(tester).entries.length, starts);
+        expect(history(tester).entries.first.reason, reason);
+        expect(history(tester).entries.first.connected, isTrue);
+        expect(history(tester).entries.first.mode, ControlMode.background);
       }
       tester.binding.handleAppLifecycleStateChanged(AppLifecycleState.resumed);
       await tester.pumpWidget(const SizedBox());
     },
   );
+
+  for (final remoteEnd in [true, false]) {
+    windowsTest(
+      remoteEnd
+          ? 'remote end is distinct from a lost connection in return logs'
+          : 'lost LAN connection records its cause once after native recovery',
+      (tester) async {
+        const key = '0123456789abcdef0123456789abcdef';
+        final receiver = LanSession();
+        receiver.onPointerInfo = () async => {
+          'x': 200,
+          'y': 300,
+          'left': 0,
+          'top': 0,
+          'width': 1920,
+          'height': 1080,
+          'sequence': 0,
+        };
+        addTearDown(() async {
+          await receiver.close();
+          receiver.dispose();
+        });
+        await tester.runAsync(
+          () => receiver.listen(port: 0, key: key, bindAddress: '127.0.0.1'),
+        );
+        final saved = AppSettings()
+          ..edgeSwitchEnabled = true
+          ..shortcut = const ExitShortcut(0x77)
+          ..host = '127.0.0.1'
+          ..port = receiver.port
+          ..peerKey = key;
+        await open(
+          tester,
+          store: MemorySettingsStore()..value = jsonEncode(saved.toJson()),
+        );
+        Future<void> waitForCall(String method) async {
+          final deadline = DateTime.now().add(const Duration(seconds: 5));
+          while (!calls.any((c) => c.method == method)) {
+            if (DateTime.now().isAfter(deadline)) {
+              fail('Missing native $method');
+            }
+            await Future<void>.delayed(const Duration(milliseconds: 5));
+          }
+        }
+
+        await tester.runAsync(() async {
+          await native('edgeEnter');
+          await waitForCall('start');
+        });
+        await tester.pump();
+        await tester.runAsync(() async {
+          if (remoteEnd) {
+            await receiver.endCapture();
+          } else {
+            await receiver.close();
+          }
+          await waitForCall('stop');
+          await native('stopped', {'reason': 'manual'});
+          await native('stopped', {'reason': 'manual'});
+        });
+        await tester.pumpAndSettle();
+        final log = history(tester).entries.single;
+        expect(log.reason, remoteEnd ? 'remote_end' : 'connection_lost');
+        expect(log.nativeReason, 'manual');
+        expect(log.connected, remoteEnd);
+        expect(log.mode, ControlMode.background);
+        if (!remoteEnd) expect(log.detail, '连接已断开');
+        await tester.pumpWidget(const SizedBox());
+      },
+    );
+  }
 
   windowsTest('space connects then starts remotely on release and can resume', (
     tester,

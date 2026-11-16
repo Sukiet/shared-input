@@ -35,52 +35,5 @@ int main() {
   Check(CheckExpiry(4000, 1000, 1000) == Expiry::heartbeat, "heartbeat boundary");
   Check(CheckExpiry(3999, 1000, 1000) == Expiry::none, "before heartbeat boundary");
   Check(CheckExpiry(4000, 1000, 4001) == Expiry::none, "concurrent newer heartbeat must not underflow");
-  for (bool vertical : {false, true}) {
-    ShakeDetector detector;
-    bool result = false;
-    for (int i = 0; i < 7; ++i) {
-      const int delta = i % 2 == 0 ? 800 : -800;
-      result = detector.Add(vertical ? 0 : delta, vertical ? delta : 0, 100 + i * 150);
-      if (i < 6) Check(!result, "fewer than six reversals rejected even with large motion");
-    }
-    Check(result, "rapid large shake exits on either axis");
-  }
-  ShakeDetector monotonic, jitter, slow, old_gesture, moderate_corrections;
-  for (int i = 0; i < 50; ++i) {
-    Check(!monotonic.Add(100, 0, i * 10), "straight movement is not a shake");
-    Check(!jitter.Add(i % 2 ? 4 : -4, 0, i * 10), "small jitter rejected");
-    Check(!slow.Add(i % 2 ? 800 : -800, 0, i * 400), "slow reversal rejected");
-    Check(!old_gesture.Add(i % 2 ? 140 : -140, 0, i * 50), "previously triggering small gesture is now rejected");
-    Check(!moderate_corrections.Add(i % 2 ? 500 : -500, 0, i * 50), "subthreshold rapid corrections rejected");
-  }
-  ShakeDetector short_travel;
-  for (int i = 0; i < 7; ++i) {
-    Check(!short_travel.Add(i % 2 ? -680 : 680, 0, 100 + i * 50),
-        "six reversals still require sufficient total travel");
-  }
-  Check(short_travel.Add(40, 0, 450), "total travel threshold is inclusive");
-  for (int interval : {200, 201}) {
-    ShakeDetector window_boundary;
-    bool result = false;
-    for (int i = 0; i < 7; ++i) {
-      result = window_boundary.Add(i % 2 ? -800 : 800, 0, 100 + i * interval);
-    }
-    Check(result == (interval == 200), "gesture must finish within the 1200ms window");
-  }
-  ShakeDetector packetized;
-  bool packetized_result = false;
-  for (int leg = 0; leg < 7; ++leg) {
-    for (int sample = 0; sample < 100; ++sample) {
-      packetized_result = packetized.Add(leg % 2 ? -8 : 8, 0,
-          100 + leg * 150 + sample);
-      if (leg < 6) Check(!packetized_result, "high polling rate must not count extra reversals");
-    }
-  }
-  Check(packetized_result, "deliberate shake also works across many small raw packets");
-  ShakeDetector first_mouse, second_mouse;
-  for (int i = 0; i < 5; ++i) {
-    Check(!first_mouse.Add(800, 0, i * 100), "first mouse stays monotonic");
-    Check(!second_mouse.Add(-800, 0, i * 100), "second mouse cannot combine a shake");
-  }
   std::cout << "Safety policy checks passed.\n";
 }

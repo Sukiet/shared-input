@@ -40,7 +40,7 @@ Windows 已通过静态检查、54 项 Flutter 测试、5 项原生测试和 Deb
 
 Mac 的 RunnerTests 新增 TIFF 转 PNG 的透明度测试和非法图像测试，已加入测试构建目标；Windows 环境无法执行这些测试或构建 macOS。双机实测应包含两向中文 / Emoji / 多行文字、系统截图、浏览器复制图片、透明 PNG，以及传大图时继续移动鼠标和键入。Mac 端读取授权和目标应用的粘贴兼容性需在实机验证。
 
-原先未解决的晃动退出问题保持独立，见 [问题记录](issues/mouse-shake-exit-unresolved.md)。
+晃动退出已于 2026-11-15 按用户要求关闭，见 [历史问题记录](issues/mouse-shake-exit-unresolved.md)。
 
 ## 原生接口参考
 

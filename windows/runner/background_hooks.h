@@ -2,6 +2,7 @@
 #define SHARED_INPUT_BACKGROUND_HOOKS_H_
 #include <windows.h>
 #include <cstdint>
+#include "control_release.h"
 
 #ifdef SHARED_INPUT_HOOKS_EXPORTS
 #define SHARED_HOOK_API __declspec(dllexport)
@@ -12,8 +13,15 @@
 namespace shared_input {
 extern "C" {
 SHARED_HOOK_API bool SharedHooksInstall(HWND owner, UINT message, int key, bool shift);
-SHARED_HOOK_API bool SharedHooksBegin();
+SHARED_HOOK_API bool SharedHooksBegin(uint32_t generation);
 SHARED_HOOK_API void SharedHooksRelease();
+SHARED_HOOK_API void SharedHooksResetRelease(uint32_t generation);
+SHARED_HOOK_API void SharedHooksReleaseFor(uint32_t generation, ReleaseCause cause);
+SHARED_HOOK_API ReleaseCause SharedHooksReleaseReason(uint32_t generation);
+SHARED_HOOK_API uint64_t SharedHooksMouseSeen();
+SHARED_HOOK_API uint64_t SharedHooksKeyboardSeen();
+SHARED_HOOK_API uint64_t SharedHooksPumpSeen();
+SHARED_HOOK_API bool SharedHooksHealthy(uint64_t now);
 SHARED_HOOK_API bool SharedHooksBlocking();
 SHARED_HOOK_API bool SharedHooksHasHeld();
 SHARED_HOOK_API bool SharedHooksObserved();
@@ -28,8 +36,15 @@ class BackgroundHooks {
  public:
   ~BackgroundHooks() { Close(); }
   bool Install(HWND owner, UINT message, int key, bool shift) { return SharedHooksInstall(owner, message, key, shift); }
-  bool Begin() { return SharedHooksBegin(); }
+  bool Begin(uint32_t generation = 0) { return SharedHooksBegin(generation); }
   void Release() { SharedHooksRelease(); }
+  void ResetRelease(uint32_t generation) { SharedHooksResetRelease(generation); }
+  void ReleaseFor(uint32_t generation, ReleaseCause cause) { SharedHooksReleaseFor(generation, cause); }
+  ReleaseCause ReleaseReason(uint32_t generation) const { return SharedHooksReleaseReason(generation); }
+  uint64_t MouseSeen() const { return SharedHooksMouseSeen(); }
+  uint64_t KeyboardSeen() const { return SharedHooksKeyboardSeen(); }
+  uint64_t PumpSeen() const { return SharedHooksPumpSeen(); }
+  bool Healthy(uint64_t now) const { return SharedHooksHealthy(now); }
   bool Blocking() const { return SharedHooksBlocking(); }
   bool HasHeld() const { return SharedHooksHasHeld(); }
   bool Observed() const { return SharedHooksObserved(); }
