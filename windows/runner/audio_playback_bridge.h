@@ -27,6 +27,7 @@ class AudioPlaybackBridge {
  private:
   struct Job {
     std::string session, key, peer, device;
+    int buffer_ms;
     uint64_t generation;
     std::shared_ptr<Result> result;
   };
@@ -44,5 +45,8 @@ class AudioPlaybackBridge {
   std::optional<Job> pending_;
   std::deque<Completion> completions_;
   std::string session_, status_ = "stopped", message_;
+  int64_t rendered_frames_ = 0, underruns_ = 0, missing_packets_ = 0, overflow_drops_ = 0;
+  double buffered_ms_ = 0, rate_ppm_ = 0;
+  int target_buffer_ms_ = 40;
 };
 #endif

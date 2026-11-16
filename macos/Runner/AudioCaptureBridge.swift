@@ -208,7 +208,10 @@ private final class SystemAudioCapture {
     }
   }
   private func enqueue(_ data: UnsafePointer<AudioBufferList>) {
-    guard ringLock.try() else { return }
+    // The consumer holds this lock only for a bounded preallocated memcpy.
+    // A try-lock here discarded complete capture blocks on normal contention,
+    // compressing the PCM timeline without creating a detectable UDP gap.
+    ringLock.lock()
     defer { ringLock.unlock() }
     guard count < ring.count, sourceBytesPerFrame > 0 else { return }
     let input = UnsafeMutableAudioBufferListPointer(UnsafeMutablePointer(mutating: data))

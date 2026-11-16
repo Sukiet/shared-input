@@ -77,6 +77,7 @@ class AppSettings {
   bool edgeSwitchEnabled = false;
   bool clipboardEnabled = true;
   AudioSyncMode audioSyncMode = AudioSyncMode.off;
+  int audioBufferMs = 40;
   DisplayLayout displayLayout = const DisplayLayout();
 
   Map<String, dynamic> get smoothingOptions => {
@@ -112,6 +113,7 @@ class AppSettings {
     'edgeSwitchEnabled': edgeSwitchEnabled,
     'clipboardEnabled': clipboardEnabled,
     'audioSyncMode': audioSyncMode.name,
+    'audioBufferMs': audioBufferMs,
     'displayLayout': displayLayout.toJson(),
   };
 
@@ -154,6 +156,10 @@ class AppSettings {
       result.clipboardEnabled = json['clipboardEnabled'] as bool;
     }
     result.audioSyncMode = AudioSyncMode.parse(json['audioSyncMode']);
+    final bufferMs = json['audioBufferMs'];
+    if (bufferMs is int && bufferMs >= 10 && bufferMs <= 200) {
+      result.audioBufferMs = bufferMs;
+    }
     result.displayLayout = DisplayLayout.fromJson(json['displayLayout']);
     if (json['smoothingEnabled'] is bool) {
       result.smoothingEnabled = json['smoothingEnabled'] as bool;

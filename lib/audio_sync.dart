@@ -26,6 +26,7 @@ class AudioSync extends ChangeNotifier {
   bool failed = false, sourceActive = false;
   bool _disposed = false, _ticking = false;
   int _epoch = 0;
+  int _bufferMs = 40;
   String? _plan, _player, _source;
   Timer? _lease, _startTimeout;
 
@@ -44,10 +45,16 @@ class AudioSync extends ChangeNotifier {
     _reconcile();
   }
 
-  void configure(AudioSyncMode mode, InputRole role, AudioOutputInfo output) {
+  void configure(
+    AudioSyncMode mode,
+    InputRole role,
+    AudioOutputInfo output, {
+    int bufferMs = 40,
+  }) {
     _mode = mode;
     _role = role;
     _output = output;
+    _bufferMs = bufferMs.clamp(10, 200);
     _reconcile();
   }
 
@@ -92,7 +99,8 @@ class AudioSync extends ChangeNotifier {
       blocked = '等待可用的系统音频输出设备';
     }
     final plan =
-        blocked ?? '${lan.connectionGeneration}:${_output.id}:${_mode.name}';
+        blocked ??
+        '${lan.connectionGeneration}:${_output.id}:${_mode.name}:$_bufferMs';
     if (_plan == plan) return;
     _plan = plan;
     final epoch = ++_epoch;
@@ -113,15 +121,14 @@ class AudioSync extends ChangeNotifier {
     _player = id;
     _status('正在建立音频回传…');
     try {
-      final ready = await channel.invokeMapMethod<String, dynamic>(
-        'audioPlaybackStart',
-        {
-          'session': id,
-          'key': key,
-          'peer': lan.remoteHost,
-          'device': _output.id,
-        },
-      );
+      final ready = await channel
+          .invokeMapMethod<String, dynamic>('audioPlaybackStart', {
+            'session': id,
+            'key': key,
+            'peer': lan.remoteHost,
+            'device': _output.id,
+            'bufferMs': _bufferMs,
+          });
       if (_disposed || epoch != _epoch || _player != id) {
         await _nativeStop('audioPlaybackStop', id);
         return;

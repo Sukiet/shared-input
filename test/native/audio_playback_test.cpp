@@ -83,12 +83,15 @@ int main() {
       Sleep(5);
     }
     Check(Wait(bridge, [&] { return std::get<bool>(bridge.Snapshot().at(Value("receiving"))); }), "valid UDP reaches native playback");
+    Check(Wait(bridge, [&] { return std::get<int64_t>(bridge.Snapshot().at(Value("renderedFrames"))) > 0; }), "WASAPI actually consumes decrypted PCM");
     bridge.Stop(std::string(32, 'b'));
     Check(std::get<std::string>(bridge.Snapshot().at(Value("status"))) == "ready", "stale stop cannot stop active stream");
     Check(Wait(bridge, [&] { return std::get<std::string>(bridge.Snapshot().at(Value("status"))) == "error"; }, 3000), "packet silence expires playback");
     ReplyState restarted;
+    args[Value("bufferMs")] = Value(200);
     bridge.Start(args, std::make_unique<Reply>(restarted));
     Check(Wait(bridge, [&] { return restarted.done; }) && restarted.error.empty(), "worker restarts after stream failure");
+    Check(std::get<int32_t>(bridge.Snapshot().at(Value("targetBufferMs"))) == 200, "requested playout buffer reaches the native worker");
     bridge.Stop(session);
     Check(std::get<std::string>(bridge.Snapshot().at(Value("status"))) == "stopped", "exact session stops");
     closesocket(sender); WSACleanup();

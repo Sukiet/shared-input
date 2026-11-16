@@ -90,6 +90,90 @@ void main() {
   });
 
   test(
+    'audio buffer persists with validated bounds and a compatible default',
+    () {
+      for (final milliseconds in [10, 41, 200]) {
+        expect(
+          AppSettings.fromJson(
+            (AppSettings()..audioBufferMs = milliseconds).toJson(),
+          ).audioBufferMs,
+          milliseconds,
+        );
+      }
+      expect(AppSettings.fromJson({}).audioBufferMs, 40);
+      for (final invalid in [null, 0, -1, 201, '80', 40.5]) {
+        expect(
+          AppSettings.fromJson({'audioBufferMs': invalid}).audioBufferMs,
+          40,
+        );
+      }
+    },
+  );
+
+  test(
+    'buffer changes restart only audio with the selected native playout value',
+    () async {
+      await sync.initialize();
+      sync.configure(AudioSyncMode.on, InputRole.controller, speakers);
+      await Future<void>.delayed(const Duration(milliseconds: 10));
+      final first = lan.sent.single['session'];
+      expect(
+        calls
+            .lastWhere((c) => c.method == 'audioPlaybackStart')
+            .arguments['bufferMs'],
+        40,
+      );
+      sync.configure(
+        AudioSyncMode.on,
+        InputRole.controller,
+        speakers,
+        bufferMs: 73,
+      );
+      await Future<void>.delayed(const Duration(milliseconds: 10));
+      expect(
+        calls
+            .lastWhere((c) => c.method == 'audioPlaybackStart')
+            .arguments['bufferMs'],
+        73,
+      );
+      expect(
+        lan.sent.where(
+          (m) => m['type'] == 'audioStop' && m['session'] == first,
+        ),
+        hasLength(1),
+      );
+      expect(lan.connected, true);
+      final starts = calls
+          .where((c) => c.method == 'audioPlaybackStart')
+          .length;
+      sync.configure(
+        AudioSyncMode.on,
+        InputRole.controller,
+        speakers,
+        bufferMs: 73,
+      );
+      await Future<void>.delayed(const Duration(milliseconds: 10));
+      expect(
+        calls.where((c) => c.method == 'audioPlaybackStart'),
+        hasLength(starts),
+      );
+      sync.configure(
+        AudioSyncMode.on,
+        InputRole.controller,
+        speakers,
+        bufferMs: 1000,
+      );
+      await Future<void>.delayed(const Duration(milliseconds: 10));
+      expect(
+        calls
+            .lastWhere((c) => c.method == 'audioPlaybackStart')
+            .arguments['bufferMs'],
+        200,
+      );
+    },
+  );
+
+  test(
     'headphone auto mode follows default device, mouse return does not stop audio',
     () async {
       await sync.initialize();

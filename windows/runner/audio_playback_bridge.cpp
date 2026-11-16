@@ -3,6 +3,7 @@
 #include "audio_playback_bridge.h"
 #include "audio_packet.h"
 #include <audioclient.h>
+#include <avrt.h>
 #include <mmdeviceapi.h>
 #include <wrl/client.h>
 #include <array>
@@ -26,6 +27,13 @@ std::wstring Wide(const std::string& text) {
   MultiByteToWideChar(CP_UTF8, 0, text.data(), static_cast<int>(text.size()), value.data(), length);
   return value;
 }
+int BufferMs(const Map& data) {
+  const auto it = data.find(Value("bufferMs"));
+  if (it == data.end()) return 40;
+  if (const auto value = std::get_if<int32_t>(&it->second)) return std::clamp(*value, 10, 200);
+  if (const auto value = std::get_if<int64_t>(&it->second)) return static_cast<int>(std::clamp<int64_t>(*value, 10, 200));
+  return 40;
+}
 std::string Error(HRESULT result) {
   char code[24]{};
   std::snprintf(code, sizeof(code), "0x%08lX", static_cast<unsigned long>(result));
@@ -47,6 +55,11 @@ struct EngineStop {
   IAudioClient* client = nullptr;
   ~EngineStop() { if (client) client->Stop(); }
 };
+struct AudioScheduling {
+  DWORD index = 0;
+  HANDLE task = AvSetMmThreadCharacteristicsW(L"Audio", &index);
+  ~AudioScheduling() { if (task) AvRevertMmThreadCharacteristics(task); }
+};
 }  // namespace
 
 AudioPlaybackBridge::AudioPlaybackBridge(HWND owner) : owner_(owner) {
@@ -62,7 +75,7 @@ AudioPlaybackBridge::~AudioPlaybackBridge() {
   if (commands_) CloseHandle(commands_);
 }
 void AudioPlaybackBridge::Start(const Map& args, std::unique_ptr<Result> result) {
-  Job job{Text(args, "session"), Text(args, "key"), Text(args, "peer"), Text(args, "device"), 0,
+  Job job{Text(args, "session"), Text(args, "key"), Text(args, "peer"), Text(args, "device"), BufferMs(args), 0,
       std::shared_ptr<Result>(std::move(result))};
   std::vector<uint8_t> key;
   if (!commands_ || job.session.size() != 32 || job.device.empty() || !shared_input::AudioHex(job.key, key)) {
@@ -74,6 +87,9 @@ void AudioPlaybackBridge::Start(const Map& args, std::unique_ptr<Result> result)
     job.generation = ++generation_;
     old = std::move(pending_);
     session_ = job.session; status_ = "starting"; message_.clear(); last_packet_ = 0;
+    rendered_frames_ = underruns_ = missing_packets_ = overflow_drops_ = 0;
+    buffered_ms_ = rate_ppm_ = 0;
+    target_buffer_ms_ = job.buffer_ms;
     pending_ = std::move(job);
     SetEvent(commands_);
   }
@@ -95,6 +111,10 @@ AudioPlaybackBridge::Map AudioPlaybackBridge::Snapshot() const {
   const auto last = last_packet_.load(), now = GetTickCount64();
   return {{Value("session"), Value(session_)}, {Value("status"), Value(status_)},
       {Value("message"), Value(message_)},
+      {Value("renderedFrames"), Value(rendered_frames_)}, {Value("underruns"), Value(underruns_)},
+      {Value("missingPackets"), Value(missing_packets_)}, {Value("overflowDrops"), Value(overflow_drops_)},
+      {Value("bufferedMs"), Value(buffered_ms_)}, {Value("ratePpm"), Value(rate_ppm_)},
+      {Value("targetBufferMs"), Value(target_buffer_ms_)},
       {Value("receiving"), Value(status_ == "ready" && last != 0 && (now < last || now - last < 1000))}};
 }
 void AudioPlaybackBridge::Reply(std::shared_ptr<Result> result, Map value, std::string error) {
@@ -146,6 +166,8 @@ void AudioPlaybackBridge::Play(const Job& job) {
   };
   Network network;
   network.socket = socket(AF_INET, SOCK_DGRAM, IPPROTO_UDP);
+  const int receive_bytes = 128 * 1024;
+  setsockopt(network.socket, SOL_SOCKET, SO_RCVBUF, reinterpret_cast<const char*>(&receive_bytes), sizeof(receive_bytes));
   network.event = WSACreateEvent();
   sockaddr_in bind_address{}; bind_address.sin_family = AF_INET;
   in_addr peer{};
@@ -187,6 +209,7 @@ void AudioPlaybackBridge::Play(const Job& job) {
   if (SUCCEEDED(result)) result = client->Start();
   if (FAILED(result)) { failure(Error(result)); return; }
   EngineStop stop{client.Get()};
+  AudioScheduling scheduling;
   if (job.generation != generation_ || closing_) { failure("音频启动已取消"); return; }
   {
     std::lock_guard<std::mutex> lock(mutex_);
@@ -194,7 +217,7 @@ void AudioPlaybackBridge::Play(const Job& job) {
   }
   Reply(job.result, {{Value("port"), Value(static_cast<int>(ntohs(bind_address.sin_port)))}});
   replied = true;
-  shared_input::AudioJitterBuffer jitter;
+  shared_input::AudioJitterBuffer jitter(job.buffer_ms);
   std::array<uint8_t, shared_input::kAudioPacketBytes + 1> packet{};
   const auto started = GetTickCount64();
   HANDLE events[] = {commands_, network.event, ready.value};
@@ -217,7 +240,9 @@ void AudioPlaybackBridge::Play(const Job& job) {
         }
       }
     }
-    if (event == WAIT_OBJECT_0 + 2) {
+    // Network bursts must not starve a render event that became ready while
+    // receiving/decrypting packets. WaitForMultipleObjects favors lower IDs.
+    if (event == WAIT_OBJECT_0 + 2 || WaitForSingleObject(ready.value, 0) == WAIT_OBJECT_0) {
       UINT32 padding = 0;
       result = client->GetCurrentPadding(&padding);
       if (FAILED(result)) { failure(Error(result)); break; }
@@ -228,6 +253,15 @@ void AudioPlaybackBridge::Play(const Job& job) {
         jitter.Fill(reinterpret_cast<int16_t*>(bytes), available);
         result = render->ReleaseBuffer(available, 0);
         if (FAILED(result)) { failure(Error(result)); break; }
+        std::lock_guard<std::mutex> lock(mutex_);
+        if (job.generation == generation_) {
+          rendered_frames_ = static_cast<int64_t>(jitter.RenderedFrames());
+          underruns_ = static_cast<int64_t>(jitter.Underruns());
+          missing_packets_ = static_cast<int64_t>(jitter.MissingPackets());
+          overflow_drops_ = static_cast<int64_t>(jitter.OverflowDrops());
+          buffered_ms_ = static_cast<double>(jitter.BufferedFrames()) / 48;
+          rate_ppm_ = jitter.RatePpm();
+        }
       }
     }
     const auto last = last_packet_.load(), now = GetTickCount64();

@@ -56,6 +56,9 @@ class AudioOutputPanel extends StatelessWidget {
     this.onModeChanged,
     this.syncStatus = '不同步',
     this.onRetry,
+    this.bufferMs = 40,
+    this.onBufferChanged,
+    this.onBufferChangeEnd,
   });
   final AudioOutputInfo info;
   final VoidCallback onRefresh;
@@ -63,6 +66,8 @@ class AudioOutputPanel extends StatelessWidget {
   final ValueChanged<AudioSyncMode>? onModeChanged;
   final String syncStatus;
   final VoidCallback? onRetry;
+  final int bufferMs;
+  final ValueChanged<int>? onBufferChanged, onBufferChangeEnd;
 
   @override
   Widget build(BuildContext context) => Column(
@@ -115,6 +120,35 @@ class AudioOutputPanel extends StatelessWidget {
             : (value) {
                 if (value != null) onModeChanged!(value);
               },
+      ),
+      const SizedBox(height: 6),
+      Row(
+        children: [
+          const Expanded(child: Text('播放缓冲', style: TextStyle(fontSize: 12))),
+          Text(
+            '$bufferMs ms',
+            key: const Key('audio-buffer-value'),
+            style: const TextStyle(fontSize: 12),
+          ),
+        ],
+      ),
+      Slider(
+        key: const Key('audio-buffer-slider'),
+        value: bufferMs.clamp(10, 200).toDouble(),
+        min: 10,
+        max: 200,
+        divisions: 190,
+        label: '$bufferMs ms',
+        onChanged: onBufferChanged == null
+            ? null
+            : (value) => onBufferChanged!(value.round()),
+        onChangeEnd: onBufferChangeEnd == null
+            ? null
+            : (value) => onBufferChangeEnd!(value.round()),
+      ),
+      const Text(
+        '越小延迟越低，越大越稳定；松开滑杆后生效。',
+        style: TextStyle(fontSize: 11, color: Color(0xff929aa6)),
       ),
       const SizedBox(height: 6),
       Text(

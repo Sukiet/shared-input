@@ -217,6 +217,15 @@ void main() {
     await tester.tap(find.text('耳机插入时自动同步').last);
     await tester.pumpAndSettle();
     expect(jsonDecode(store.value!)['audioSyncMode'], 'headphones');
+    final bufferSlider = find.byKey(const Key('audio-buffer-slider'));
+    await tester.ensureVisible(bufferSlider);
+    expect(tester.widget<Slider>(bufferSlider).value, 40);
+    expect(tester.widget<Slider>(bufferSlider).divisions, 190);
+    await tester.drag(bufferSlider, const Offset(60, 0));
+    await tester.pumpAndSettle();
+    final selectedBuffer = tester.widget<Slider>(bufferSlider).value.round();
+    expect(selectedBuffer, isNot(40));
+    expect(jsonDecode(store.value!)['audioBufferMs'], selectedBuffer);
     await tester.ensureVisible(find.text('被控端'));
     await tester.tap(find.text('被控端'));
     await tester.pumpAndSettle();
@@ -224,9 +233,11 @@ void main() {
     await tester.tap(find.text('控制端'));
     await tester.pumpAndSettle();
     expect(tester.widget<DropdownButtonFormField<AudioSyncMode>>(selector).initialValue, AudioSyncMode.headphones);
+    expect(tester.widget<Slider>(bufferSlider).value, selectedBuffer);
     await tester.pumpWidget(const SizedBox());
     await open(tester, store: store);
     expect(tester.widget<DropdownButtonFormField<AudioSyncMode>>(selector).initialValue, AudioSyncMode.headphones);
+    expect(tester.widget<Slider>(bufferSlider).value, selectedBuffer);
     expect(tester.takeException(), isNull);
     await tester.pumpWidget(const SizedBox());
   });

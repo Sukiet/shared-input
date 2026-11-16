@@ -200,7 +200,7 @@ class _InputPageState extends State<InputPage> with WidgetsBindingObserver {
         _settings.role = InputRole.receiver;
       }
       if (!mounted) return;
-      _audioSync.configure(_settings.audioSyncMode, _settings.role, _audioOutput.value);
+      _configureAudioSync();
       await _audioSync.initialize();
       if (!mounted) return;
       setState(() {
@@ -249,8 +249,13 @@ class _InputPageState extends State<InputPage> with WidgetsBindingObserver {
     if (!mounted) return;
     final info = AudioOutputInfo.fromMap(data);
     if (info.revision >= _audioOutput.value.revision) _audioOutput.value = info;
-    _audioSync.configure(_settings.audioSyncMode, _settings.role, _audioOutput.value);
+    _configureAudioSync();
   }
+
+  void _configureAudioSync() => _audioSync.configure(
+    _settings.audioSyncMode, _settings.role, _audioOutput.value,
+    bufferMs: _settings.audioBufferMs,
+  );
 
   Future<void> _readAudioOutput() async {
     if (!_captureSupported || _receiving || _readingAudioOutput) return;
@@ -267,7 +272,7 @@ class _InputPageState extends State<InputPage> with WidgetsBindingObserver {
           error: error.code,
           revision: _audioOutput.value.revision,
         );
-        _audioSync.configure(_settings.audioSyncMode, _settings.role, _audioOutput.value);
+        _configureAudioSync();
       }
     } on MissingPluginException {
       if (mounted) {
@@ -276,7 +281,7 @@ class _InputPageState extends State<InputPage> with WidgetsBindingObserver {
           error: '请更新 Windows 程序',
           revision: _audioOutput.value.revision,
         );
-        _audioSync.configure(_settings.audioSyncMode, _settings.role, _audioOutput.value);
+        _configureAudioSync();
       }
     } finally {
       _readingAudioOutput = false;
@@ -725,7 +730,7 @@ class _InputPageState extends State<InputPage> with WidgetsBindingObserver {
     });
     await _saveSettings();
     await _configureEdge();
-    _audioSync.configure(_settings.audioSyncMode, _settings.role, _audioOutput.value);
+    _configureAudioSync();
     if (!_receiving) unawaited(_readAudioOutput());
   });
   Future<void> _connect() => _perform(_changeConnection);
@@ -1623,7 +1628,14 @@ class _InputPageState extends State<InputPage> with WidgetsBindingObserver {
               onModeChanged: (AudioSyncMode value) {
                 setState(() => _settings.audioSyncMode = value);
                 _persist();
-                _audioSync.configure(value, _settings.role, info);
+                _configureAudioSync();
+              },
+              bufferMs: _settings.audioBufferMs,
+              onBufferChanged: (value) => setState(() => _settings.audioBufferMs = value),
+              onBufferChangeEnd: (value) {
+                setState(() => _settings.audioBufferMs = value);
+                _persist();
+                _configureAudioSync();
               },
               syncStatus: _audioSync.status,
               onRetry: _audioSync.failed ? _audioSync.retry : null,
