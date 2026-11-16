@@ -2,6 +2,7 @@ import 'dart:async';
 import 'dart:convert';
 import 'package:flutter_test/flutter_test.dart';
 import 'package:shared_input/settings.dart';
+import 'package:shared_input/local_key.dart';
 
 class SlowStore implements SettingsStore {
   final first = Completer<void>();
@@ -16,6 +17,17 @@ class SlowStore implements SettingsStore {
 }
 
 void main() {
+  test('local key exceptions persist, deduplicate and reject invalid data', () {
+    final settings = AppSettings()..localKeys = [const LocalKeyException(0xaf, '音量增加'), const LocalKeyException(0xae, '音量降低')];
+    final restored = AppSettings.fromJson(settings.toJson());
+    expect(restored.localKeys.map((key) => key.key), [0xaf, 0xae]);
+    expect(restored.localKeys.first.label, '音量增加');
+    expect(AppSettings.fromJson({}).localKeys, isEmpty);
+    final malformed = AppSettings.fromJson({'localKeys': [null, {'key': 0}, {'key': 255}, {'key': 0xe7},
+      {'key': '175'}, {'key': 175, 'label': '音量增加'}, {'key': 175, 'label': '重复'}, {'key': 174}]});
+    expect(malformed.localKeys.map((key) => key.key), [175, 174]);
+    expect(malformed.localKeys.last.code, 'VK 0xAE');
+  });
   test(
     'prediction mode is exclusive, durable, and rejects invalid parameters',
     () {

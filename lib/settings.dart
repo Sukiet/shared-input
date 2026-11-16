@@ -5,6 +5,7 @@ import 'sensitivity.dart';
 import 'scroll_speed.dart';
 import 'display_layout.dart';
 import 'audio_sync_mode.dart';
+import 'local_key.dart';
 
 enum InputRole { controller, receiver }
 
@@ -78,6 +79,7 @@ class AppSettings {
   bool clipboardEnabled = true;
   AudioSyncMode audioSyncMode = AudioSyncMode.off;
   int audioBufferMs = 40;
+  List<LocalKeyException> localKeys = [];
   DisplayLayout displayLayout = const DisplayLayout();
 
   Map<String, dynamic> get smoothingOptions => {
@@ -114,11 +116,20 @@ class AppSettings {
     'clipboardEnabled': clipboardEnabled,
     'audioSyncMode': audioSyncMode.name,
     'audioBufferMs': audioBufferMs,
+    'localKeys': localKeys.map((key) => key.toJson()).toList(),
     'displayLayout': displayLayout.toJson(),
   };
 
   static AppSettings fromJson(Map<String, dynamic> json) {
     final result = AppSettings();
+    final localKeys = json['localKeys'];
+    if (localKeys is List) {
+      final seen = <int>{};
+      for (final item in localKeys.take(254)) {
+        final key = LocalKeyException.fromJson(item);
+        if (key != null && seen.add(key.key)) result.localKeys.add(key);
+      }
+    }
     result.role = json['role'] == 'receiver'
         ? InputRole.receiver
         : InputRole.controller;

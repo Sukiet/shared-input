@@ -65,6 +65,8 @@ class InputBridge {
   std::unique_ptr<AudioOutputMonitor> audio_output_;
   std::unique_ptr<AudioPlaybackBridge> audio_playback_;
   bool initialized_ = false, active_ = false, recording_ = false;
+  bool identifying_local_key_ = false;
+  uint32_t local_key_identify_token_ = 0;
   std::string identifying_;
   uint64_t setup_since_ = 0, started_ = 0;
   HANDLE keyboard_ = nullptr, mouse_ = nullptr;

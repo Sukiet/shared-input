@@ -8,6 +8,8 @@ import 'control_return_log_panel.dart';
 import 'audio_output_panel.dart';
 import 'audio_sync.dart';
 import 'audio_sync_mode.dart';
+import 'local_key.dart';
+import 'local_key_panel.dart';
 import 'private_text_field.dart';
 import 'sensitivity.dart';
 import 'scroll_speed.dart';
@@ -93,6 +95,7 @@ class _InputPageState extends State<InputPage> with WidgetsBindingObserver {
   String? _keyboard, _mouse, _shortcut, _identify, _speedError;
   bool _recording = false, _active = false, _ready = false, _busy = false;
   bool _spaceArmed = false, _windowActive = true;
+  bool _identifyingLocalKey = false;
   int _shortcutGeneration = 0;
   int _edgeGeneration = 0;
   double _speed = Sensitivity.defaultValue, _step = 0.0001;
@@ -235,6 +238,7 @@ class _InputPageState extends State<InputPage> with WidgetsBindingObserver {
             _settings.shortcut!.toJson(),
           );
         }
+        await _configureLocalKeys(_settings.localKeys);
         await _syncDisplayLayout();
         await _configureEdge();
       }
@@ -343,6 +347,16 @@ class _InputPageState extends State<InputPage> with WidgetsBindingObserver {
     if (!mounted) return;
     final data = Map<String, dynamic>.from(call.arguments as Map? ?? {});
     switch (call.method) {
+      case 'localKeyIdentified':
+        if (_identifyingLocalKey) {
+          _identifyingLocalKey = false;
+          Navigator.of(context).pop(LocalKeyException.fromJson(data));
+        }
+      case 'localKeyIdentificationCancelled':
+        if (_identifyingLocalKey) {
+          _identifyingLocalKey = false;
+          Navigator.of(context).pop();
+        }
       case 'audioOutputChanged':
         _setAudioOutput(data);
       case 'audioPlaybackState':
@@ -451,6 +465,55 @@ class _InputPageState extends State<InputPage> with WidgetsBindingObserver {
         _status = '按 Ctrl + Alt + 字母或 F6～F11，Esc 取消。';
       });
     }
+  });
+
+  Future<void> _configureLocalKeys(List<LocalKeyException> keys) => _channel.invokeMethod<void>(
+    'configureLocalKeys', {'keys': keys.map((key) => key.key).toList()},
+  );
+
+  Future<void> _addLocalKey() => _perform(() async {
+    FocusManager.instance.primaryFocus?.unfocus();
+    _identifyingLocalKey = true;
+    final dialog = showDialog<LocalKeyException>(context: context, barrierDismissible: false,
+      builder: (context) => AlertDialog(
+        title: const Text('识别例外按键'),
+        content: const Text('请按一个键，或向一个方向转动音量旋钮。\n10 秒内未识别会自动取消。'),
+        actions: [TextButton(key: const Key('cancel-local-key'),
+          onPressed: () => Navigator.of(context).pop(), child: const Text('取消'))],
+      ),
+    );
+    try {
+      await _channel.invokeMethod<void>('identifyLocalKey');
+      final key = await dialog;
+      _identifyingLocalKey = false;
+      if (!mounted || key == null) return;
+      if (_settings.localKeys.any((item) => item.key == key.key)) {
+        setState(() => _status = '这个按键已在例外列表中。');
+        return;
+      }
+      final keys = [..._settings.localKeys, key];
+      await _configureLocalKeys(keys);
+      if (!mounted) return;
+      setState(() { _settings.localKeys = keys; _status = '${key.label} 已留在 Windows。'; });
+      await _saveSettings();
+    } catch (_) {
+      if (mounted && _identifyingLocalKey) {
+        _identifyingLocalKey = false;
+        Navigator.of(context).pop();
+      }
+      rethrow;
+    } finally {
+      _identifyingLocalKey = false;
+      await _channel.invokeMethod<void>('cancelSetup');
+    }
+  });
+
+  Future<void> _removeLocalKey(LocalKeyException key) => _perform(() async {
+    final keys = _settings.localKeys.where((item) => item.key != key.key).toList();
+    await _configureLocalKeys(keys);
+    if (!mounted) return;
+    setState(() => _settings.localKeys = keys);
+    await _saveSettings();
   });
 
   Future<void> _identifyDevice(String type) => _perform(() async {
@@ -1642,6 +1705,11 @@ class _InputPageState extends State<InputPage> with WidgetsBindingObserver {
             ),
           ),
         ),
+      ],
+      if (_captureSupported) ...[
+        const SizedBox(height: 16),
+        LocalKeyPanel(keys: _settings.localKeys, enabled: _ready && !_active && !_busy && !_recording && _identify == null,
+          onAdd: _addLocalKey, onRemove: _removeLocalKey),
       ],
       const SizedBox(height: 16),
       ControlReturnLogPanel(

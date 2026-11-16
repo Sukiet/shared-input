@@ -2,6 +2,7 @@
 #include "pointer_motion.h"
 #include "keyboard_capture.h"
 #include "capture_ime.h"
+#include "key_routing.h"
 
 #include <cfgmgr32.h>
 #include <setupapi.h>
@@ -22,6 +23,7 @@ constexpr UINT kRestoreFocusMessage = WM_APP + 0x143;
 constexpr UINT kStreamMessage = WM_APP + 0x144;
 constexpr UINT kBackgroundStopMessage = WM_APP + 0x145;
 constexpr UINT kBackgroundKeyMessage = kBackgroundStopMessage + 1;
+constexpr UINT kLocalKeyIdentifiedMessage = kBackgroundStopMessage + 2;
 constexpr UINT_PTR kStatsTimer = 0x5349;
 constexpr wchar_t kCaptureClass[] = L"SharedInputLocalCapture";
 using Value = flutter::EncodableValue;
@@ -282,6 +284,37 @@ void InputBridge::OnMethod(const flutter::MethodCall<Value>& call,
       shortcut_shift_ = BoolArg(*args, "shift");
       result->Success();
     }
+  } else if (method == "configureLocalKeys") {
+    const auto args = call.arguments() ? std::get_if<Map>(call.arguments()) : nullptr;
+    const auto value = args ? Find(*args, "keys") : nullptr;
+    const auto list = value ? std::get_if<flutter::EncodableList>(value) : nullptr;
+    if (active_ || !list || list->size() > 254) {
+      result->Error("invalid_local_keys", "请停止控制后设置按键例外。"); return;
+    }
+    std::vector<int> keys;
+    for (const auto& item : *list) {
+      const auto key = std::get_if<int32_t>(&item);
+      if (!key || !shared_input::ValidLocalKey(static_cast<unsigned>(*key))) {
+        result->Error("invalid_local_keys", "按键例外无效。"); return;
+      }
+      keys.push_back(*key);
+    }
+    if (!background_.SetLocalKeys(keys.data(), static_cast<unsigned>(keys.size()))) {
+      result->Error("invalid_local_keys", "按键例外设置失败。"); return;
+    }
+    result->Success();
+  } else if (method == "identifyLocalKey") {
+    if (active_ || GetForegroundWindow() != owner_) {
+      result->Error("invalid_state", "请在前台窗口的非控制状态下识别按键。"); return;
+    }
+    CancelSetup();
+    if (!background_.Install(owner_, kBackgroundStopMessage, shortcut_key_, shortcut_shift_)) {
+      result->Error("hook_failed", "无法监听按键，请重试。"); return;
+    }
+    identifying_local_key_ = true;
+    setup_since_ = GetTickCount64();
+    background_.IdentifyKey(++local_key_identify_token_);
+    result->Success();
   } else if (method == "configureEdge") {
     const auto args = call.arguments() ? std::get_if<Map>(call.arguments()) : nullptr;
     const bool enabled = args && BoolArg(*args, "enabled");
@@ -381,7 +414,7 @@ void InputBridge::OnMethod(const flutter::MethodCall<Value>& call,
 }
 
 void InputBridge::Start(const Map& args, std::unique_ptr<Result> result) {
-  if (active_ || recording_ || !identifying_.empty() || !shortcut_key_) {
+  if (active_ || recording_ || identifying_local_key_ || !identifying_.empty() || !shortcut_key_) {
     result->Error("not_ready", "必须先选择设备并设置退出快捷键。");
     return;
   }
@@ -751,6 +784,9 @@ void InputBridge::Emit(const std::string& method, Map data) {
 }
 
 void InputBridge::CancelSetup() {
+  background_.IdentifyKey(0);
+  ++local_key_identify_token_;
+  if (identifying_local_key_) { identifying_local_key_ = false; Emit("localKeyIdentificationCancelled"); }
   if (recording_) { recording_ = false; Emit("recordingCancelled"); }
   if (!identifying_.empty()) { identifying_.clear(); Emit("identificationCancelled"); }
 }
@@ -815,7 +851,7 @@ std::optional<LRESULT> InputBridge::HandleMessage(UINT message, WPARAM wparam, L
       break;
     case WM_TIMER:
       if (wparam == kStatsTimer) {
-        if ((recording_ || !identifying_.empty()) && GetTickCount64() - setup_since_ >= 10000) CancelSetup();
+        if ((recording_ || identifying_local_key_ || !identifying_.empty()) && GetTickCount64() - setup_since_ >= 10000) CancelSetup();
         if (active_) {
           if (background_capture_ && !background_.Blocking()) Stop("hook_lost");
           else if (!background_capture_ && (GetForegroundWindow() != owner_ || GetFocus() != capture_)) Stop("focus_lost");
@@ -828,6 +864,31 @@ std::optional<LRESULT> InputBridge::HandleMessage(UINT message, WPARAM wparam, L
       if (active_ && background_capture_ &&
           static_cast<unsigned>(lparam) == generation_.load() && !background_.Blocking()) Stop("shortcut");
       return 0;
+    case kLocalKeyIdentifiedMessage: {
+      if (!identifying_local_key_ || wparam != local_key_identify_token_ || GetForegroundWindow() != owner_) return 0;
+      identifying_local_key_ = false;
+      const int key = static_cast<int>(lparam & 0xff);
+      const int scan = static_cast<int>((lparam >> 8) & 0xff);
+      const bool extended = (lparam & 0x10000) != 0;
+      std::string label;
+      switch (key) {
+        case VK_VOLUME_UP: label = "音量增加"; break;
+        case VK_VOLUME_DOWN: label = "音量降低"; break;
+        case VK_VOLUME_MUTE: label = "静音"; break;
+        case VK_MEDIA_PLAY_PAUSE: label = "播放 / 暂停"; break;
+        case VK_MEDIA_NEXT_TRACK: label = "下一曲"; break;
+        case VK_MEDIA_PREV_TRACK: label = "上一曲"; break;
+        case VK_MEDIA_STOP: label = "停止播放"; break;
+        default: {
+          wchar_t name[128]{};
+          const int name_scan = scan ? scan : static_cast<int>(MapVirtualKeyW(key, MAPVK_VK_TO_VSC_EX) & 0xff);
+          if (GetKeyNameTextW((name_scan << 16) | (extended ? 1 << 24 : 0), name, 128)) label = Utf8(name);
+          if (label.empty()) label = "按键 " + std::to_string(key);
+        }
+      }
+      Emit("localKeyIdentified", {{Value("key"), Value(key)}, {Value("label"), Value(label)}});
+      return 0;
+    }
     case kBackgroundKeyMessage: {
       if (!edge_enabled_) return 0;
       RAWINPUT input{};

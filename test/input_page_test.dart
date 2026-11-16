@@ -20,6 +20,7 @@ void main() {
   final calls = <MethodCall>[];
   var devices = <Map<String, dynamic>>[];
   var rejectStart = false;
+  var rejectLocalKeys = false;
   String? stopDuringStart;
   Completer<Object?>? pendingAudioOutput;
 
@@ -54,10 +55,14 @@ void main() {
       {'id': 'mouse-1', 'name': 'Test mouse', 'type': 'mouse', 'usb': true},
     ];
     rejectStart = false;
+    rejectLocalKeys = false;
     stopDuringStart = null;
     pendingAudioOutput = null;
     messenger.setMockMethodCallHandler(channel, (call) async {
       calls.add(call);
+      if (call.method == 'configureLocalKeys' && rejectLocalKeys) {
+        throw PlatformException(code: 'invalid_local_keys', message: '测试：例外设置失败');
+      }
       if (call.method == 'devices') return devices;
       if (call.method == 'audioOutput') {
         return pendingAudioOutput?.future ?? {
@@ -179,6 +184,67 @@ void main() {
       await tester.pumpWidget(const SizedBox());
     },
   );
+
+  windowsTest('local key exceptions recognize media keys, deduplicate, persist and remove', (tester) async {
+    final store = MemorySettingsStore();
+    await open(tester, store: store);
+    expect(calls.any((call) => call.method == 'configureLocalKeys' && (call.arguments as Map)['keys'].isEmpty), true);
+    Future<void> identify(int key, String label) async {
+      await tester.ensureVisible(find.byKey(const Key('add-local-key')));
+      await tester.tap(find.byKey(const Key('add-local-key')));
+      await tester.pumpAndSettle();
+      expect(find.text('识别例外按键'), findsOneWidget);
+      expect(calls.any((call) => call.method == 'identifyLocalKey'), true);
+      await native('localKeyIdentified', {'key': key, 'label': label});
+      await tester.pumpAndSettle();
+    }
+    await identify(175, '音量增加');
+    expect(find.byKey(const Key('local-key-175')), findsOneWidget);
+    expect(jsonDecode(store.value!)['localKeys'], [{'key': 175, 'label': '音量增加'}]);
+    expect((calls.lastWhere((c) => c.method == 'configureLocalKeys').arguments as Map)['keys'], [175]);
+    await identify(175, '音量增加');
+    expect(find.byKey(const Key('local-key-175')), findsOneWidget);
+    expect(jsonDecode(store.value!)['localKeys'], hasLength(1));
+    await identify(174, '音量降低');
+    await tester.pumpWidget(const SizedBox());
+    await open(tester, store: store);
+    expect(find.byKey(const Key('local-key-175')), findsOneWidget);
+    expect(find.byKey(const Key('local-key-174')), findsOneWidget);
+    expect((calls.lastWhere((c) => c.method == 'configureLocalKeys').arguments as Map)['keys'], [175, 174]);
+    await tester.ensureVisible(find.byKey(const Key('local-key-175')));
+    tester.widget<InputChip>(find.byKey(const Key('local-key-175'))).onDeleted!();
+    await tester.pumpAndSettle();
+    expect(find.byKey(const Key('local-key-175')), findsNothing);
+    expect((calls.lastWhere((c) => c.method == 'configureLocalKeys').arguments as Map)['keys'], [174]);
+    expect(jsonDecode(store.value!)['localKeys'], [{'key': 174, 'label': '音量降低'}]);
+    await tester.pumpWidget(const SizedBox());
+  });
+
+  windowsTest('exception identification cancels cleanly and native failure does not remove preferences', (tester) async {
+    final store = MemorySettingsStore()..value = jsonEncode({'localKeys': [{'key': 175, 'label': '音量增加'}]});
+    await open(tester, store: store);
+    await tester.ensureVisible(find.byKey(const Key('add-local-key')));
+    await tester.tap(find.byKey(const Key('add-local-key')));
+    await tester.pumpAndSettle();
+    await tester.tap(find.byKey(const Key('cancel-local-key')));
+    await tester.pumpAndSettle();
+    expect(find.text('识别例外按键'), findsNothing);
+    await native('localKeyIdentified', {'key': 174, 'label': '过期结果'});
+    await tester.pumpAndSettle();
+    expect(find.byKey(const Key('local-key-174')), findsNothing);
+    await tester.tap(find.byKey(const Key('add-local-key')));
+    await tester.pumpAndSettle();
+    await native('localKeyIdentificationCancelled');
+    await tester.pumpAndSettle();
+    expect(find.text('识别例外按键'), findsNothing);
+    rejectLocalKeys = true;
+    tester.widget<InputChip>(find.byKey(const Key('local-key-175'))).onDeleted!();
+    await tester.pumpAndSettle();
+    expect(find.byKey(const Key('local-key-175')), findsOneWidget);
+    expect(jsonDecode(store.value!)['localKeys'], [{'key': 175, 'label': '音量增加'}]);
+    expect(tester.takeException(), isNull);
+    await tester.pumpWidget(const SizedBox());
+  });
 
   windowsTest('late audio read cannot overwrite a newer device notification', (
     tester,

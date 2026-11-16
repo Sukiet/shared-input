@@ -1,4 +1,5 @@
 #include "background_hooks.h"
+#include "key_routing.h"
 #include <array>
 #include <atomic>
 #include <future>
@@ -69,6 +70,17 @@ class HookRuntime {
     return result.get();
   }
   void ResetRelease(uint32_t generation) { release_.Begin(generation); }
+  bool SetLocalKeys(const int* keys, unsigned count) {
+    if (Blocking() || count > 254 || (count && !keys)) return false;
+    std::array<bool, 256> next{};
+    for (unsigned i = 0; i < count; ++i) {
+      if (!ValidLocalKey(static_cast<unsigned>(keys[i]))) return false;
+      next[keys[i]] = true;
+    }
+    for (size_t i = 0; i < next.size(); ++i) local_keys_[i] = next[i];
+    return true;
+  }
+  void IdentifyKey(uint32_t token) { identify_ = token; }
   void ReleaseFor(uint32_t generation, ReleaseCause cause) {
     // One CAS preserves the first cause, unblocks, and rejects old generations.
     release_.Record(generation, cause);
@@ -105,7 +117,7 @@ class HookRuntime {
     buttons_ = 0;
     mouse_seen_ = keyboard_seen_ = 0;
     pump_seen_ = 0;
-    pressed_.fill(false); remote_.fill(false); remote_buttons_ = 0;
+    pressed_.fill(false); identify_drain_.fill(false); routing_.Reset(); identify_ = 0; remote_buttons_ = 0;
   }
  public:
   static LRESULT CALLBACK Keyboard(int code, WPARAM message, LPARAM data) {
@@ -117,20 +129,34 @@ class HookRuntime {
     const unsigned key = input.vkCode;
     if (key >= 256) return CallNextHookEx(nullptr, code, message, data);
     const bool down = message == WM_KEYDOWN || message == WM_SYSKEYDOWN;
+    const bool was_down = self->pressed_[key];
     if (self->pressed_[key] != down) {
       self->pressed_[key] = down;
       self->held_.fetch_add(down ? 1 : -1);
     }
-    const bool remote = ownership.blocking || self->remote_[key];
-    self->remote_[key] = remote && down;
-    if (ownership.blocking && down && key == static_cast<unsigned>(self->key_.load()) &&
+    const bool shortcut = ownership.blocking && down && key == static_cast<unsigned>(self->key_.load()) &&
         (self->pressed_[VK_LCONTROL] || self->pressed_[VK_RCONTROL]) &&
         (self->pressed_[VK_LMENU] || self->pressed_[VK_RMENU]) &&
         ((self->pressed_[VK_LSHIFT] || self->pressed_[VK_RSHIFT]) == self->shift_) &&
-        !self->pressed_[VK_LWIN] && !self->pressed_[VK_RWIN]) {
+        !self->pressed_[VK_LWIN] && !self->pressed_[VK_RWIN];
+    const bool remote = self->routing_.Remote(key, down, ownership.blocking, !shortcut && self->local_keys_[key]);
+    if (self->identify_.load() != 0 && !ownership.blocking && down && !was_down &&
+        ValidLocalKey(key) && GetForegroundWindow() == self->owner_) {
+      const auto token = self->identify_.exchange(0);
+      if (token) {
+        const LPARAM packed = static_cast<LPARAM>(key | ((input.scanCode & 0xff) << 8) |
+            ((input.flags & LLKHF_EXTENDED) ? 0x10000 : 0));
+        if (PostMessageW(self->owner_, self->stop_message_ + 2, token, packed)) self->identify_drain_[key] = true;
+      }
+    }
+    if (self->identify_drain_[key]) {
+      if (!down) self->identify_drain_[key] = false;
+      return 1;
+    }
+    if (shortcut) {
       self->ReleaseFor(ownership.generation, ReleaseCause::shortcut);
       PostMessageW(self->owner_, self->stop_message_, 1, ownership.generation);
-    } else if (key != VK_PACKET && ownership.blocking) {
+    } else if (key != VK_PACKET && ownership.blocking && remote) {
       // Keyboard capture is exclusively through this hook in background mode.
       // The following private message carries physical scan code, E0, and up/down.
       const LPARAM packed = static_cast<LPARAM>((input.scanCode & 0xff) |
@@ -205,7 +231,10 @@ class HookRuntime {
   std::atomic<bool> shift_{false};
   CaptureReleaseLatch release_;
   std::atomic<uint64_t> mouse_seen_{0}, keyboard_seen_{0}, pump_seen_{0};
-  std::array<bool, 256> pressed_{}, remote_{};
+  std::array<bool, 256> pressed_{}, identify_drain_{};
+  std::array<std::atomic<bool>, 256> local_keys_{};
+  std::atomic<uint32_t> identify_{0};
+  KeyRouting routing_;
   unsigned remote_buttons_ = 0;
   HHOOK keyboard_ = nullptr, mouse_ = nullptr;
   DWORD thread_id_ = 0;
@@ -220,6 +249,8 @@ extern "C" __declspec(dllexport) LRESULT CALLBACK SharedMouseProc(int c, WPARAM 
 }
 bool SharedHooksInstall(HWND owner, UINT message, int key, bool shift) { return runtime.Install(owner, message, key, shift); }
 bool SharedHooksBegin(uint32_t generation) { return runtime.Begin(generation); }
+bool SharedHooksSetLocalKeys(const int* keys, unsigned count) { return runtime.SetLocalKeys(keys, count); }
+void SharedHooksIdentifyKey(uint32_t token) { runtime.IdentifyKey(token); }
 void SharedHooksRelease() { runtime.Release(); }
 void SharedHooksResetRelease(uint32_t generation) { runtime.ResetRelease(generation); }
 void SharedHooksReleaseFor(uint32_t generation, ReleaseCause cause) { runtime.ReleaseFor(generation, cause); }
