@@ -21,26 +21,34 @@ class HookRuntime {
       MSG message{};
       PeekMessageW(&message, nullptr, WM_USER, WM_USER, PM_NOREMOVE);
       thread_id_ = GetCurrentThreadId();
-      HMODULE module = nullptr;
-      GetModuleHandleExW(GET_MODULE_HANDLE_EX_FLAG_FROM_ADDRESS | GET_MODULE_HANDLE_EX_FLAG_UNCHANGED_REFCOUNT,
-          reinterpret_cast<LPCWSTR>(&Keyboard), &module);
-      const auto keyboard = reinterpret_cast<HOOKPROC>(GetProcAddress(module, "SharedKeyboardProc"));
-      const auto mouse = reinterpret_cast<HOOKPROC>(GetProcAddress(module, "SharedMouseProc"));
-      keyboard_ = SetWindowsHookExW(WH_KEYBOARD_LL, keyboard, module, 0);
-      mouse_ = SetWindowsHookExW(WH_MOUSE_LL, mouse, module, 0);
-      const bool installed = keyboard_ && mouse_;
+      const bool hooks_installed = RefreshHooks();
+      const UINT_PTR pump_timer = hooks_installed ? SetTimer(nullptr, 0, 50, nullptr) : 0;
+      const bool installed = hooks_installed && pump_timer;
+      pump_seen_ = GetTickCount64();
       ready.set_value(installed);
       if (installed) {
         while (GetMessageW(&message, nullptr, 0, 0) > 0) {
           if (message.message == kBeginMessage) {
-            const bool allowed = !HasHeld() && Observed();
-            blocked_ = allowed;
+            // Windows may have silently removed a timed-out hook in an old
+            // capture. Start with fresh handles, installing before removing old
+            // ones, and keep the same native input ownership transition.
+            const bool allowed = !HasHeld() && Observed() && RefreshHooks() && !HasHeld();
+            if (allowed) {
+              pump_seen_ = GetTickCount64();
+              release_.Begin(static_cast<uint32_t>(message.wParam), true);
+            }
+            else Release();
             reinterpret_cast<std::promise<bool>*>(message.lParam)->set_value(allowed);
+            continue;
+          }
+          if (message.message == WM_TIMER && message.wParam == pump_timer) {
+            RecordPump();
             continue;
           }
           TranslateMessage(&message); DispatchMessageW(&message);
         }
       }
+      if (pump_timer) KillTimer(nullptr, pump_timer);
       if (keyboard_) UnhookWindowsHookEx(keyboard_);
       if (mouse_) UnhookWindowsHookEx(mouse_);
       keyboard_ = mouse_ = nullptr;
@@ -51,21 +59,42 @@ class HookRuntime {
     return false;
   }
 
-  bool Begin() {
+  bool Begin(uint32_t generation) {
     if (!thread_.joinable()) return false;
     // Serialize the ownership transition with hook callbacks. A key arriving
     // during start must belong to exactly one machine.
     std::promise<bool> ready;
     auto result = ready.get_future();
-    if (!PostThreadMessageW(thread_id_, kBeginMessage, 0, reinterpret_cast<LPARAM>(&ready))) return false;
+    if (!PostThreadMessageW(thread_id_, kBeginMessage, generation, reinterpret_cast<LPARAM>(&ready))) return false;
     return result.get();
   }
-  void Release() { blocked_ = false; }
-  bool Blocking() const { return blocked_.load(); }
+  void ResetRelease(uint32_t generation) { release_.Begin(generation); }
+  void ReleaseFor(uint32_t generation, ReleaseCause cause) {
+    // One CAS preserves the first cause, unblocks, and rejects old generations.
+    release_.Record(generation, cause);
+  }
+  void Release() { ReleaseFor(release_.Generation(), ReleaseCause::manual); }
+  ReleaseCause ReleaseReason(uint32_t generation) const { return release_.Reason(generation); }
+  uint64_t MouseSeen() const { return mouse_seen_.load(); }
+  uint64_t KeyboardSeen() const { return keyboard_seen_.load(); }
+  uint64_t PumpSeen() const { return pump_seen_.load(); }
+  bool Healthy(uint64_t now) const { return HookPumpFresh(now, PumpSeen(), MouseSeen(), KeyboardSeen()); }
+  void RecordPump() {
+    const auto now = GetTickCount64();
+    const auto ownership = release_.CurrentOwnership();
+    // If the pump resumes after an actual stall, retain the failure rather than
+    // making a late heartbeat conceal it before the independent watchdog runs.
+    if (ownership.blocking && !Healthy(now)) {
+      ReleaseFor(ownership.generation, ReleaseCause::hook_thread_timeout);
+      PostMessageW(owner_, stop_message_, 1, ownership.generation);
+    }
+    pump_seen_ = now;
+  }
+  bool Blocking() const { return release_.Blocking(); }
   bool HasHeld() const { return held_.load() != 0 || buttons_.load() != 0; }
   bool Observed() const { return mouse_seen_.load() != 0 || keyboard_seen_.load() != 0; }
-  bool MouseFresh(uint64_t now) const { return now - mouse_seen_.load() < 250; }
-  bool KeyboardFresh(uint64_t now) const { return now - keyboard_seen_.load() < 250; }
+  bool MouseFresh(uint64_t now) const { return HookFresh(now, MouseSeen()); }
+  bool KeyboardFresh(uint64_t now) const { return HookFresh(now, KeyboardSeen()); }
   void Close() {
     Release();
     if (thread_.joinable()) {
@@ -75,6 +104,7 @@ class HookRuntime {
     held_ = 0;
     buttons_ = 0;
     mouse_seen_ = keyboard_seen_ = 0;
+    pump_seen_ = 0;
     pressed_.fill(false); remote_.fill(false); remote_buttons_ = 0;
   }
  public:
@@ -82,6 +112,7 @@ class HookRuntime {
     auto self = current_.load();
     if (code < 0 || !self) return CallNextHookEx(nullptr, code, message, data);
     self->keyboard_seen_ = GetTickCount64();
+    const auto ownership = self->release_.CurrentOwnership();
     const auto& input = *reinterpret_cast<const KBDLLHOOKSTRUCT*>(data);
     const unsigned key = input.vkCode;
     if (key >= 256) return CallNextHookEx(nullptr, code, message, data);
@@ -90,21 +121,23 @@ class HookRuntime {
       self->pressed_[key] = down;
       self->held_.fetch_add(down ? 1 : -1);
     }
-    const bool remote = self->blocked_ || self->remote_[key];
+    const bool remote = ownership.blocking || self->remote_[key];
     self->remote_[key] = remote && down;
-    if (self->blocked_ && down && key == static_cast<unsigned>(self->key_.load()) &&
+    if (ownership.blocking && down && key == static_cast<unsigned>(self->key_.load()) &&
         (self->pressed_[VK_LCONTROL] || self->pressed_[VK_RCONTROL]) &&
         (self->pressed_[VK_LMENU] || self->pressed_[VK_RMENU]) &&
         ((self->pressed_[VK_LSHIFT] || self->pressed_[VK_RSHIFT]) == self->shift_) &&
         !self->pressed_[VK_LWIN] && !self->pressed_[VK_RWIN]) {
-      self->Release();
-      PostMessageW(self->owner_, self->stop_message_, 1, 0);
-    } else if (key != VK_PACKET) {
+      self->ReleaseFor(ownership.generation, ReleaseCause::shortcut);
+      PostMessageW(self->owner_, self->stop_message_, 1, ownership.generation);
+    } else if (key != VK_PACKET && ownership.blocking) {
       // Keyboard capture is exclusively through this hook in background mode.
       // The following private message carries physical scan code, E0, and up/down.
       const LPARAM packed = static_cast<LPARAM>((input.scanCode & 0xff) |
           ((input.flags & LLKHF_EXTENDED) ? 0x100 : 0) | (down ? 0x200 : 0));
-      if (!PostMessageW(self->owner_, self->stop_message_ + 1, key, packed)) self->Release();
+      if (!PostMessageW(self->owner_, self->stop_message_ + 1, key, packed)) {
+        self->ReleaseFor(ownership.generation, ReleaseCause::hook_queue_failed);
+      }
     }
     // Drain releases belonging to the remote session after emergency exit.
     if (remote) return 1;
@@ -114,6 +147,7 @@ class HookRuntime {
     auto self = current_.load();
     if (code < 0 || !self) return CallNextHookEx(nullptr, code, message, data);
     self->mouse_seen_ = GetTickCount64();
+    const auto ownership = self->release_.CurrentOwnership();
     const auto& input = *reinterpret_cast<const MSLLHOOKSTRUCT*>(data);
     int button = -1;
     bool down = false;
@@ -127,7 +161,7 @@ class HookRuntime {
       case WM_XBUTTONDOWN: down = true; [[fallthrough]];
       case WM_XBUTTONUP: button = HIWORD(input.mouseData) == XBUTTON1 ? 3 : 4; break;
     }
-    bool remote = self->blocked_;
+    bool remote = ownership.blocking;
     if (button >= 0) {
       const unsigned mask = 1u << button;
       if (down) self->buttons_.fetch_or(mask);
@@ -140,14 +174,37 @@ class HookRuntime {
     return CallNextHookEx(nullptr, code, message, data);
   }
  private:
+  bool RefreshHooks() {
+    HMODULE module = nullptr;
+    if (!GetModuleHandleExW(GET_MODULE_HANDLE_EX_FLAG_FROM_ADDRESS |
+        GET_MODULE_HANDLE_EX_FLAG_UNCHANGED_REFCOUNT,
+        reinterpret_cast<LPCWSTR>(&Keyboard), &module)) return false;
+    const auto keyboard = reinterpret_cast<HOOKPROC>(GetProcAddress(module, "SharedKeyboardProc"));
+    const auto mouse = reinterpret_cast<HOOKPROC>(GetProcAddress(module, "SharedMouseProc"));
+    if (!keyboard || !mouse) return false;
+    const auto next_keyboard = SetWindowsHookExW(WH_KEYBOARD_LL, keyboard, module, 0);
+    const auto next_mouse = SetWindowsHookExW(WH_MOUSE_LL, mouse, module, 0);
+    if (!next_keyboard || !next_mouse) {
+      if (next_keyboard) UnhookWindowsHookEx(next_keyboard);
+      if (next_mouse) UnhookWindowsHookEx(next_mouse);
+      return false;
+    }
+    const auto old_keyboard = keyboard_;
+    const auto old_mouse = mouse_;
+    keyboard_ = next_keyboard; mouse_ = next_mouse;
+    if (old_keyboard) UnhookWindowsHookEx(old_keyboard);
+    if (old_mouse) UnhookWindowsHookEx(old_mouse);
+    return true;
+  }
   static constexpr UINT kBeginMessage = WM_APP + 0x275;
   inline static std::atomic<HookRuntime*> current_{nullptr};
   HWND owner_ = nullptr;
   UINT stop_message_ = 0;
   std::atomic<int> key_{0}, held_{0};
   std::atomic<unsigned> buttons_{0};
-  std::atomic<bool> shift_{false}, blocked_{false};
-  std::atomic<uint64_t> mouse_seen_{0}, keyboard_seen_{0};
+  std::atomic<bool> shift_{false};
+  CaptureReleaseLatch release_;
+  std::atomic<uint64_t> mouse_seen_{0}, keyboard_seen_{0}, pump_seen_{0};
   std::array<bool, 256> pressed_{}, remote_{};
   unsigned remote_buttons_ = 0;
   HHOOK keyboard_ = nullptr, mouse_ = nullptr;
@@ -162,8 +219,15 @@ extern "C" __declspec(dllexport) LRESULT CALLBACK SharedMouseProc(int c, WPARAM 
   return HookRuntime::Mouse(c, w, l);
 }
 bool SharedHooksInstall(HWND owner, UINT message, int key, bool shift) { return runtime.Install(owner, message, key, shift); }
-bool SharedHooksBegin() { return runtime.Begin(); }
+bool SharedHooksBegin(uint32_t generation) { return runtime.Begin(generation); }
 void SharedHooksRelease() { runtime.Release(); }
+void SharedHooksResetRelease(uint32_t generation) { runtime.ResetRelease(generation); }
+void SharedHooksReleaseFor(uint32_t generation, ReleaseCause cause) { runtime.ReleaseFor(generation, cause); }
+ReleaseCause SharedHooksReleaseReason(uint32_t generation) { return runtime.ReleaseReason(generation); }
+uint64_t SharedHooksMouseSeen() { return runtime.MouseSeen(); }
+uint64_t SharedHooksKeyboardSeen() { return runtime.KeyboardSeen(); }
+uint64_t SharedHooksPumpSeen() { return runtime.PumpSeen(); }
+bool SharedHooksHealthy(uint64_t now) { return runtime.Healthy(now); }
 bool SharedHooksBlocking() { return runtime.Blocking(); }
 bool SharedHooksHasHeld() { return runtime.HasHeld(); }
 bool SharedHooksObserved() { return runtime.Observed(); }

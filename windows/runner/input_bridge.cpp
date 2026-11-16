@@ -410,8 +410,13 @@ void InputBridge::Start(const Map& args, std::unique_ptr<Result> result) {
   started_ = GetTickCount64();
   background_capture_ = background;
   if (background) {
-    if (!background_.Install(owner_, kBackgroundStopMessage, shortcut_key_, shortcut_shift_) ||
-        !background_.Begin()) {
+    if (!background_.Install(owner_, kBackgroundStopMessage, shortcut_key_, shortcut_shift_)) {
+      background_capture_ = false; remote_capture_ = false;
+      result->Error("hook_failed", "后台输入拦截未就绪，请移动鼠标或按键后重试。"); return;
+    }
+    std::lock_guard<std::mutex> lock(cursor_lease_);
+    const auto generation = ++generation_;
+    if (!background_.Begin(generation)) {
       background_capture_ = false; remote_capture_ = false;
       result->Error("hook_failed", "后台输入拦截未就绪，请移动鼠标或按键后重试。"); return;
     }
@@ -419,11 +424,8 @@ void InputBridge::Start(const Map& args, std::unique_ptr<Result> result) {
     return_fraction_ = NumberArg(EdgeState(), "localPosition", 0.5);
     pointer_received_ = started_;
     active_ = true;
-    {
-      std::lock_guard<std::mutex> lock(cursor_lease_);
-      ++generation_; heartbeat_ = started_; watch_started_ = started_; armed_ = true;
-      owned_clip_ = {};
-    }
+    heartbeat_ = started_; watch_started_ = started_; armed_ = true;
+    owned_clip_ = {};
   } else {
     RECT client{};
     GetClientRect(owner_, &client);
@@ -448,6 +450,7 @@ void InputBridge::Start(const Map& args, std::unique_ptr<Result> result) {
     {
       std::lock_guard<std::mutex> lock(cursor_lease_);
       ++generation_;
+      background_.ResetRelease(generation_.load());
       heartbeat_ = started_;
       watch_started_ = started_;
       owned_clip_ = clip;
@@ -480,10 +483,14 @@ void InputBridge::Start(const Map& args, std::unique_ptr<Result> result) {
 void InputBridge::Stop(const std::string& reason, bool notify) {
   const bool was_active = active_;
   const bool was_background = background_capture_;
-  // Release first; neither Dart nor a channel response is needed for cleanup.
+  // Record the first reason and unblock in one native atomic operation, before
+  // any Dart/UI work. Later timer messages cannot overwrite the first cause.
+  auto cause = shared_input::ReleaseCauseFor(reason);
   {
     std::lock_guard<std::mutex> lock(cursor_lease_);
-    ReleaseInputCapture();
+    ReleaseInputCapture(cause);
+    const auto first = background_.ReleaseReason(generation_.load());
+    if (first != shared_input::ReleaseCause::none) cause = first;
   }
   active_ = false;
   background_capture_ = false;
@@ -511,7 +518,22 @@ void InputBridge::Stop(const std::string& reason, bool notify) {
   }
   if (notify) {
     auto stats = Stats();
-    stats[Value("reason")] = Value(reason);
+    stats[Value("reason")] = Value(cause == shared_input::ReleaseCause::other
+        ? reason : std::string(shared_input::ReleaseReasonCode(cause)));
+    const auto mouse_seen = background_.MouseSeen();
+    const auto keyboard_seen = background_.KeyboardSeen();
+    const auto pointer_seen = pointer_received_.load();
+    const auto heartbeat_seen = heartbeat_.load();
+    const auto pump_seen = background_.PumpSeen();
+    const auto now = GetTickCount64();
+    stats[Value("exitDiagnostics")] = Value(Map{
+        {Value("trigger"), Value(shared_input::ReleaseCauseCode(cause))},
+        {Value("generation"), Value(static_cast<int64_t>(generation_.load()))},
+        {Value("mouseAgeMs"), Value(shared_input::ObservedAgeMs(now, mouse_seen))},
+        {Value("keyboardAgeMs"), Value(shared_input::ObservedAgeMs(now, keyboard_seen))},
+        {Value("hookPumpAgeMs"), Value(shared_input::ObservedAgeMs(now, pump_seen))},
+        {Value("pointerAgeMs"), Value(shared_input::ObservedAgeMs(now, pointer_seen))},
+        {Value("heartbeatAgeMs"), Value(shared_input::ObservedAgeMs(now, heartbeat_seen))}});
     Emit("stopped", std::move(stats));
   }
 }
@@ -545,7 +567,7 @@ void InputBridge::ProcessInput(const RAWINPUT& raw, UINT bytes) {
   if (active_ && background_capture_ && !background_.Blocking()) return;
   const auto now = GetTickCount64();
   if (raw.header.dwType == RIM_TYPEKEYBOARD && bytes >= sizeof(RAWINPUTHEADER) + sizeof(RAWKEYBOARD)) {
-    if (background_capture_ && !background_.KeyboardFresh(now)) { Stop("hook_lost"); return; }
+    if (background_capture_ && !background_.Healthy(now)) { Stop("hook_thread_timeout"); return; }
     const auto& keyboard = raw.data.keyboard;
     if (keyboard.VKey == 255 || (!background_capture_ && !raw.header.hDevice)) return;
     const int key = PhysicalKey(keyboard);
@@ -589,7 +611,7 @@ void InputBridge::ProcessInput(const RAWINPUT& raw, UINT bytes) {
         {Value("extended"), Value(scan.extended)},
         {Value("down"), Value(!up)}, {Value("repeat"), Value(repeat)}});
   } else if (raw.header.dwType == RIM_TYPEMOUSE && bytes >= sizeof(RAWINPUTHEADER) + sizeof(RAWMOUSE)) {
-    if (background_capture_ && !background_.MouseFresh(now)) { Stop("hook_lost"); return; }
+    if (background_capture_ && !background_.Healthy(now)) { Stop("hook_thread_timeout"); return; }
     const auto& mouse = raw.data.mouse;
     if (!active_ && edge_enabled_ && !recording_ && identifying_.empty() &&
         !(mouse.usFlags & MOUSE_MOVE_ABSOLUTE) &&
@@ -760,7 +782,8 @@ std::optional<LRESULT> InputBridge::HandleMessage(UINT message, WPARAM wparam, L
       }
       break;
     case kBackgroundStopMessage:
-      if (active_ && background_capture_ && !background_.Blocking()) Stop("shortcut");
+      if (active_ && background_capture_ &&
+          static_cast<unsigned>(lparam) == generation_.load() && !background_.Blocking()) Stop("shortcut");
       return 0;
     case kBackgroundKeyMessage: {
       if (!edge_enabled_) return 0;
@@ -776,7 +799,8 @@ std::optional<LRESULT> InputBridge::HandleMessage(UINT message, WPARAM wparam, L
     }
     case kWatchdogMessage:
       if (static_cast<unsigned>(lparam) == generation_.load()) {
-        Stop(wparam == 1 ? "timeout" : wparam == 3 ? "pointer_timeout" : "heartbeat");
+        Stop(wparam == 1 ? "timeout" : wparam == 3 ? "pointer_timeout" :
+            wparam == 4 ? "hook_thread_timeout" : "heartbeat");
       }
       return 0;
     case kRestoreFocusMessage:
@@ -829,10 +853,17 @@ void InputBridge::Watchdog() {
     std::this_thread::sleep_for(std::chrono::milliseconds(50));
     std::lock_guard<std::mutex> lock(cursor_lease_);
     if (!armed_) continue;
-    const auto now = GetTickCount64();
     const auto heartbeat = heartbeat_.load();
-    if (background_.Blocking() && now - pointer_received_.load() >= 1000) {
-      ReleaseInputCapture();
+    const auto pointer_received = pointer_received_.load();
+    const auto now = GetTickCount64();
+    if (background_.Blocking() && !background_.Healthy(now)) {
+      ReleaseInputCapture(shared_input::ReleaseCause::hook_thread_timeout);
+      PostMessage(owner_, kWatchdogMessage, 4, generation_.load());
+      continue;
+    }
+    if (background_.Blocking() && shared_input::ElapsedAtLeast(
+        now, pointer_received, shared_input::kPointerFeedbackLimitMs)) {
+      ReleaseInputCapture(shared_input::ReleaseCause::pointer_timeout);
       PostMessage(owner_, kWatchdogMessage, 3, generation_.load());
       continue;
     }
@@ -843,14 +874,15 @@ void InputBridge::Watchdog() {
     if (expiry == shared_input::Expiry::none) continue;
     // This thread releases confinement even if Flutter/the platform loop stalls.
     // Session generations prevent a queued old timeout stopping a new session.
-    ReleaseInputCapture();
+    ReleaseInputCapture(expiry == shared_input::Expiry::timeout
+        ? shared_input::ReleaseCause::timeout : shared_input::ReleaseCause::heartbeat);
     PostMessage(owner_, kWatchdogMessage,
         expiry == shared_input::Expiry::timeout ? 1 : 2, generation_.load());
   }
 }
 
-void InputBridge::ReleaseInputCapture() {
-  background_.Release();
+void InputBridge::ReleaseInputCapture(shared_input::ReleaseCause cause) {
+  background_.ReleaseFor(generation_.load(), cause);
   if (armed_.exchange(false)) {
     RECT current{};
     if (GetClipCursor(&current) && EqualRect(&current, &owned_clip_)) ClipCursor(nullptr);

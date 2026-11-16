@@ -1,8 +1,11 @@
-param([switch]$BuildWindows)
+param(
+    [switch]$BuildWindows,
+    [string]$FlutterPath = 'flutter'
+)
 
 $ErrorActionPreference = 'Stop'
 $repoRoot = Split-Path -Parent $PSScriptRoot
-$flutterCommand = (Get-Command flutter -ErrorAction Stop).Source
+$flutterCommand = (Get-Command $FlutterPath -ErrorAction Stop).Source
 $cmakeCommand = Get-Command cmake -ErrorAction SilentlyContinue
 if ($cmakeCommand) {
     $cmakePath = $cmakeCommand.Source

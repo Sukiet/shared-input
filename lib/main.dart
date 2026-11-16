@@ -2,9 +2,9 @@ import 'dart:async';
 import 'dart:io';
 import 'package:flutter/foundation.dart';
 import 'package:flutter/material.dart';
-import 'package:flutter/scheduler.dart';
 import 'package:flutter/services.dart';
-import 'pointer_preview.dart';
+import 'control_return_log.dart';
+import 'control_return_log_panel.dart';
 import 'private_text_field.dart';
 import 'sensitivity.dart';
 import 'scroll_speed.dart';
@@ -16,12 +16,17 @@ import 'remote/lan_session.dart';
 
 void main() {
   WidgetsFlutterBinding.ensureInitialized();
-  runApp(SharedInputApp(store: PreferencesSettingsStore()));
+  runApp(
+    SharedInputApp(
+      store: PreferencesSettingsStore(),
+      returnLogStore: PreferencesReturnLogStore(),
+    ),
+  );
 }
 
 class SharedInputApp extends StatelessWidget {
-  const SharedInputApp({super.key, this.store});
-  final SettingsStore? store;
+  const SharedInputApp({super.key, this.store, this.returnLogStore});
+  final SettingsStore? store, returnLogStore;
   @override
   Widget build(BuildContext context) => MaterialApp(
     title: 'Shared Input',
@@ -41,21 +46,26 @@ class SharedInputApp extends StatelessWidget {
         contentPadding: EdgeInsets.symmetric(horizontal: 12, vertical: 13),
       ),
     ),
-    home: InputPage(store: store),
+    home: InputPage(store: store, returnLogStore: returnLogStore),
   );
 }
 
 class InputPage extends StatefulWidget {
-  const InputPage({super.key, this.store});
-  final SettingsStore? store;
+  const InputPage({super.key, this.store, this.returnLogStore});
+  final SettingsStore? store, returnLogStore;
   @override
   State<InputPage> createState() => _InputPageState();
 }
 
-class _InputPageState extends State<InputPage>
-    with SingleTickerProviderStateMixin, WidgetsBindingObserver {
+class _ControlRun {
+  _ControlRun(this.mode);
+  final ControlMode mode;
+  final elapsed = Stopwatch()..start();
+  String? stopReason, stopDetail;
+}
+
+class _InputPageState extends State<InputPage> with WidgetsBindingObserver {
   static const _channel = MethodChannel('shared_input/dry_run');
-  final _position = ValueNotifier(const Offset(300, 120));
   final _stats = ValueNotifier<Map<String, dynamic>>({});
   final _speedText = TextEditingController(text: '0.1000');
   final _scrollSpeedText = TextEditingController(text: '3.00');
@@ -71,15 +81,14 @@ class _InputPageState extends State<InputPage>
   List<String> _addresses = [];
   bool get _captureSupported => defaultTargetPlatform == TargetPlatform.windows;
   bool get _receiving => _settings.role == InputRole.receiver;
-  late final Ticker _frames;
+  late final ControlReturnHistory _returnHistory;
+  _ControlRun? _controlRun;
   List<Map<String, dynamic>> _devices = [];
   String? _keyboard, _mouse, _shortcut, _identify, _speedError;
   bool _recording = false, _active = false, _ready = false, _busy = false;
-  bool _readingPointer = false;
   bool _spaceArmed = false, _windowActive = true;
   int _shortcutGeneration = 0;
   int _edgeGeneration = 0;
-  int _frameGeneration = 0;
   double _speed = Sensitivity.defaultValue, _step = 0.0001;
   String _status = '';
   Timer? _heartbeat;
@@ -106,6 +115,9 @@ class _InputPageState extends State<InputPage>
     // Override button activation for Space inside this app, before focus routing.
     FocusManager.instance.addEarlyKeyEventHandler(_onSpace);
     _preferences = SettingsRepository(widget.store ?? MemorySettingsStore());
+    _returnHistory = ControlReturnHistory(
+      widget.returnLogStore ?? MemorySettingsStore(),
+    );
     _clipboard = ClipboardSync(_lan, _channel);
     _lan.addListener(_connectionChanged);
     _lan.onBeginWithOptions = (capture, options) => _channel.invokeMethod<void>(
@@ -128,14 +140,19 @@ class _InputPageState extends State<InputPage>
     _lan.onEnd = () => _channel.invokeMethod<void>('receiverStop');
     _lan.onConnectionLost = () {
       ++_edgeGeneration;
-      if (mounted && _active) {
+      if (mounted) {
         unawaited(
-          _channel.invokeMethod<void>('stop').catchError((Object _) {}),
+          _requestControlStop('connection_lost', detail: _lan.status)
+              .catchError((Object _) {}),
         );
       }
     };
-    _lan.onCaptureEnded = _lan.onConnectionLost;
-    _frames = createTicker((_) => _readPointer());
+    _lan.onCaptureEnded = () {
+      ++_edgeGeneration;
+      if (mounted) {
+        unawaited(_requestControlStop('remote_end').catchError((Object _) {}));
+      }
+    };
     _channel.setMethodCallHandler(_onNativeEvent);
     _initialize();
     _heartbeat = Timer.periodic(const Duration(milliseconds: 500), (_) {
@@ -145,36 +162,31 @@ class _InputPageState extends State<InputPage>
     });
   }
 
-  // Pull the latest absolute native position once per display frame. One
-  // outstanding call at most: a slow bridge never accumulates old mouse events.
-  Future<void> _readPointer() async {
-    if (!_active || _readingPointer) return;
-    _readingPointer = true;
-    final generation = _frameGeneration;
-    try {
-      final frame = await _channel.invokeListMethod<dynamic>('pointer');
-      if (mounted &&
-          _active &&
-          generation == _frameGeneration &&
-          frame != null &&
-          frame.length >= 3 &&
-          frame[2] == true) {
-        _position.value = Offset(
-          (frame[0] as num).toDouble(),
-          (frame[1] as num).toDouble(),
-        );
-      }
-    } on PlatformException {
-      // Native watchdog remains responsible for releasing capture on failure.
-    } on MissingPluginException {
-      // An engine restart is handled by initialize, which always disarms capture.
-    } finally {
-      _readingPointer = false;
-    }
+  Future<void> _requestControlStop(String reason, {String? detail}) async {
+    final run = _controlRun;
+    if (run == null) return;
+    run.stopReason ??= reason;
+    run.stopDetail ??= detail;
+    await _channel.invokeMethod<void>('stop');
+  }
+
+  void _saveReturnLog(Future<void> write) {
+    unawaited(
+      write.catchError((Object error) {
+        if (mounted) setState(() => _status = '断联日志保存失败：$error');
+      }),
+    );
   }
 
   Future<void> _initialize() async {
     await _perform(() async {
+      try {
+        await _returnHistory.load();
+      } catch (_) {
+        // Log storage must not disable the input recovery controls.
+        if (mounted) setState(() => _status = '历史日志读取失败，将继续记录本次返回。');
+      }
+      if (!mounted) return;
       _settings = await _preferences.load();
       if (defaultTargetPlatform == TargetPlatform.macOS &&
           !_preferences.restored) {
@@ -315,31 +327,49 @@ class _InputPageState extends State<InputPage>
       case 'devicesChanged':
         await _refresh();
       case 'stats':
-        // Counters/countdown are independent of cursor rendering and settings.
+        // Only the statistics panel listens to these periodic updates.
         _stats.value = data;
       case 'inputFrame':
         _lan.sendInput(data);
       case 'stopped':
+        final run = _controlRun;
+        if (run == null) return; // Duplicate/idle notifications are not returns.
+        _controlRun = null;
+        final nativeReason = data['reason'] as String? ?? 'manual';
+        final reason = nativeReason == 'manual'
+            ? run.stopReason ?? nativeReason
+            : nativeReason;
+        final connected = _lan.connected;
+        final ended = DateTime.now();
+        _saveReturnLog(
+          _returnHistory.add(ControlReturnEntry(
+            time: ended,
+            reason: reason,
+            nativeReason: nativeReason,
+            detail: reason == run.stopReason ? run.stopDetail : null,
+            mode: run.mode,
+            connected: connected,
+            durationMs: run.elapsed.elapsedMilliseconds,
+            exitDiagnostics: ControlReturnEntry.readDiagnostics(data['exitDiagnostics']),
+          )),
+        );
         ++_edgeGeneration;
         unawaited(_lan.endCapture());
-        ++_frameGeneration;
-        _frames.stop();
-        if (data['x'] is num && data['y'] is num) {
-          _position.value = Offset(
-            (data['x'] as num).toDouble(),
-            (data['y'] as num).toDouble(),
-          );
-        }
         _stats.value = data;
         setState(() {
           _active = false;
-          _status = _reason(data['reason'] as String? ?? 'manual');
+          _status = _reason(reason);
         });
     }
   }
 
   String _reason(String value) => switch (value) {
     'edge' => '已切回 Windows。',
+    'connection_lost' => '远程连接中断，已恢复 Windows 输入。',
+    'remote_end' => '被控端结束控制，已恢复 Windows 输入。',
+    'manual_disconnect' => '已断开连接，已恢复 Windows 输入。',
+    'role_changed' => '已结束控制并切换角色。',
+    'input_overflow' => '待发送输入队列溢出，已恢复 Windows 输入。',
     'pointer_timeout' => 'Mac 指针反馈中断，已恢复 Windows 输入。',
     'hook_lost' => '后台输入拦截中断，已恢复 Windows 输入。',
     'shortcut' => '已通过快捷键退出。',
@@ -558,6 +588,14 @@ class _InputPageState extends State<InputPage>
       await _lan.endCapture();
       return;
     }
+    final run = _ControlRun(
+      background
+          ? ControlMode.background
+          : _lan.capturing
+          ? ControlMode.remote
+          : ControlMode.local,
+    );
+    _controlRun = run;
     try {
       await _channel.invokeMethod<void>('start', {
         'keyboard': _keyboard,
@@ -569,18 +607,17 @@ class _InputPageState extends State<InputPage>
         'edgeTriggered': edgeTriggered,
       });
     } catch (_) {
+      if (identical(_controlRun, run)) _controlRun = null;
       await _lan.endCapture();
       rethrow;
     }
-    if (mounted) {
-      _position.value = const Offset(300, 120);
+    // A native emergency exit may arrive before the start reply.
+    if (mounted && identical(_controlRun, run)) {
       _stats.value = {};
-      ++_frameGeneration;
       setState(() {
         _active = true;
         _status = '';
       });
-      _frames.start();
     }
   }
 
@@ -620,7 +657,7 @@ class _InputPageState extends State<InputPage>
 
   Future<void> _switchRole(int index) => _perform(() async {
     ++_edgeGeneration;
-    if (_active) await _channel.invokeMethod<void>('stop');
+    if (_controlRun != null) await _requestControlStop('role_changed');
     await _lan.endCapture();
     await _lan.close();
     if (_ready) await _channel.invokeMethod<void>('cancelSetup');
@@ -650,6 +687,7 @@ class _InputPageState extends State<InputPage>
       await _lan.listen(port: port, key: _settings.listenKey);
     } else {
       if (_lan.connected) {
+        await _requestControlStop('manual_disconnect');
         await _lan.close();
         return;
       }
@@ -670,12 +708,10 @@ class _InputPageState extends State<InputPage>
   void dispose() {
     FocusManager.instance.removeEarlyKeyEventHandler(_onSpace);
     WidgetsBinding.instance.removeObserver(this);
-    ++_frameGeneration;
-    _frames.dispose();
     _heartbeat?.cancel();
     _channel.setMethodCallHandler(null);
-    _position.dispose();
     _stats.dispose();
+    _returnHistory.dispose();
     _speedText.dispose();
     _scrollSpeedText.dispose();
     _hostText.dispose();
@@ -1508,34 +1544,10 @@ class _InputPageState extends State<InputPage>
     children: [
       _connectionPanel(),
       const SizedBox(height: 16),
-      SizedBox(
-        height: 36,
-        child: Row(
-          children: [
-            const Expanded(
-              child: Text(
-                '模拟桌面',
-                style: TextStyle(fontWeight: FontWeight.w600),
-              ),
-            ),
-            ValueListenableBuilder<Map<String, dynamic>>(
-              valueListenable: _stats,
-              builder: (_, stats, _) => Text(
-                _active && !_lan.capturing
-                    ? '控制中 · ${((stats['remainingMs'] as num? ?? 30000) / 1000).ceil()} s'
-                    : _active
-                    ? '控制中'
-                    : '未开始',
-                style: const TextStyle(fontSize: 12, color: Color(0xff929aa6)),
-              ),
-            ),
-          ],
-        ),
-      ),
-      const SizedBox(height: 10),
-      AspectRatio(
-        aspectRatio: 16 / 10,
-        child: PointerPreview(position: _position),
+      ControlReturnLogPanel(
+        history: _returnHistory,
+        active: _active,
+        onClear: () => _saveReturnLog(_returnHistory.clear()),
       ),
       Theme(
         data: Theme.of(context).copyWith(dividerColor: Colors.transparent),

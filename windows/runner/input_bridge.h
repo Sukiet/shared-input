@@ -51,7 +51,7 @@ class InputBridge {
   bool MatchesShortcut(int key) const;
   void Watchdog();
   // Requires cursor_lease_; also restores this process's keyboard registration.
-  void ReleaseInputCapture();
+  void ReleaseInputCapture(shared_input::ReleaseCause cause);
   static void CALLBACK StreamTick(UINT, UINT, DWORD_PTR user, DWORD_PTR, DWORD_PTR);
   void FlushStream();
   void QueueInput(Map event);

@@ -1,5 +1,7 @@
 # Shared Input
 
+当前改动汇总与验证状态见 [Windows 控制端稳定性与断联日志报告（2026-11-16）](docs/reports/2026-11-16-windows-control-stability.md)。
+
 局域网键盘鼠标共享。Windows 控制端通过 Raw Input 采集选中的设备；macOS 被控端通过 Quartz 注入键盘、鼠标、拖拽和滚轮事件。Windows 也提供被控端实现。界面顶部通过“控制端 / 被控端”切换角色。
 
 ## 连接两台电脑
@@ -86,7 +88,7 @@ build/native/mac_pointer_predictor_test
 
 ## 运行
 
-需要 Flutter、Visual Studio 的“使用 C++ 的桌面开发”和 Windows SDK。
+需要 Flutter **3.41.3 或更高版本**、Visual Studio 的“使用 C++ 的桌面开发”和 Windows SDK。Windows 本次验证使用 Flutter 3.41.4 / Dart 3.11.1；3.41.0–3.41.2 存在引擎空闲计时器空转问题，即使不控制 Mac 也可能持续消耗 CPU。详见 [Windows 空闲卡顿排查](docs/issues/windows-idle-drag-lag.md)。升级 SDK 后必须重新构建，旧 exe 不会自动修复。
 
 ```powershell
 flutter pub get
@@ -94,6 +96,24 @@ flutter run -d windows
 ```
 
 也可执行 `flutter build windows --debug`，然后打开 `build\windows\x64\runner\Debug\shared_input.exe`。分发时需要保留该目录内的 DLL 和 data，不能只复制 exe。
+
+使用独立 SDK 运行 Windows 检查和 Debug 构建时，可执行：
+
+```powershell
+.\tool\check.ps1 -BuildWindows -FlutterPath 'E:\Sukiet\repository\shared_human_input\.toolchains\flutter-3.41.4\bin\flutter.bat'
+```
+
+上述路径是本机独立安装位置，其他机器请换成自己的 Flutter SDK 路径。
+
+## 断联日志
+
+控制端原“模拟桌面”区域改为“断联日志”；`lib/pointer_preview.dart` 组件继续保留，但不再挂载到控制端，也不再逐帧轮询预览坐标。
+
+每次实际结束控制并恢复 Windows 输入时记录一条，包含本地时间（毫秒）、退出原因与原始代码、控制模式、持续时间和当时的连接状态。正常边缘切回也记录，且会标明“连接仍保持”；连接真正中断与被控端主动结束会话分别记录。未成功开始控制、空闲通知、重复停止通知不增加日志。
+
+可按边缘切回、快捷键、连接中断、安全保护、窗口 / 设备、主动停止和其他类型筛选。“清除日志”清除所有类型的历史。最近 300 条按新到旧自动保存在本机，重启后恢复；不保存按键内容、连接码、剪贴板或指针轨迹。
+
+“安全保护”包括钩子新鲜度、Mac 指针反馈超时、界面心跳等检查。现已修正跨线程时间相减的无符号下溢，并由原生层原子保存每个会话首次释放的原因，避免后续统计消息抢先归类。钩子保护已改为拦截线程响应检查（250 ms），鼠标或键盘暂时没有回调不再单独触发退出；Mac 反馈 1 秒、界面心跳 3 秒保护保留；新版日志附带触发检查和停止时的链路年龄快照。旧日志保持原样，不能据旧的 hook_lost 推断真实触发原因。详见 [记录范围与验证状态](docs/issues/windows-unexpected-return-logs.md)。
 
 ## 使用流程
 
