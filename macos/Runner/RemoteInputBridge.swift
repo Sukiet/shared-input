@@ -7,6 +7,8 @@ import ApplicationServices
 final class RemoteInputBridge {
   private let channel: FlutterMethodChannel
   private let clipboard = ClipboardBridge()
+  private let cursorVisibility = ReceiverCursorVisibility()
+  private var edgeExit = ReceiverEdgeExit()
   private let lock = NSLock()
   private var timer: DispatchSourceTimer?
   private var motionTimer: DispatchSourceTimer?
@@ -87,15 +89,16 @@ final class RemoteInputBridge {
         point = self.predictionOutput.update(self.constrained(self.predictor.value(at: now)), at: now)
       } else { point = self.interpolator.value(at: now) }
       self.emitMotionLocked(point)
+      self.updateExitCursorLocked(at: now)
     }
     motionTimer.resume()
     self.motionTimer = motionTimer
   }
   deinit { motionTimer?.cancel(); timer?.cancel(); clipboard.reset(); stop() }
   func shutdown() { clipboard.reset(); stop() }
-  func stop() {
+  func stop(hideCursor: Bool = false) {
     lock.lock(); defer { lock.unlock() }
-    releaseLocked()
+    releaseLocked(hideCursor: hideCursor)
   }
 
   private func handle(_ call: FlutterMethodCall, _ result: @escaping FlutterResult) {
@@ -193,6 +196,8 @@ final class RemoteInputBridge {
       lock.lock()
       releaseLocked()
       capture = id; sequence = -1; total = .zero
+      edgeExit = ReceiverEdgeExit(edge: entry == nil ? nil : entrySide,
+                                 started: ProcessInfo.processInfo.systemUptime)
       activity = ProcessInfo.processInfo.beginActivity(options: [.userInitiated, .latencyCritical],
         reason: "Receiving keyboard and mouse input")
       position = CGEvent(source: nil)?.location ?? .zero
@@ -224,7 +229,7 @@ final class RemoteInputBridge {
       lock.unlock()
       if active { result(nil) }
       else { result(FlutterError(code: "receiver_stopped", message: "接收已停止。", details: nil)) }
-    case "receiverStop": stop(); result(nil)
+    case "receiverStop": stop(hideCursor: true); result(nil)
     case "receiverInput":
       let entered = tick()
       lock.lock()
@@ -244,6 +249,7 @@ final class RemoteInputBridge {
         }
       }
       lastReceived = ProcessInfo.processInfo.systemUptime
+      updateExitCursorLocked(at: lastReceived)
       result(nil)
     default: result(FlutterMethodNotImplemented)
     }
@@ -262,6 +268,8 @@ final class RemoteInputBridge {
     let started = tick()
     defer { measure("post", started) }
     event?.flags = flags
+    // Do not mistake our queued motion/button releases for local mouse input.
+    event?.setIntegerValueField(.eventSourceUserData, value: ReceiverCursorVisibility.remoteEventTag)
     event?.post(tap: .cghidEventTap)
   }
   private func constrained(_ point: CGPoint) -> CGPoint {
@@ -288,6 +296,7 @@ final class RemoteInputBridge {
     let dx = value.x - total.x, dy = value.y - total.y
     total = value; sequence = next.int64Value
     let now = ProcessInfo.processInfo.systemUptime
+    edgeExit.motion(dx: dx, dy: dy, at: now)
     let target = interpolator.target
     let confirmed = constrained(CGPoint(x: target.x + dx, y: target.y + dy))
     if predictionEnabled {
@@ -386,7 +395,8 @@ final class RemoteInputBridge {
     }
     return true
   }
-  private func releaseLocked() {
+  private func releaseLocked(hideCursor: Bool = false) {
+    let wasCapturing = capture != nil
     predictor.reset(position); lastPredictionSource = 0
     predictionOutput.reset(position, at: ProcessInfo.processInfo.systemUptime)
     motionTimer?.schedule(deadline: .distantFuture)
@@ -404,8 +414,26 @@ final class RemoteInputBridge {
         mouseButton: CGMouseButton(rawValue: UInt32(button))!))
     }
     heldButtons.removeAll(); capture = nil; sequence = -1; total = .zero
+    edgeExit = ReceiverEdgeExit()
     lastInputTime = nil
     wheelX = 0; wheelY = 0; caps = false
     if let token = activity { ProcessInfo.processInfo.endActivity(token); activity = nil }
+    if hideCursor {
+      if wasCapturing { cursorVisibility.hide() }
+    } else { cursorVisibility.show() }
+  }
+
+  private func updateExitCursorLocked(at now: TimeInterval) {
+    guard capture != nil, edgeExit.edge != nil else { return }
+    let confirmed = predictionEnabled ? predictor.confirmed : interpolator.target
+    let bounds = CGDisplayBounds(CGMainDisplayID())
+    let held = !heldKeys.isEmpty || !heldButtons.isEmpty
+    if edgeExit.shouldHide(rendered: position, confirmed: confirmed, bounds: bounds, held: held, at: now) {
+      // Cosmetic anticipation only: keep feedback and input alive until Windows
+      // actually ends this capture. Never use a predicted-only edge crossing.
+      cursorVisibility.anticipateExit()
+    } else if edgeExit.shouldCancel(confirmed: confirmed, bounds: bounds, held: held) {
+      cursorVisibility.cancelAnticipation()
+    }
   }
 }

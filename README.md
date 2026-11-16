@@ -12,6 +12,10 @@
 
 尚未连接时，Windows 的“开始本地预览”保留原来的模拟功能，最多运行 30 秒；真正的远程控制没有 30 秒上限，使用心跳和断线保护。Mac 控制端采集尚未实现，当前主要方向是 Windows → Mac。
 
+Mac 在边缘切回时，由原生层根据真实位置和向外移动意图提前隐藏指针，不再等待 Windows 的结束通知往返；这里只改变指针显示，控制会话仍由 Windows 结束。预测点单独越界、按住键或按钮、刚进入控制时不会提前隐藏；返回屏幕内部时恢复。其他退出方式收到结束通知后隐藏。本机鼠标或触控板产生移动、点击、拖动、滚动或手势时恢复显示，迟到的结束通知不会再次隐藏；重新进入远程控制、退出程序或原生安全保护停止时也恢复显示。
+
+跨应用及全屏隐藏使用运行时检测的 WindowServer `SetsCursorInBackground` 兼容接口（私有接口，参考 [Input Leap 的 macOS 实现](https://github.com/input-leap/input-leap/blob/master/src/lib/platform/OSXScreen.mm)）。本机不支持该接口时回退到公开 Quartz 接口，后台隐藏效果可能受限，不抢占应用焦点。
+
 ## 传输与持久化
 
 - **鼠标移动：UDP。** 默认发送上限 **500 Hz**，可选 125 / 250 / 500 / 1000 Hz。Windows 原生多媒体定时器合并原始设备报告，通过平台通道直接交给网络层，不受 Flutter 预览帧率限制。每次最多一个待处理的原生发送通知。
@@ -74,6 +78,8 @@ Mac 被控端的“鼠标处理模式”可选择直接跟随、平滑插值或�
 mkdir -p build/native
 xcrun swiftc macos/Runner/PointerInterpolator.swift macos/Runner/PointerPredictor.swift test/native/mac_pointer_predictor_test.swift -o build/native/mac_pointer_predictor_test
 build/native/mac_pointer_predictor_test
+xcrun swiftc macos/Runner/ReceiverCursor.swift test/native/mac_receiver_cursor_test.swift -o build/native/mac_receiver_cursor_test
+build/native/mac_receiver_cursor_test
 ```
 
 ### 鼠标卡顿诊断
