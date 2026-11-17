@@ -12,17 +12,24 @@ class DragGesture {
     if (button > 1) return;
     const unsigned mask = 1u << button;
     if (down) {
-      if (!buttons_) { x_ = x; y_ = y; active_ = false; }
+      if (!buttons_) { x_ = x; y_ = y; source_ = mask; active_ = false; }
       buttons_ |= mask;
-    } else { buttons_ &= ~mask; if (!buttons_) active_ = false; }
+    } else { buttons_ &= ~mask; if (!(buttons_ & source_)) active_ = false; }
   }
   void Move(int x, int y, int threshold_x, int threshold_y) {
-    if (buttons_ && (std::abs(static_cast<int64_t>(x) - x_) >= threshold_x ||
+    if ((buttons_ & source_) && (std::abs(static_cast<int64_t>(x) - x_) >= threshold_x ||
         std::abs(static_cast<int64_t>(y) - y_) >= threshold_y)) active_ = true;
   }
   bool Active() const { return active_; }
+  unsigned SourceButtons() const { return active_ ? source_ : 0; }
+  // A missed hook up may only end an existing gesture; sampled state never
+  // creates a press or a new drag. Called outside low-level hook callbacks.
+  void ReconcileButtons(unsigned physical_buttons) {
+    buttons_ &= physical_buttons;
+    if (!(buttons_ & source_)) active_ = false;
+  }
  private:
-  unsigned buttons_ = 0;
+  unsigned buttons_ = 0, source_ = 0;
   int x_ = 0, y_ = 0;
   bool active_ = false;
 };

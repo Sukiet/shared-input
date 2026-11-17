@@ -39,6 +39,7 @@ class EdgeDragProbe {
   void Clear();
   void Reposition();
   void SetDragging(bool dragging);
+  void Notify() { state_->Changed(); }
   bool Enabled() const { return state_->enabled; }
   const State& Snapshot() const { return *state_; }
  private:

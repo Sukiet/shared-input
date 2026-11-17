@@ -11,6 +11,7 @@ import 'audio_sync_mode.dart';
 import 'local_key.dart';
 import 'local_key_panel.dart';
 import 'edge_drag_preview.dart';
+import 'drag_preview_link.dart';
 import 'private_text_field.dart';
 import 'sensitivity.dart';
 import 'scroll_speed.dart';
@@ -83,6 +84,9 @@ class _InputPageState extends State<InputPage> with WidgetsBindingObserver {
   final _peerKeyText = TextEditingController();
   final _listenKeyText = TextEditingController();
   final _lan = LanSession();
+  late final DragPreviewLink _dragLink;
+  bool get _macReceiver => defaultTargetPlatform == TargetPlatform.macOS;
+  bool get _dragSupported => _captureSupported || _macReceiver;
   late final ClipboardSync _clipboard;
   late final AudioSync _audioSync;
   late final SettingsRepository _preferences;
@@ -100,6 +104,7 @@ class _InputPageState extends State<InputPage> with WidgetsBindingObserver {
   bool _identifyingLocalKey = false;
   int _shortcutGeneration = 0;
   int _edgeGeneration = 0;
+  int _attemptedDragFlow = 0;
   double _speed = Sensitivity.defaultValue, _step = 0.0001;
   String _status = '';
   Timer? _heartbeat;
@@ -111,7 +116,6 @@ class _InputPageState extends State<InputPage> with WidgetsBindingObserver {
       !_receiving &&
       !_active &&
       !_recording &&
-      !_dragPreview.value.enabled &&
       _identify == null &&
       (_settings.edgeSwitchEnabled || (_keyboard != null && _mouse != null)) &&
       _shortcut != null &&
@@ -123,6 +127,23 @@ class _InputPageState extends State<InputPage> with WidgetsBindingObserver {
   @override
   void initState() {
     super.initState();
+    if (_macReceiver) {
+      _dragPreview.value = const EdgeDragPreview(origin: DragOrigin.receiver);
+    }
+    _dragLink = DragPreviewLink(
+      _lan,
+      origin: _macReceiver ? DragOrigin.receiver : DragOrigin.controller,
+      configureReceiver: (enabled, side) async {
+        if (!_macReceiver || !_receiving) return;
+        final data = await _channel.invokeMapMethod<String, dynamic>(
+          'edgeDragProbe',
+          {'enabled': enabled, 'side': side},
+        );
+        if (data != null) _setDragPreview(data);
+      },
+      clearLocal: _clearLocalDragPreview,
+    );
+    _dragLink.addListener(_syncReceiverDragTest);
     WidgetsBinding.instance.addObserver(this);
     // Override button activation for Space inside this app, before focus routing.
     FocusManager.instance.addEarlyKeyEventHandler(_onSpace);
@@ -150,13 +171,16 @@ class _InputPageState extends State<InputPage> with WidgetsBindingObserver {
     _lan.onHeartbeat = () => _channel.invokeMethod<void>('receiverHeartbeat');
     _lan.diagnostics.native = () =>
         _channel.invokeMapMethod<String, dynamic>('receiverDiagnostics');
-    _lan.onEnd = () => _channel.invokeMethod<void>('receiverStop');
+    _lan.onEndWithReason = (reason) =>
+        _channel.invokeMethod<void>('receiverStop', {'reason': reason});
     _lan.onConnectionLost = () {
       ++_edgeGeneration;
       if (mounted) {
         unawaited(
-          _requestControlStop('connection_lost', detail: _lan.status)
-              .catchError((Object _) {}),
+          _requestControlStop(
+            'connection_lost',
+            detail: _lan.status,
+          ).catchError((Object _) {}),
         );
       }
     };
@@ -201,6 +225,7 @@ class _InputPageState extends State<InputPage> with WidgetsBindingObserver {
       }
       if (!mounted) return;
       _settings = await _preferences.load();
+      _dragLink.configureLayout(_settings.displayLayout);
       if (defaultTargetPlatform == TargetPlatform.macOS &&
           !_preferences.restored) {
         _settings.role = InputRole.receiver;
@@ -260,9 +285,22 @@ class _InputPageState extends State<InputPage> with WidgetsBindingObserver {
   }
 
   void _configureAudioSync() => _audioSync.configure(
-    _settings.audioSyncMode, _settings.role, _audioOutput.value,
+    _settings.audioSyncMode,
+    _settings.role,
+    _audioOutput.value,
     bufferMs: _settings.audioBufferMs,
   );
+
+  void _syncReceiverDragTest() {
+    if (!_ready || !_captureSupported) return;
+    unawaited(
+      _channel
+          .invokeMethod<void>('receiverDragTest', {
+            'enabled': _dragLink.receiverReady,
+          })
+          .catchError((Object _) {}),
+    );
+  }
 
   Future<void> _readAudioOutput() async {
     if (!_captureSupported || _receiving || _readingAudioOutput) return;
@@ -342,7 +380,10 @@ class _InputPageState extends State<InputPage> with WidgetsBindingObserver {
     } catch (error) {
       if (mounted) setState(() => _status = '$error');
     } finally {
-      if (mounted) setState(() => _busy = false);
+      if (mounted) {
+        setState(() => _busy = false);
+        _tryDragHandoff();
+      }
     }
   }
 
@@ -352,6 +393,7 @@ class _InputPageState extends State<InputPage> with WidgetsBindingObserver {
     switch (call.method) {
       case 'edgeDragProbeChanged':
         _setDragPreview(data);
+        _tryDragHandoff();
       case 'localKeyIdentified':
         if (_identifyingLocalKey) {
           _identifyingLocalKey = false;
@@ -411,7 +453,9 @@ class _InputPageState extends State<InputPage> with WidgetsBindingObserver {
         _lan.sendInput(data);
       case 'stopped':
         final run = _controlRun;
-        if (run == null) return; // Duplicate/idle notifications are not returns.
+        if (run == null) {
+          return; // Duplicate/idle notifications are not returns.
+        }
         _controlRun = null;
         final nativeReason = data['reason'] as String? ?? 'manual';
         final reason = nativeReason == 'manual'
@@ -420,24 +464,29 @@ class _InputPageState extends State<InputPage> with WidgetsBindingObserver {
         final connected = _lan.connected;
         final ended = DateTime.now();
         _saveReturnLog(
-          _returnHistory.add(ControlReturnEntry(
-            time: ended,
-            reason: reason,
-            nativeReason: nativeReason,
-            detail: reason == run.stopReason ? run.stopDetail : null,
-            mode: run.mode,
-            connected: connected,
-            durationMs: run.elapsed.elapsedMilliseconds,
-            exitDiagnostics: ControlReturnEntry.readDiagnostics(data['exitDiagnostics']),
-          )),
+          _returnHistory.add(
+            ControlReturnEntry(
+              time: ended,
+              reason: reason,
+              nativeReason: nativeReason,
+              detail: reason == run.stopReason ? run.stopDetail : null,
+              mode: run.mode,
+              connected: connected,
+              durationMs: run.elapsed.elapsedMilliseconds,
+              exitDiagnostics: ControlReturnEntry.readDiagnostics(
+                data['exitDiagnostics'],
+              ),
+            ),
+          ),
         );
         ++_edgeGeneration;
-        unawaited(_lan.endCapture());
+        unawaited(_lan.endCapture(reason: reason));
         _stats.value = data;
         setState(() {
           _active = false;
           _status = _reason(reason);
         });
+        _tryDragHandoff();
     }
   }
 
@@ -474,35 +523,54 @@ class _InputPageState extends State<InputPage> with WidgetsBindingObserver {
 
   void _setDragPreview(Map<String, dynamic> data) {
     if (!mounted) return;
-    final value = EdgeDragPreview.fromMap(data);
+    final value = EdgeDragPreview.fromMap({
+      ...data,
+      'origin': _macReceiver ? 'receiver' : 'controller',
+    });
     if (value.revision < _dragPreview.value.revision) return;
     final changed = value.enabled != _dragPreview.value.enabled;
     _dragPreview.value = value;
+    _dragLink.publish(value);
+    if (value.dragFlow == 0) _attemptedDragFlow = 0;
     if (changed) setState(() {});
   }
 
   Future<void> _toggleDragPreview(bool enabled) => _perform(() async {
-    final data = await _channel.invokeMapMethod<String, dynamic>('edgeDragProbe', {'enabled': enabled});
+    final data = await _channel.invokeMapMethod<String, dynamic>(
+      'edgeDragProbe',
+      {'enabled': enabled},
+    );
     if (data != null) _setDragPreview(data);
   });
-  Future<void> _clearDragPreview() => _perform(() async {
-    final data = await _channel.invokeMapMethod<String, dynamic>('edgeDragProbeClear');
+  Future<void> _clearDragPreview() => _perform(_dragLink.clearBoth);
+  Future<void> _clearLocalDragPreview() async {
+    final data = await _channel.invokeMapMethod<String, dynamic>(
+      'edgeDragProbeClear',
+    );
     if (data != null) _setDragPreview(data);
-  });
+  }
 
-  Future<void> _configureLocalKeys(List<LocalKeyException> keys) => _channel.invokeMethod<void>(
-    'configureLocalKeys', {'keys': keys.map((key) => key.key).toList()},
-  );
+  Future<void> _configureLocalKeys(List<LocalKeyException> keys) =>
+      _channel.invokeMethod<void>('configureLocalKeys', {
+        'keys': keys.map((key) => key.key).toList(),
+      });
 
   Future<void> _addLocalKey() => _perform(() async {
     FocusManager.instance.primaryFocus?.unfocus();
     _identifyingLocalKey = true;
-    final dialog = showDialog<LocalKeyException>(context: context, barrierDismissible: false,
+    final dialog = showDialog<LocalKeyException>(
+      context: context,
+      barrierDismissible: false,
       builder: (context) => AlertDialog(
         title: const Text('识别例外按键'),
         content: const Text('请按一个键，或向一个方向转动音量旋钮。\n10 秒内未识别会自动取消。'),
-        actions: [TextButton(key: const Key('cancel-local-key'),
-          onPressed: () => Navigator.of(context).pop(), child: const Text('取消'))],
+        actions: [
+          TextButton(
+            key: const Key('cancel-local-key'),
+            onPressed: () => Navigator.of(context).pop(),
+            child: const Text('取消'),
+          ),
+        ],
       ),
     );
     try {
@@ -517,7 +585,10 @@ class _InputPageState extends State<InputPage> with WidgetsBindingObserver {
       final keys = [..._settings.localKeys, key];
       await _configureLocalKeys(keys);
       if (!mounted) return;
-      setState(() { _settings.localKeys = keys; _status = '${key.label} 已留在 Windows。'; });
+      setState(() {
+        _settings.localKeys = keys;
+        _status = '${key.label} 已留在 Windows。';
+      });
       await _saveSettings();
     } catch (_) {
       if (mounted && _identifyingLocalKey) {
@@ -532,7 +603,9 @@ class _InputPageState extends State<InputPage> with WidgetsBindingObserver {
   });
 
   Future<void> _removeLocalKey(LocalKeyException key) => _perform(() async {
-    final keys = _settings.localKeys.where((item) => item.key != key.key).toList();
+    final keys = _settings.localKeys
+        .where((item) => item.key != key.key)
+        .toList();
     await _configureLocalKeys(keys);
     if (!mounted) return;
     setState(() => _settings.localKeys = keys);
@@ -665,6 +738,7 @@ class _InputPageState extends State<InputPage> with WidgetsBindingObserver {
     await _channel.invokeMethod<void>('configureLayout', layout.nativeOptions);
     if (!mounted) return;
     setState(() => _settings.displayLayout = layout);
+    _dragLink.configureLayout(layout);
     await _saveSettings();
   }
 
@@ -678,6 +752,7 @@ class _InputPageState extends State<InputPage> with WidgetsBindingObserver {
     if (!mounted) return;
     ++_edgeGeneration;
     setState(() => _settings.displayLayout = result);
+    _dragLink.configureLayout(result);
     await _saveSettings();
   });
 
@@ -710,6 +785,87 @@ class _InputPageState extends State<InputPage> with WidgetsBindingObserver {
     });
   }
 
+  bool get _canDragHandoff =>
+      _ready &&
+      _captureSupported &&
+      !_receiving &&
+      !_active &&
+      !_busy &&
+      !_recording &&
+      !_identifyingLocalKey &&
+      _identify == null &&
+      _settings.edgeSwitchEnabled &&
+      _shortcut != null &&
+      _speedError == null &&
+      _scrollSpeedError == null &&
+      _dragPreview.value.enabled &&
+      _dragPreview.value.gestureActive;
+
+  void _tryDragHandoff() {
+    final drag = _dragPreview.value;
+    if (_canDragHandoff &&
+        drag.dragStage == 'edge' &&
+        drag.dragFlow != _attemptedDragFlow) {
+      unawaited(_beginDragHandoff(drag.dragFlow));
+    }
+  }
+
+  Future<void> _beginDragHandoff(int flow) async {
+    if (!_canDragHandoff || flow == 0 || flow == _attemptedDragFlow) return;
+    _attemptedDragFlow = flow;
+    final generation = _edgeGeneration;
+    bool allowed() {
+      final drag = _dragPreview.value;
+      return mounted &&
+          generation == _edgeGeneration &&
+          !_receiving &&
+          !_active &&
+          _ready &&
+          _settings.edgeSwitchEnabled &&
+          _shortcut != null &&
+          drag.enabled &&
+          drag.gestureActive &&
+          drag.dragFlow == flow &&
+          (drag.dragStage == 'edge' || drag.dragStage == 'switching');
+    }
+
+    await _perform(() async {
+      var completed = false;
+      String message = '拖拽已结束或已离开边缘，已取消跨屏。';
+      try {
+        await _channel.invokeMethod<void>('prepareDragHandoff', {'flow': flow});
+        if (!allowed()) return;
+        if (!_lan.connected) await _changeConnection();
+        if (!allowed() || !_lan.connected) return;
+        if (!_lan.supportsEdge) throw StateError('请更新 Mac 被控端以支持边缘切换。');
+        final state =
+            await _channel.invokeMapMethod<String, dynamic>('edgeState') ?? {};
+        if (!allowed() || state['atEdge'] != true) return;
+        await _startCapture(
+          allowed: allowed,
+          background: true,
+          edgeTriggered: true,
+          dragFlow: flow,
+          entryY: (state['entryY'] as num? ?? 0.5).toDouble(),
+          entrySide: state['entrySide'] as String? ?? 'left',
+        );
+        completed = _active;
+      } catch (error) {
+        message = error is PlatformException
+            ? error.message ?? error.code
+            : '$error';
+        rethrow;
+      } finally {
+        if (!completed && mounted) {
+          await _channel.invokeMethod<void>('abortDragHandoff', {
+            'flow': flow,
+            'message': message,
+          });
+        }
+      }
+    });
+  }
+
   Future<void> _start() =>
       _settings.edgeSwitchEnabled ? _beginEdge() : _perform(_startCapture);
 
@@ -719,6 +875,7 @@ class _InputPageState extends State<InputPage> with WidgetsBindingObserver {
     bool edgeTriggered = false,
     double entryY = 0.5,
     String entrySide = 'left',
+    int? dragFlow,
   }) async {
     if (!background) FocusManager.instance.primaryFocus?.unfocus();
     await _saveSettings();
@@ -751,6 +908,7 @@ class _InputPageState extends State<InputPage> with WidgetsBindingObserver {
         'sendHz': _settings.sendHz,
         'background': background,
         'edgeTriggered': edgeTriggered,
+        'dragFlow': ?dragFlow,
       });
     } catch (_) {
       if (identical(_controlRun, run)) _controlRun = null;
@@ -803,8 +961,11 @@ class _InputPageState extends State<InputPage> with WidgetsBindingObserver {
 
   Future<void> _switchRole(int index) => _perform(() async {
     ++_edgeGeneration;
-    if (_captureSupported && _dragPreview.value.enabled) {
-      final data = await _channel.invokeMapMethod<String, dynamic>('edgeDragProbe', {'enabled': false});
+    if (_dragSupported && _dragPreview.value.enabled) {
+      final data = await _channel.invokeMapMethod<String, dynamic>(
+        'edgeDragProbe',
+        {'enabled': false},
+      );
       if (data != null) _setDragPreview(data);
     }
     if (_controlRun != null) await _requestControlStop('role_changed');
@@ -864,11 +1025,16 @@ class _InputPageState extends State<InputPage> with WidgetsBindingObserver {
     _channel.setMethodCallHandler(null);
     _stats.dispose();
     _audioOutput.dispose();
-    if (_captureSupported) {
-      unawaited(_channel.invokeMethod<Object?>('edgeDragProbe', {'enabled': false})
-        .then<void>((_) {}).catchError((Object _) {}));
+    if (_dragSupported) {
+      unawaited(
+        _channel
+            .invokeMethod<Object?>('edgeDragProbe', {'enabled': false})
+            .then<void>((_) {})
+            .catchError((Object _) {}),
+      );
     }
     _dragPreview.dispose();
+    _dragLink.dispose();
     _returnHistory.dispose();
     _speedText.dispose();
     _scrollSpeedText.dispose();
@@ -1671,8 +1837,10 @@ class _InputPageState extends State<InputPage> with WidgetsBindingObserver {
         const SizedBox(height: 12),
         ListenableBuilder(
           listenable: _audioSync,
-          builder: (_, _) => Text(_audioSync.status,
-            style: const TextStyle(fontSize: 12, color: Color(0xff929aa6))),
+          builder: (_, _) => Text(
+            _audioSync.status,
+            style: const TextStyle(fontSize: 12, color: Color(0xff929aa6)),
+          ),
         ),
       ],
       const SizedBox(height: 16),
@@ -1703,7 +1871,39 @@ class _InputPageState extends State<InputPage> with WidgetsBindingObserver {
             child: const Text('辅助功能授权'),
           ),
         ),
+      if (_macReceiver) ...[const SizedBox(height: 18), _dragPanel()],
     ],
+  );
+
+  Widget _dragPanel() => ListenableBuilder(
+    listenable: _dragLink,
+    builder: (_, _) => ValueListenableBuilder<EdgeDragPreview>(
+      valueListenable: _dragPreview,
+      builder: (_, preview, _) {
+        final side = ScreenSide.values.firstWhere(
+          (side) => side.name == preview.side,
+          orElse: () => _macReceiver
+              ? _settings.displayLayout.side.opposite
+              : _settings.displayLayout.side,
+        );
+        return EdgeDragPreviewPanel(
+          preview: preview,
+          peer: _dragLink.peer,
+          syncStatus: _dragLink.status,
+          edgeLabel: '${side.label}边缘',
+          canChange:
+              _ready &&
+              !_active &&
+              !preview.gestureActive &&
+              !_busy &&
+              !_recording &&
+              _identify == null,
+          canToggle: !_macReceiver || !_lan.connected,
+          onChanged: _toggleDragPreview,
+          onClear: _clearDragPreview,
+        );
+      },
+    ),
   );
 
   Widget _monitor() => Column(
@@ -1726,7 +1926,8 @@ class _InputPageState extends State<InputPage> with WidgetsBindingObserver {
                 _configureAudioSync();
               },
               bufferMs: _settings.audioBufferMs,
-              onBufferChanged: (value) => setState(() => _settings.audioBufferMs = value),
+              onBufferChanged: (value) =>
+                  setState(() => _settings.audioBufferMs = value),
               onBufferChangeEnd: (value) {
                 setState(() => _settings.audioBufferMs = value);
                 _persist();
@@ -1740,19 +1941,15 @@ class _InputPageState extends State<InputPage> with WidgetsBindingObserver {
       ],
       if (_captureSupported) ...[
         const SizedBox(height: 16),
-        LocalKeyPanel(keys: _settings.localKeys, enabled: _ready && !_active && !_busy && !_recording && _identify == null,
-          onAdd: _addLocalKey, onRemove: _removeLocalKey),
-      ],
-      if (_captureSupported) ...[
-        const SizedBox(height: 16),
-        ValueListenableBuilder<EdgeDragPreview>(valueListenable: _dragPreview,
-          builder: (_, preview, _) => EdgeDragPreviewPanel(
-            preview: preview, edgeLabel: '${_settings.displayLayout.side.label}边缘',
-            canChange: _ready && !_active && !_busy && !_recording && _identify == null,
-            onChanged: _toggleDragPreview, onClear: _clearDragPreview,
-          ),
+        LocalKeyPanel(
+          keys: _settings.localKeys,
+          enabled:
+              _ready && !_active && !_busy && !_recording && _identify == null,
+          onAdd: _addLocalKey,
+          onRemove: _removeLocalKey,
         ),
       ],
+      if (_captureSupported) ...[const SizedBox(height: 16), _dragPanel()],
       const SizedBox(height: 16),
       ControlReturnLogPanel(
         history: _returnHistory,

@@ -212,7 +212,7 @@ void main() {
     await tester.pumpAndSettle();
     expect(tester.widget<SwitchListTile>(toggle).value, true);
     expect(find.text('区域关闭（鼠标穿透）'), findsOneWidget);
-    expect(start(tester).onPressed, isNull);
+    expect(start(tester).onPressed, isNotNull);
     final data = <String, dynamic>{'enabled': true, 'hitEnabled': true, 'revision': 2, 'phase': 'enter', 'count': 2,
       'files': [{'name': '图像.png', 'path': r'C:\照片\图像.png'}, {'name': '工作文件夹', 'path': r'D:\工作文件夹'}],
       'formats': ['CF_HDROP']};
@@ -243,6 +243,39 @@ void main() {
     await tester.pumpWidget(const SizedBox());
   });
 
+  testWidgets('Mac receiver displays its own drag source independently of controller events', (tester) async {
+    await open(tester);
+    expect(find.text('被控机拖拽事件'), findsOneWidget);
+    expect(find.text('主控机拖拽事件'), findsOneWidget);
+    final toggle = find.byKey(const Key('edge-drag-preview-toggle'));
+    await tester.ensureVisible(toggle);
+    await tester.tap(find.descendant(of: toggle, matching: find.byType(Switch)));
+    await tester.pumpAndSettle();
+    await native('edgeDragProbeChanged', {
+      'enabled': true, 'revision': ++dragProbeRevision, 'hitEnabled': true,
+      'origin': 'receiver', 'side': 'top', 'phase': 'enter', 'count': 1,
+      'dragStage': 'edge', 'gestureActive': true, 'dragFlow': 3,
+      'dragHistory': ['gesture', 'edge'],
+      'files': [{'name': 'Mac文件夹', 'path': '/Users/test/Mac文件夹'}],
+    });
+    await tester.pumpAndSettle();
+    final panel = tester.widget<EdgeDragPreviewPanel>(find.byType(EdgeDragPreviewPanel));
+    expect(panel.preview.origin, DragOrigin.receiver);
+    expect(panel.edgeLabel, '上方边缘');
+    expect(panel.peer!.origin, DragOrigin.controller);
+    expect(find.text('/Users/test/Mac文件夹'), findsOneWidget);
+    expect(find.text('屏幕边缘已接收 · Mac'), findsOneWidget);
+    expect(calls.where((c) => c.method == 'start'), isEmpty);
+    await native('edgeDragProbeChanged', {
+      'enabled': true, 'revision': ++dragProbeRevision, 'side': 'top',
+      'dragStage': 'crossed', 'onRemote': true, 'gestureActive': false,
+      'dragHistory': ['gesture', 'edge', 'crossed'],
+    });
+    await tester.pumpAndSettle();
+    expect(find.text('已跨机器 · Windows'), findsOneWidget);
+    await tester.pumpWidget(const SizedBox());
+  }, variant: TargetPlatformVariant.only(TargetPlatform.macOS));
+
   windowsTest('drag preview registration errors stay disabled and role switch closes the local receiver', (tester) async {
     final store = MemorySettingsStore();
     await open(tester, store: store);
@@ -266,6 +299,141 @@ void main() {
     expect(tester.takeException(), isNull);
     await tester.pumpWidget(const SizedBox());
   });
+
+  for (final outcome in ['cross', 'release', 'reject', 'return-held', 'unrecognized-held']) {
+    windowsTest('Windows drag handoff: $outcome', (tester) async {
+      const key = '0123456789abcdef0123456789abcdef';
+      final receiver = LanSession();
+      final beginGate = (await tester.runAsync(() async => Completer<void>()))!;
+      var begins = 0, ends = 0;
+      receiver.onBegin = (_) async {
+        ++begins;
+        if (outcome == 'release') await beginGate.future;
+      };
+      receiver.onEnd = () async { ++ends; };
+      receiver.onPointerInfo = () async => {
+        'x': 24, 'y': 270, 'left': 0, 'top': 0,
+        'width': 1920, 'height': 1080, 'sequence': 0,
+      };
+      addTearDown(() async {
+        if (!beginGate.isCompleted) beginGate.complete();
+        await receiver.close(); receiver.dispose();
+      });
+      await tester.runAsync(() => receiver.listen(port: 0, key: key, bindAddress: '127.0.0.1'));
+      final saved = AppSettings()..edgeSwitchEnabled = true
+        ..shortcut = const ExitShortcut(0x77)
+        ..host = '127.0.0.1'..port = receiver.port..peerKey = key;
+      await open(tester, store: MemorySettingsStore()..value = jsonEncode(saved.toJson()));
+      final toggle = find.byKey(const Key('edge-drag-preview-toggle'));
+      await tester.ensureVisible(toggle);
+      await tester.tap(find.descendant(of: toggle, matching: find.byType(Switch)));
+      await tester.pumpAndSettle();
+      final data = <String, dynamic>{
+        'enabled': true, 'hitEnabled': true, 'dragFlow': 9, 'gestureActive': true,
+        'phase': 'enter', 'count': 1,
+        'files': [{'name': '测试文件.txt', 'path': r'C:\测试文件.txt'}],
+        if (outcome == 'unrecognized-held') ...{
+          'phase': 'unsupported', 'count': 0, 'files': [], 'hovering': false,
+        },
+      };
+      await native('edgeDragProbeChanged', {...data, 'revision': ++dragProbeRevision,
+        'dragStage': 'gesture', 'dragHistory': ['gesture']});
+      await tester.pumpAndSettle();
+      expect(find.text('进入拖拽手势 · Windows'), findsOneWidget);
+      expect(calls.where((c) => c.method == 'prepareDragHandoff'), isEmpty);
+      Future<void> waitUntil(bool Function() predicate, String description) async {
+        final deadline = DateTime.now().add(const Duration(seconds: 5));
+        while (!predicate()) {
+          if (DateTime.now().isAfter(deadline)) fail(description);
+          await Future<void>.delayed(const Duration(milliseconds: 5));
+        }
+      }
+      rejectStart = outcome == 'reject';
+      await tester.runAsync(() async {
+        await native('edgeDragProbeChanged', {...data, 'revision': ++dragProbeRevision,
+          'hovering': outcome != 'unrecognized-held', 'dragStage': 'edge', 'dragHistory': ['gesture', 'edge']});
+        await waitUntil(() => begins == 1, 'Drag did not begin peer capture');
+        if (outcome == 'release') {
+          await native('edgeDragProbeChanged', {...data, 'revision': ++dragProbeRevision,
+            'hovering': true, 'gestureActive': false, 'dragStage': 'ended',
+            'dragHistory': ['gesture', 'edge', 'switching', 'ended']});
+          beginGate.complete();
+        }
+        if (outcome != 'release' && outcome != 'reject') {
+          await waitUntil(() => calls.any((c) => c.method == 'start'), 'Drag did not start native control');
+        } else {
+          await waitUntil(() => calls.any((c) => c.method == 'abortDragHandoff') && ends == 1,
+            'Cancelled handoff did not release peer capture: begins=$begins ends=$ends calls=${calls.map((c) => c.method).join(",")}');
+        }
+        await Future<void>.delayed(const Duration(milliseconds: 10));
+      });
+      await tester.pumpAndSettle();
+      expect((calls.singleWhere((c) => c.method == 'prepareDragHandoff').arguments as Map)['flow'], 9);
+      if (outcome == 'release') {
+        expect(calls.where((c) => c.method == 'start'), isEmpty);
+        expect(find.text('退出拖拽手势 · Windows'), findsOneWidget);
+      } else {
+        final args = calls.singleWhere((c) => c.method == 'start').arguments as Map;
+        expect(args['dragFlow'], 9);
+        expect(args['background'], true);
+        expect(args['edgeTriggered'], true);
+        expect(args['remote'], true);
+      }
+      if (outcome != 'release' && outcome != 'reject') {
+        await native('edgeDragProbeChanged', {...data, 'revision': ++dragProbeRevision,
+          'hovering': outcome != 'unrecognized-held', 'dragStage': 'crossed', 'onRemote': true,
+          'dragHistory': ['gesture', 'edge', 'switching', 'crossed']});
+        await tester.pumpAndSettle();
+        expect(find.text('已跨机器 · Mac'), findsOneWidget);
+        if (outcome == 'cross') {
+          await native('edgeDragProbeChanged', {...data, 'revision': ++dragProbeRevision,
+            'gestureActive': false, 'dragStage': 'ended', 'onRemote': true,
+            'dragHistory': ['gesture', 'edge', 'switching', 'crossed', 'ended']});
+          await tester.pumpAndSettle();
+          expect(find.text('退出拖拽手势 · Mac'), findsOneWidget);
+        }
+        expect(calls.where((c) => c.method == 'stop'), isEmpty);
+        await tester.runAsync(() async {
+          await native('stopped', {'reason': 'edge'});
+          await waitUntil(() => ends == 1, 'Edge return did not release peer');
+        });
+        await native('edgeDragProbeChanged', {...data, 'revision': ++dragProbeRevision,
+          'gestureActive': false, 'dragStage': 'returned',
+          'dragHistory': ['gesture', 'edge', 'switching', 'crossed', 'ended', 'returned']});
+        await tester.pumpAndSettle();
+        expect(find.text('回到原来的机器 · Windows'), findsOneWidget);
+        expect(history(tester).entries.single.reason, 'edge');
+        expect(start(tester).onPressed, isNotNull);
+        expect(tester.widget<SwitchListTile>(toggle).onChanged, isNotNull);
+        // Ordinary pointer crossing must continue while the drag test is on.
+        await tester.runAsync(() async {
+          await native('edgeEnter');
+          await waitUntil(() => calls.where((c) => c.method == 'start').length == 2,
+            'Ordinary edge crossing remained blocked after drag return');
+          await Future<void>.delayed(const Duration(milliseconds: 10));
+          await native('stopped', {'reason': 'edge'});
+          await waitUntil(() => ends == 2, 'Second return did not release peer');
+        });
+        await tester.pumpAndSettle();
+        expect((calls.lastWhere((c) => c.method == 'start').arguments as Map).containsKey('dragFlow'), false);
+        // A new source gesture must also be able to cross again.
+        await tester.runAsync(() async {
+          await native('edgeDragProbeChanged', {...data, 'revision': ++dragProbeRevision,
+            'dragFlow': 10, 'dragStage': 'edge', 'hovering': true,
+            'dragHistory': ['gesture', 'edge']});
+          await waitUntil(() => calls.where((c) => c.method == 'start').length == 3,
+            'New drag remained blocked after return');
+          await Future<void>.delayed(const Duration(milliseconds: 10));
+          await native('stopped', {'reason': 'shortcut'});
+          await waitUntil(() => ends == 3, 'Third return did not release peer');
+        });
+        await tester.pumpAndSettle();
+        expect((calls.lastWhere((c) => c.method == 'start').arguments as Map)['dragFlow'], 10);
+      }
+      expect(tester.takeException(), isNull);
+      await tester.pumpWidget(const SizedBox());
+    });
+  }
 
   windowsTest('local key exceptions recognize media keys, deduplicate, persist and remove', (tester) async {
     final store = MemorySettingsStore();
@@ -811,6 +979,11 @@ void main() {
         ..peerKey = key;
       final store = MemorySettingsStore()..value = jsonEncode(saved.toJson());
       await open(tester, store: store);
+      final dragToggle = find.byKey(const Key('edge-drag-preview-toggle'));
+      await tester.ensureVisible(dragToggle);
+      await tester.tap(find.descendant(of: dragToggle, matching: find.byType(Switch)));
+      await tester.pumpAndSettle();
+      expect(tester.widget<SwitchListTile>(dragToggle).value, true);
       expect(start(tester).onPressed, isNotNull);
       expect(
         calls.any(

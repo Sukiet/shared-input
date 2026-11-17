@@ -21,6 +21,8 @@
 /* End PBXAggregateTarget section */
 
 /* Begin PBXBuildFile section */
+		AB001001000000000000000B /* EdgeDragProbe.swift in Sources */ = {isa = PBXBuildFile; fileRef = AB0010020000000000000009 /* EdgeDragProbe.swift */; };
+		AB001001000000000000000C /* EdgeDragProbe.swift in Test Sources */ = {isa = PBXBuildFile; fileRef = AB0010020000000000000009 /* EdgeDragProbe.swift */; };
 		AB001001000000000000000A /* AudioPacket.swift in Sources */ = {isa = PBXBuildFile; fileRef = AB0010020000000000000008 /* AudioPacket.swift */; };
 		AB0010010000000000000009 /* AudioCaptureBridge.swift in Sources */ = {isa = PBXBuildFile; fileRef = AB0010020000000000000007 /* AudioCaptureBridge.swift */; };
 		AB0010010000000000000008 /* ReceiverCursor.swift in Sources */ = {isa = PBXBuildFile; fileRef = AB0010020000000000000006 /* ReceiverCursor.swift */; };
@@ -71,6 +73,7 @@
 /* End PBXCopyFilesBuildPhase section */
 
 /* Begin PBXFileReference section */
+		AB0010020000000000000009 /* EdgeDragProbe.swift */ = {isa = PBXFileReference; lastKnownFileType = sourcecode.swift; path = EdgeDragProbe.swift; sourceTree = "<group>"; };
 		AB0010020000000000000008 /* AudioPacket.swift */ = {isa = PBXFileReference; lastKnownFileType = sourcecode.swift; path = AudioPacket.swift; sourceTree = "<group>"; };
 		AB0010020000000000000007 /* AudioCaptureBridge.swift */ = {isa = PBXFileReference; lastKnownFileType = sourcecode.swift; path = AudioCaptureBridge.swift; sourceTree = "<group>"; };
 		AB0010020000000000000006 /* ReceiverCursor.swift */ = {isa = PBXFileReference; lastKnownFileType = sourcecode.swift; path = ReceiverCursor.swift; sourceTree = "<group>"; };
@@ -187,6 +190,7 @@
 				33CC10F02044A3C60003C045 /* AppDelegate.swift */,
 				33CC11122044BFA00003C045 /* MainFlutterWindow.swift */,
 				AB0010020000000000000001 /* RemoteInputBridge.swift */,
+				AB0010020000000000000009 /* EdgeDragProbe.swift */,
 				AB0010020000000000000007 /* AudioCaptureBridge.swift */,
 				AB0010020000000000000008 /* AudioPacket.swift */,
 				AB0010020000000000000006 /* ReceiverCursor.swift */,
@@ -373,6 +377,7 @@
 			buildActionMask = 2147483647;
 			files = (
 				331C80D8294CF71000263BE5 /* RunnerTests.swift in Sources */,
+				AB001001000000000000000C /* EdgeDragProbe.swift in Test Sources */,
 				AB0010010000000000000006 /* ClipboardBridge.swift in Test Sources */,
 				AB0010010000000000000003 /* MacKeyMap.swift in Test Sources */,
 			);
@@ -384,6 +389,7 @@
 			files = (
 				33CC11132044BFA00003C045 /* MainFlutterWindow.swift in Sources */,
 				AB0010010000000000000001 /* RemoteInputBridge.swift in Sources */,
+				AB001001000000000000000B /* EdgeDragProbe.swift in Sources */,
 				AB0010010000000000000009 /* AudioCaptureBridge.swift in Sources */,
 				AB001001000000000000000A /* AudioPacket.swift in Sources */,
 				AB0010010000000000000008 /* ReceiverCursor.swift in Sources */,

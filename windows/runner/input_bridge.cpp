@@ -126,8 +126,9 @@ RECT PrimaryBounds() {
   GetMonitorInfoW(MonitorFromPoint(POINT{0, 0}, MONITOR_DEFAULTTOPRIMARY), &info);
   return info.rcMonitor;
 }
-bool AnyHeld() {
+bool AnyHeld(unsigned local_buttons = 0) {
   for (int key = VK_LBUTTON; key < 255; ++key) {
+    if ((key == VK_LBUTTON && (local_buttons & 1)) || (key == VK_RBUTTON && (local_buttons & 2))) continue;
     if (GetAsyncKeyState(key) & 0x8000) return true;
   }
   return false;
@@ -256,11 +257,14 @@ void InputBridge::OnMethod(const flutter::MethodCall<Value>& call,
     clipboard_->Handle(call, std::move(result)); return;
   }
   if (method == "initialize") {
+    // Release the current owner before clearing its source-drag information.
+    Stop("manual", false);
+    drag_handoff_.Reset();
+    receiver_drag_test_ = false;
     background_.ObserveDrag(0);
     if (drag_probe_) { drag_probe_->Configure(false, display_layout_.side); drag_probe_->Clear(); }
     clipboard_->Reset();
     // Hot restart / a new Dart view always starts disarmed.
-    Stop("manual", false);
     receiver_.Stop();
     CancelSetup();
     shortcut_key_ = 0;
@@ -284,8 +288,9 @@ void InputBridge::OnMethod(const flutter::MethodCall<Value>& call,
     }
     if (!drag_probe_ && enabled) drag_probe_ = std::make_unique<EdgeDragProbe>(owner_);
     if (drag_probe_) {
-      if (method == "edgeDragProbeClear") drag_probe_->Clear();
+      if (method == "edgeDragProbeClear") { drag_handoff_.Reset(); drag_probe_->Clear(); }
       else {
+        drag_handoff_.Reset();
         const auto status = drag_probe_->Configure(enabled, display_layout_.side);
         if (FAILED(status)) {
           result->Error("drag_probe_failed", "无法注册边缘拖放接收窗口（" + std::to_string(status) + "）"); return;
@@ -295,6 +300,27 @@ void InputBridge::OnMethod(const flutter::MethodCall<Value>& call,
       }
     }
     result->Success(Value(DragProbeSnapshot())); return;
+  }
+  if (method == "prepareDragHandoff" || method == "abortDragHandoff") {
+    const auto args = call.arguments() ? std::get_if<Map>(call.arguments()) : nullptr;
+    const auto flow = static_cast<uint64_t>(std::max(0, args ? IntegerArg(*args, "flow") : 0));
+    if (method == "abortDragHandoff") {
+      if (drag_handoff_.Failed(flow, args ? StringArg(*args, "message") : "切换未完成") && drag_probe_) drag_probe_->Notify();
+      result->Success(); return;
+    }
+    const unsigned buttons = drag_handoff_.Buttons();
+    const bool source_down = buttons != 0 && background_.PhysicalButtons() == buttons;
+    if (active_ || !edge_enabled_ || !shortcut_key_ || !drag_probe_ || !drag_probe_->Enabled() ||
+        !drag_handoff_.Ready(flow) || !source_down || AnyHeld(buttons) || !BoolArg(EdgeState(), "atEdge")) {
+      result->Error("drag_handoff_cancelled", "拖拽已结束、已离开边缘，或边缘切换尚未就绪。"); return;
+    }
+    drag_handoff_.Prepare(flow); drag_probe_->Notify();
+    result->Success(Value(EdgeState())); return;
+  }
+  if (method == "receiverDragTest") {
+    const auto args = call.arguments() ? std::get_if<Map>(call.arguments()) : nullptr;
+    receiver_drag_test_ = args && BoolArg(*args, "enabled");
+    result->Success(); return;
   }
   if (method == "heartbeat") {
     heartbeat_ = GetTickCount64();
@@ -441,8 +467,12 @@ void InputBridge::OnMethod(const flutter::MethodCall<Value>& call,
 }
 
 void InputBridge::Start(const Map& args, std::unique_ptr<Result> result) {
-  if (drag_probe_ && drag_probe_->Enabled()) {
-    result->Error("drag_probe_active", "请先关闭边缘拖拽测试，再开始控制。"); return;
+  const auto drag_flow = static_cast<uint64_t>(std::max(0, IntegerArg(args, "dragFlow")));
+  const bool drag_requested = drag_flow != 0;
+  const unsigned local_buttons = drag_requested ? drag_handoff_.Buttons() : 0;
+  if (drag_requested && (!BoolArg(args, "background") || !drag_probe_ || !drag_probe_->Enabled() ||
+      !drag_handoff_.Ready(drag_flow) || drag_handoff_.Stage() != "switching")) {
+    result->Error("drag_handoff_cancelled", "拖拽状态已改变，已取消跨屏。"); return;
   }
   if (active_ || recording_ || identifying_local_key_ || !identifying_.empty() || !shortcut_key_) {
     result->Error("not_ready", "必须先选择设备并设置退出快捷键。");
@@ -461,6 +491,7 @@ void InputBridge::Start(const Map& args, std::unique_ptr<Result> result) {
   }
   // Do not inherit a held modifier or shortcut into the simulated session.
   for (int key = background ? VK_LBUTTON : VK_BACK; key < 255; ++key) {
+    if ((key == VK_LBUTTON && (local_buttons & 1)) || (key == VK_RBUTTON && (local_buttons & 2))) continue;
     if (GetAsyncKeyState(key) & 0x8000) {
       result->Error("keys_held", "请松开所有键盘按键，再点击开始控制。");
       return;
@@ -498,15 +529,19 @@ void InputBridge::Start(const Map& args, std::unique_ptr<Result> result) {
   held_keys_.clear(); held_buttons_.clear(); physical_keys_.clear();
   started_ = GetTickCount64();
   background_capture_ = background;
+  drag_capture_ = drag_requested;
+  drag_passthrough_buttons_ = local_buttons;
   if (background) {
     if (!background_.Install(owner_, kBackgroundStopMessage, shortcut_key_, shortcut_shift_)) {
       background_capture_ = false; remote_capture_ = false;
+      drag_capture_ = false; drag_passthrough_buttons_ = 0;
       result->Error("hook_failed", "后台输入拦截未就绪，请移动鼠标或按键后重试。"); return;
     }
     std::lock_guard<std::mutex> lock(cursor_lease_);
     const auto generation = ++generation_;
-    if (!background_.Begin(generation)) {
+    if (!background_.Begin(generation, local_buttons)) {
       background_capture_ = false; remote_capture_ = false;
+      drag_capture_ = false; drag_passthrough_buttons_ = 0;
       result->Error("hook_failed", "后台输入拦截未就绪，请移动鼠标或按键后重试。"); return;
     }
     edge_return_.Begin(started_, shared_input::OppositeEdge(display_layout_.side));
@@ -566,12 +601,14 @@ void InputBridge::Start(const Map& args, std::unique_ptr<Result> result) {
       return;
     }
   }
+  if (drag_requested) { drag_handoff_.Crossed(drag_flow); drag_probe_->Notify(); }
   result->Success();
 }
 
 void InputBridge::Stop(const std::string& reason, bool notify) {
   const bool was_active = active_;
   const bool was_background = background_capture_;
+  const bool was_drag_capture = drag_capture_;
   // Record the first reason and unblock in one native atomic operation, before
   // any Dart/UI work. Later timer messages cannot overwrite the first cause.
   auto cause = shared_input::ReleaseCauseFor(reason);
@@ -583,6 +620,10 @@ void InputBridge::Stop(const std::string& reason, bool notify) {
   }
   active_ = false;
   background_capture_ = false;
+  const bool source_pending = was_drag_capture && (drag_handoff_.GestureActive() ||
+      (drag_probe_ && drag_probe_->Snapshot().hovering));
+  drag_capture_ = false; drag_passthrough_buttons_ = 0;
+  if (was_active && was_drag_capture && drag_handoff_.Returned(reason) && drag_probe_) drag_probe_->Notify();
   if (was_active && remote_capture_) FlushStream();
   StopStream();
   if (!was_active) return;
@@ -590,14 +631,18 @@ void InputBridge::Stop(const std::string& reason, bool notify) {
   held_keys_.clear(); held_buttons_.clear(); physical_keys_.clear();
   if (was_background) {
     edge_cooldown_ = GetTickCount64() + 500;
-    const auto bounds = PrimaryBounds();
-    const int along_x = bounds.left + static_cast<int>(return_fraction_ * (bounds.right - bounds.left - 1));
-    const int along_y = bounds.top + static_cast<int>(return_fraction_ * (bounds.bottom - bounds.top - 1));
-    switch (display_layout_.side) {
-      case shared_input::ScreenEdge::right: SetCursorPos(bounds.right - 24, along_y); break;
-      case shared_input::ScreenEdge::left: SetCursorPos(bounds.left + 24, along_y); break;
-      case shared_input::ScreenEdge::top: SetCursorPos(along_x, bounds.top + 24); break;
-      case shared_input::ScreenEdge::bottom: SetCursorPos(along_x, bounds.bottom - 24); break;
+    // Keep the source cursor over the rejecting OLE edge until its session
+    // ends. Warping it into Explorer before button-up could drop real files.
+    if (!source_pending) {
+      const auto bounds = PrimaryBounds();
+      const int along_x = bounds.left + static_cast<int>(return_fraction_ * (bounds.right - bounds.left - 1));
+      const int along_y = bounds.top + static_cast<int>(return_fraction_ * (bounds.bottom - bounds.top - 1));
+      switch (display_layout_.side) {
+        case shared_input::ScreenEdge::right: SetCursorPos(bounds.right - 24, along_y); break;
+        case shared_input::ScreenEdge::left: SetCursorPos(bounds.left + 24, along_y); break;
+        case shared_input::ScreenEdge::top: SetCursorPos(along_x, bounds.top + 24); break;
+        case shared_input::ScreenEdge::bottom: SetCursorPos(along_x, bounds.bottom - 24); break;
+      }
     }
   } else {
     SetCursor(LoadCursor(nullptr, IDC_ARROW));
@@ -652,6 +697,15 @@ void InputBridge::ReadInput(HRAWINPUT handle) {
 }
 
 void InputBridge::ProcessInput(const RAWINPUT& raw, UINT bytes) {
+  // Raw input independently observes source release, including after return.
+  // Do this before capture/foreground guards, which may legitimately discard
+  // the same packet for forwarding purposes.
+  if (raw.header.dwType == RIM_TYPEMOUSE && bytes >= sizeof(RAWINPUTHEADER) + sizeof(RAWMOUSE)) {
+    const auto flags = raw.data.mouse.usButtonFlags;
+    const unsigned released = ((flags & RI_MOUSE_LEFT_BUTTON_UP) ? 1u : 0u) |
+        ((flags & RI_MOUSE_RIGHT_BUTTON_UP) ? 2u : 0u);
+    if (released & drag_handoff_.Buttons()) EndSourceDragGesture();
+  }
   if (!edge_enabled_ && GetForegroundWindow() != owner_) return;
   if (active_ && background_capture_ && !background_.Blocking()) return;
   const auto now = GetTickCount64();
@@ -702,13 +756,23 @@ void InputBridge::ProcessInput(const RAWINPUT& raw, UINT bytes) {
   } else if (raw.header.dwType == RIM_TYPEMOUSE && bytes >= sizeof(RAWINPUTHEADER) + sizeof(RAWMOUSE)) {
     if (background_capture_ && !background_.Healthy(now)) { Stop("hook_thread_timeout"); return; }
     const auto& mouse = raw.data.mouse;
-    if (!active_ && edge_enabled_ && (!drag_probe_ || !drag_probe_->Enabled()) && !recording_ && identifying_.empty() &&
+    if (!active_ && edge_enabled_ && !recording_ && identifying_.empty() &&
         !(mouse.usFlags & MOUSE_MOVE_ABSOLUTE) &&
-        shared_input::OutwardMotion(display_layout_.side, mouse.lLastX, mouse.lLastY) > 0 &&
-        now >= edge_cooldown_ && now - edge_requested_ >= 1000 && !AnyHeld() &&
-        !background_.HasHeld()) {
+        shared_input::OutwardMotion(display_layout_.side, mouse.lLastX, mouse.lLastY) > 0) {
       auto state = EdgeState();
-      if (BoolArg(state, "atEdge")) { edge_requested_ = now; Emit("edgeEnter", std::move(state)); }
+      if (BoolArg(state, "atEdge")) {
+        const unsigned local_buttons = background_.PhysicalButtons();
+        if (drag_probe_ && drag_probe_->Enabled() && (local_buttons == 1 || local_buttons == 2) &&
+            !AnyHeld(local_buttons)) {
+          if (drag_handoff_.PushEdge(local_buttons)) {
+            drag_probe_->SetDragging(true);
+            drag_probe_->Notify();
+          }
+        } else if (!AnyHeld() && !background_.HasHeld() &&
+            now >= edge_cooldown_ && now - edge_requested_ >= 1000) {
+          edge_requested_ = now; Emit("edgeEnter", std::move(state));
+        }
+      }
     }
     if (identifying_ == "mouse" && (mouse.lLastX || mouse.lLastY || mouse.usButtonFlags)) {
       const auto path = Utf8(DevicePath(raw.header.hDevice));
@@ -734,6 +798,10 @@ void InputBridge::ProcessInput(const RAWINPUT& raw, UINT bytes) {
     }
     if (mouse.usButtonFlags) ++buttons_;
     for (int button = 0; button < 5; ++button) {
+      if (drag_passthrough_buttons_ & (1u << button)) {
+        if (mouse.usButtonFlags & (2 << (button * 2))) drag_passthrough_buttons_ &= ~(1u << button);
+        continue; // This press began on Windows; never send its lone up to Mac.
+      }
       if (mouse.usButtonFlags & (1 << (button * 2))) {
         held_buttons_.insert(button);
         QueueInput({{Value("kind"), Value("button")}, {Value("button"), Value(button)}, {Value("down"), Value(true)}});
@@ -795,9 +863,15 @@ void InputBridge::RemotePointer(const Map& data) {
       ? shared_input::EdgeFraction(y, top, height) : shared_input::EdgeFraction(x, left, width);
   return_fraction_ = display_layout_.ToController(fraction);
   pointer_received_ = GetTickCount64();
+  // Only the updated receiver with a configured rejecting edge may return a
+  // Mac-origin held press. Windows-origin source holds still use their existing
+  // local ownership path, independently of this negotiated receiver feature.
+  const bool drag_test = drag_probe_ && drag_probe_->Enabled() && receiver_drag_test_;
   if (active_ && background_capture_ && edge_return_.Return(x, y, left, top, width, height,
       static_cast<int64_t>(NumberArg(data, "sequence", -1)),
-      !held_keys_.empty() || !held_buttons_.empty() || background_.HasHeld(), GetTickCount64())) Stop("edge");
+      !held_keys_.empty() || (!drag_test && !held_buttons_.empty()) ||
+        (drag_test ? background_.HasRemoteHeld(true) :
+          (drag_capture_ ? background_.HasRemoteHeld() : background_.HasHeld())), GetTickCount64())) Stop("edge");
 }
 
 InputBridge::Map InputBridge::Stats() const {
@@ -833,21 +907,37 @@ InputBridge::Map InputBridge::AudioOutput() const {
 InputBridge::Map InputBridge::DragProbeSnapshot() const {
   if (!drag_probe_) return {{Value("enabled"), Value(false)}, {Value("revision"), Value(int64_t{0})}};
   const auto& state = drag_probe_->Snapshot();
-  flutter::EncodableList files, formats;
+  flutter::EncodableList files, formats, history;
+  for (const auto& stage : drag_handoff_.History()) history.emplace_back(stage);
   for (const auto& file : state.data.files) files.emplace_back(Map{
       {Value("name"), Value(Utf8(file.name))}, {Value("path"), Value(Utf8(file.path))},
       {Value("promised"), Value(file.promised)}});
   for (const auto& format : state.data.formats) formats.emplace_back(Utf8(format));
   return {{Value("enabled"), Value(state.enabled)}, {Value("side"), Value(shared_input::EdgeName(state.side))},
       {Value("hitEnabled"), Value(state.enabled && state.hit_enabled)},
+      {Value("hovering"), Value(state.hovering)},
+      {Value("dragStage"), Value(drag_handoff_.Stage())}, {Value("dragFlow"), Value(static_cast<int64_t>(drag_handoff_.Flow()))},
+      {Value("gestureActive"), Value(drag_handoff_.GestureActive())}, {Value("onRemote"), Value(drag_handoff_.Remote())},
+      {Value("dragHistory"), Value(std::move(history))}, {Value("dragReason"), Value(drag_handoff_.Reason())},
       {Value("phase"), Value(state.phase)}, {Value("revision"), Value(static_cast<int64_t>(state.revision))},
       {Value("files"), Value(std::move(files))}, {Value("formats"), Value(std::move(formats))},
       {Value("count"), Value(static_cast<int>(state.data.count))}, {Value("truncated"), Value(state.data.truncated)},
       {Value("message"), Value(Utf8(state.data.message))}};
 }
 
+void InputBridge::EndSourceDragGesture() {
+  const bool changed = drag_handoff_.EndGesture();
+  if (!drag_probe_ || !drag_probe_->Enabled()) return;
+  // Retain the rejecting target until OLE acknowledges completion. Removing
+  // its region before that could place a real source file in an underlying app.
+  if (!drag_probe_->Snapshot().hovering) drag_probe_->SetDragging(false);
+  if (changed) drag_probe_->Notify();
+}
+
 std::optional<LRESULT> InputBridge::HandleMessage(UINT message, WPARAM wparam, LPARAM lparam) {
   if (drag_probe_ && message == EdgeDragProbe::kChangedMessage) {
+    const auto& probe = drag_probe_->Snapshot();
+    if (probe.enabled && !probe.hovering && !drag_handoff_.GestureActive()) drag_probe_->SetDragging(false);
     Emit("edgeDragProbeChanged", DragProbeSnapshot()); return 0;
   }
   if (audio_playback_ && message == AudioPlaybackBridge::kResultMessage) {
@@ -919,7 +1009,14 @@ std::optional<LRESULT> InputBridge::HandleMessage(UINT message, WPARAM wparam, L
     case kBackgroundDragGestureMessage:
       if (drag_probe_ && drag_probe_->Enabled() &&
           static_cast<uint32_t>(lparam) == static_cast<uint32_t>(drag_probe_->Snapshot().generation)) {
-        drag_probe_->SetDragging(wparam != 0);
+        bool changed = false;
+        if (wparam && !active_) {
+          changed = drag_handoff_.Gesture(static_cast<unsigned>(wparam));
+          if (changed) drag_probe_->SetDragging(true);
+        } else if (!wparam) {
+          EndSourceDragGesture();
+        }
+        if (changed) drag_probe_->Notify();
       }
       return 0;
     case kLocalKeyIdentifiedMessage: {

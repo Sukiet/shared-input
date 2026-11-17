@@ -13,7 +13,9 @@
 namespace shared_input {
 extern "C" {
 SHARED_HOOK_API bool SharedHooksInstall(HWND owner, UINT message, int key, bool shift);
-SHARED_HOOK_API bool SharedHooksBegin(uint32_t generation);
+SHARED_HOOK_API bool SharedHooksBegin(uint32_t generation, uint32_t local_buttons = 0);
+SHARED_HOOK_API bool SharedHooksHasRemoteHeld(bool ignore_mouse = false);
+SHARED_HOOK_API unsigned SharedHooksPhysicalButtons();
 SHARED_HOOK_API bool SharedHooksSetLocalKeys(const int* keys, unsigned count);
 SHARED_HOOK_API void SharedHooksIdentifyKey(uint32_t token);
 SHARED_HOOK_API void SharedHooksObserveDrag(uint32_t token);
@@ -39,7 +41,9 @@ class BackgroundHooks {
  public:
   ~BackgroundHooks() { Close(); }
   bool Install(HWND owner, UINT message, int key, bool shift) { return SharedHooksInstall(owner, message, key, shift); }
-  bool Begin(uint32_t generation = 0) { return SharedHooksBegin(generation); }
+  bool Begin(uint32_t generation = 0, uint32_t local_buttons = 0) { return SharedHooksBegin(generation, local_buttons); }
+  bool HasRemoteHeld(bool ignore_mouse = false) const { return SharedHooksHasRemoteHeld(ignore_mouse); }
+  unsigned PhysicalButtons() const { return SharedHooksPhysicalButtons(); }
   bool SetLocalKeys(const int* keys, unsigned count) { return SharedHooksSetLocalKeys(keys, count); }
   void IdentifyKey(uint32_t token) { SharedHooksIdentifyKey(token); }
   void ObserveDrag(uint32_t token) { SharedHooksObserveDrag(token); }

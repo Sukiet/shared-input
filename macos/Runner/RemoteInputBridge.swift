@@ -7,6 +7,9 @@ import ApplicationServices
 final class RemoteInputBridge {
   private let channel: FlutterMethodChannel
   private let clipboard = ClipboardBridge()
+  private let dragProbe = MacEdgeDragProbe()
+  private var dragTestEnabled = false // protected by lock, like heldButtons
+  private var dragPixelScale: CGFloat = 1
   private lazy var audioCapture = AudioCaptureBridge(channel: channel)
   private let cursorVisibility = ReceiverCursorVisibility()
   private var edgeExit = ReceiverEdgeExit()
@@ -60,6 +63,9 @@ final class RemoteInputBridge {
   init(messenger: FlutterBinaryMessenger) {
     channel = FlutterMethodChannel(name: "shared_input/dry_run", binaryMessenger: messenger)
     channel.setMethodCallHandler { [weak self] call, result in self?.handle(call, result) }
+    dragProbe.changed = { [weak self] snapshot in
+      self?.channel.invokeMethod("edgeDragProbeChanged", arguments: snapshot)
+    }
     let timer = DispatchSource.makeTimerSource(queue: DispatchQueue(label: "shared-input-watchdog"))
     timer.schedule(deadline: .now() + .milliseconds(50), repeating: .milliseconds(50))
     timer.setEventHandler { [weak self] in
@@ -95,8 +101,8 @@ final class RemoteInputBridge {
     motionTimer.resume()
     self.motionTimer = motionTimer
   }
-  deinit { motionTimer?.cancel(); timer?.cancel(); clipboard.reset(); stop() }
-  func shutdown() { clipboard.reset(); stop(); audioCapture.shutdown() }
+  deinit { motionTimer?.cancel(); timer?.cancel(); clipboard.reset(); dragProbe.shutdown(); stop() }
+  func shutdown() { clipboard.reset(); stop(); dragProbe.shutdown(); audioCapture.shutdown() }
   func stop(hideCursor: Bool = false) {
     lock.lock(); defer { lock.unlock() }
     releaseLocked(hideCursor: hideCursor)
@@ -112,8 +118,19 @@ final class RemoteInputBridge {
     case "initialize":
       clipboard.reset()
       stop()
+      dragProbe.configure(enabled: false, side: "left")
+      lock.lock(); dragTestEnabled = false; lock.unlock()
       diagnosticsEnabled = args["diagnostics"] as? Bool ?? false
       result(nil)
+    case "edgeDragProbe":
+      let side = args["side"] as? String ?? dragProbe.side
+      guard ["left", "right", "top", "bottom"].contains(side) else {
+        result(FlutterError(code: "invalid_layout", message: "拖拽测试边缘无效。", details: nil)); return
+      }
+      dragProbe.configure(enabled: args["enabled"] as? Bool ?? false, side: side)
+      lock.lock(); dragTestEnabled = dragProbe.enabled; dragPixelScale = dragProbe.pixelScale; lock.unlock()
+      result(dragProbe.snapshot)
+    case "edgeDragProbeClear": dragProbe.clear(); result(dragProbe.snapshot)
     case "receiverConfigureSmoothing":
       guard let enabled = args["enabled"] as? Bool,
             let duration = args["durationMs"] as? Int, (1...100).contains(duration),
@@ -171,8 +188,9 @@ final class RemoteInputBridge {
       lock.lock()
       // System cursor queries can still return a previous predicted post while
       // its correction is in flight. Edge decisions use authoritative samples.
-      let actual = predictionEnabled ? predictor.confirmed : (CGEvent(source: nil)?.location ?? position)
-      let predicted = predictionEnabled &&
+      let usePrediction = predictionEnabled && heldButtons.isEmpty
+      let actual = usePrediction ? predictor.confirmed : (CGEvent(source: nil)?.location ?? position)
+      let predicted = usePrediction &&
         (predictor.value(at: ProcessInfo.processInfo.systemUptime) != predictor.confirmed || position != predictor.confirmed)
       let bounds = CGDisplayBounds(CGMainDisplayID())
       let snapshot: [String: Any] = ["x": actual.x, "y": actual.y,
@@ -197,7 +215,11 @@ final class RemoteInputBridge {
           !["left", "right", "top", "bottom"].contains(entrySide) {
         result(FlutterError(code: "invalid_layout", message: "显示屏入口无效。", details: nil)); return
       }
+      if entry != nil { dragProbe.setSide(entrySide) }
+      dragProbe.receiverBegan()
+      let dragScale = dragProbe.pixelScale
       lock.lock()
+      dragPixelScale = dragScale
       releaseLocked()
       capture = id; sequence = -1; total = .zero
       edgeExit = ReceiverEdgeExit(edge: entry == nil ? nil : entrySide,
@@ -233,7 +255,9 @@ final class RemoteInputBridge {
       lock.unlock()
       if active { result(nil) }
       else { result(FlutterError(code: "receiver_stopped", message: "接收已停止。", details: nil)) }
-    case "receiverStop": stop(hideCursor: true); result(nil)
+    case "receiverStop":
+      dragProbe.receiverStopped(reason: args["reason"] as? String)
+      stop(hideCursor: true); result(nil)
     case "receiverInput":
       let entered = tick()
       lock.lock()
@@ -327,7 +351,13 @@ final class RemoteInputBridge {
     return true
   }
   private func emitMotionLocked(_ point: CGPoint) {
-    let point = constrained(point)
+    var point = constrained(point)
+    if dragTestEnabled && !heldButtons.isEmpty {
+      let bounds = CGDisplayBounds(CGMainDisplayID())
+      if bounds.contains(point) {
+        point = dragProbeCursor(point, bounds: bounds, side: edgeExit.edge, scale: dragPixelScale)
+      }
+    }
     guard point != position else { return }
     position = point
     let button = heldButtons.contains(0) ? 0 : heldButtons.contains(1) ? 1 : heldButtons.sorted().first ?? 0
@@ -431,7 +461,7 @@ final class RemoteInputBridge {
     guard capture != nil, edgeExit.edge != nil else { return }
     let confirmed = predictionEnabled ? predictor.confirmed : interpolator.target
     let bounds = CGDisplayBounds(CGMainDisplayID())
-    let held = !heldKeys.isEmpty || !heldButtons.isEmpty
+    let held = !heldKeys.isEmpty || (!dragTestEnabled && !heldButtons.isEmpty)
     if edgeExit.shouldHide(rendered: position, confirmed: confirmed, bounds: bounds, held: held, at: now) {
       // Cosmetic anticipation only: keep feedback and input alive until Windows
       // actually ends this capture. Never use a predicted-only edge crossing.

@@ -21,6 +21,7 @@
 #include "audio_output_monitor.h"
 #include "audio_playback_bridge.h"
 #include "edge_drag_probe.h"
+#include "drag_handoff.h"
 
 class InputBridge {
  public:
@@ -42,6 +43,7 @@ class InputBridge {
   std::vector<Device> Enumerate();
   void ReadInput(HRAWINPUT input);
   void ProcessInput(const RAWINPUT& input, UINT bytes);
+  void EndSourceDragGesture();
   Map EdgeState() const;
   bool ConfigureLayout(const Map& options);
   void RemotePointer(const Map& data);
@@ -87,6 +89,10 @@ class InputBridge {
   RECT owned_clip_{};
   bool keyboard_captured_ = false;
   bool edge_enabled_ = false, background_capture_ = false;
+  shared_input::DragHandoff drag_handoff_;
+  bool drag_capture_ = false;
+  bool receiver_drag_test_ = false;
+  unsigned drag_passthrough_buttons_ = 0;
   uint64_t edge_requested_ = 0, edge_cooldown_ = 0;
   double return_fraction_ = 0.5;
   shared_input::BackgroundHooks background_;

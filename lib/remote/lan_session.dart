@@ -11,17 +11,29 @@ import 'input_diagnostics.dart';
 
 class LanSession extends ChangeNotifier {
   final clipboard = ClipboardChannel();
-  bool audioCaptureSupported = false, audioRenderSupported = false, supportsAudio = false;
+  bool audioCaptureSupported = false,
+      audioRenderSupported = false,
+      supportsAudio = false;
   void Function(Map<String, dynamic>)? onAudioControl;
   String? get remoteHost => _wire?.socket.remoteAddress.address;
   Future<void> sendAudioControl(Map<String, dynamic> message) async {
     final wire = _wire;
-    if (wire == null || !connected || !supportsAudio) throw StateError('音频连接不可用');
+    if (wire == null || !connected || !supportsAudio) {
+      throw StateError('音频连接不可用');
+    }
     await wire.send(message);
   }
+
   bool clipboardSupported = false, supportsClipboard = false;
   bool _clipboardOpening = false;
   void Function(Map<String, dynamic> message)? onClipboardControl;
+  bool dragPreviewSupported = false, supportsDragPreview = false;
+  FutureOr<void> Function(Map<String, dynamic>)? onDragPreviewControl;
+  Future<void> sendDragPreviewControl(Map<String, dynamic> message) async {
+    if (!connected || !supportsDragPreview) return;
+    await _wire!.send(message);
+  }
+
   int get connectionGeneration => _generation;
   bool get receiving => _receiver;
   final diagnostics = InputDiagnostics();
@@ -40,6 +52,7 @@ class LanSession extends ChangeNotifier {
   Future<void> Function(String capture, List<Map<String, dynamic>> frames)?
   onInput;
   Future<void> Function()? onEnd;
+  Future<void> Function(String? reason)? onEndWithReason;
   Future<void> Function()? onHeartbeat;
   VoidCallback? onConnectionLost;
   VoidCallback? onCaptureEnded;
@@ -141,6 +154,7 @@ class LanSession extends ChangeNotifier {
               'capabilities': [
                 'motion-prediction-v1',
                 if (clipboardSupported) 'clipboard-v1',
+                if (dragPreviewSupported) 'edge-drag-preview-v1',
                 if (audioCaptureSupported) 'audio-capture-pcm-v1',
                 if (audioRenderSupported) 'audio-render-pcm-v1',
                 if (onPointerInfo != null) 'edge-pointer-v1',
@@ -175,8 +189,18 @@ class LanSession extends ChangeNotifier {
               clipboardSupported &&
               (hello['capabilities'] as List?)?.contains('clipboard-v1') ==
                   true;
-          supportsAudio = audioCaptureSupported &&
-              (hello['capabilities'] as List?)?.contains('audio-render-pcm-v1') == true;
+          supportsDragPreview =
+              dragPreviewSupported &&
+              (hello['capabilities'] as List?)?.contains(
+                    'edge-drag-preview-v1',
+                  ) ==
+                  true;
+          supportsAudio =
+              audioCaptureSupported &&
+              (hello['capabilities'] as List?)?.contains(
+                    'audio-render-pcm-v1',
+                  ) ==
+                  true;
           _mouseCipher = PacketCipher(keys.mouse);
           _remoteAddress = socket.remoteAddress;
           _remoteUdpPort = udpPort;
@@ -233,8 +257,9 @@ class LanSession extends ChangeNotifier {
           'capabilities': [
             'motion-prediction-v1',
             if (clipboardSupported) 'clipboard-v1',
-                if (audioCaptureSupported) 'audio-capture-pcm-v1',
-                if (audioRenderSupported) 'audio-render-pcm-v1',
+            if (dragPreviewSupported) 'edge-drag-preview-v1',
+            if (audioCaptureSupported) 'audio-capture-pcm-v1',
+            if (audioRenderSupported) 'audio-render-pcm-v1',
           ],
         }, master),
       );
@@ -246,14 +271,20 @@ class LanSession extends ChangeNotifier {
       }
       supportsEdge =
           (ack['capabilities'] as List?)?.contains('edge-pointer-v1') == true;
+      supportsDragPreview =
+          dragPreviewSupported &&
+          (ack['capabilities'] as List?)?.contains('edge-drag-preview-v1') ==
+              true;
       supportsPrediction =
           (ack['capabilities'] as List?)?.contains('motion-prediction-v1') ==
           true;
       supportsClipboard =
           clipboardSupported &&
           (ack['capabilities'] as List?)?.contains('clipboard-v1') == true;
-      supportsAudio = audioRenderSupported &&
-          (ack['capabilities'] as List?)?.contains('audio-capture-pcm-v1') == true;
+      supportsAudio =
+          audioRenderSupported &&
+          (ack['capabilities'] as List?)?.contains('audio-capture-pcm-v1') ==
+              true;
       remoteDisplay = _displayInfo(ack['display']);
       supportsLayout =
           remoteDisplay != null &&
@@ -356,6 +387,10 @@ class LanSession extends ChangeNotifier {
         );
         _lastReceived = DateTime.now();
         switch (json['type']) {
+          case 'dragPreviewConfig':
+          case 'dragPreviewState':
+          case 'dragPreviewClear':
+            if (supportsDragPreview) await onDragPreviewControl?.call(json);
           case 'audioStart':
           case 'audioStarted':
           case 'audioStop':
@@ -461,7 +496,10 @@ class LanSession extends ChangeNotifier {
             _capture = null;
           case 'end':
             if (json['capture'] == _capture) {
-              await _end();
+              final reason = json['reason'];
+              await _end(
+                reason: reason is String && reason.length <= 64 ? reason : null,
+              );
               if (!_receiver) onCaptureEnded?.call();
               _changed();
             }
@@ -752,7 +790,7 @@ class LanSession extends ChangeNotifier {
     unawaited(_delivery.then((_) => _flushReceive()));
   }
 
-  Future<void> _end() async {
+  Future<void> _end({String? reason}) async {
     _pointerTimer?.cancel();
     _pointerTimer = null;
     _edgeCapture = false;
@@ -760,15 +798,25 @@ class LanSession extends ChangeNotifier {
     _capture = null;
     _pendingSend = _pendingReceive = null;
     _latestMotion = null;
-    if (wasCapturing && _receiver) await onEnd?.call();
+    if (wasCapturing && _receiver) {
+      if (onEndWithReason != null) {
+        await onEndWithReason!(reason);
+      } else {
+        await onEnd?.call();
+      }
+    }
   }
 
-  Future<void> endCapture() async {
+  Future<void> endCapture({String? reason}) async {
     final capture = _capture;
-    await _end();
+    await _end(reason: reason);
     if (capture != null && connected) {
       try {
-        await _wire!.send({'type': 'end', 'capture': capture});
+        await _wire!.send({
+          'type': 'end',
+          'capture': capture,
+          'reason': ?reason,
+        });
       } catch (_) {
         /* native watchdog also releases */
       }
@@ -789,6 +837,7 @@ class LanSession extends ChangeNotifier {
     if (_closing) return;
     _closing = true;
     supportsEdge = false;
+    supportsDragPreview = false;
     supportsLayout = false;
     supportsClipboard = false;
     supportsAudio = false;
