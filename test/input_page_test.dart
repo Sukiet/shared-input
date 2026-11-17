@@ -11,6 +11,7 @@ import 'package:shared_input/remote/lan_session.dart';
 import 'package:shared_input/settings.dart';
 import 'package:shared_input/scroll_speed.dart';
 import 'package:shared_input/audio_sync_mode.dart';
+import 'package:shared_input/edge_drag_preview.dart';
 
 void main() {
   TestWidgetsFlutterBinding.ensureInitialized();
@@ -21,6 +22,8 @@ void main() {
   var devices = <Map<String, dynamic>>[];
   var rejectStart = false;
   var rejectLocalKeys = false;
+  var rejectDragProbe = false, dragProbeEnabled = false;
+  var dragProbeRevision = 0;
   String? stopDuringStart;
   Completer<Object?>? pendingAudioOutput;
 
@@ -36,6 +39,10 @@ void main() {
     String method, [
     Map<String, dynamic> data = const {},
   ]) async {
+    if (method == 'edgeDragProbeChanged' && (data['revision'] as int? ?? 0) >= dragProbeRevision) {
+      dragProbeRevision = data['revision'] as int? ?? 0;
+      dragProbeEnabled = data['enabled'] == true;
+    }
     await messenger.handlePlatformMessage(
       channel.name,
       const StandardMethodCodec().encodeMethodCall(MethodCall(method, data)),
@@ -56,10 +63,21 @@ void main() {
     ];
     rejectStart = false;
     rejectLocalKeys = false;
+    rejectDragProbe = false; dragProbeEnabled = false; dragProbeRevision = 0;
     stopDuringStart = null;
     pendingAudioOutput = null;
     messenger.setMockMethodCallHandler(channel, (call) async {
       calls.add(call);
+      if (call.method == 'edgeDragProbe' || call.method == 'edgeDragProbeClear') {
+        if (call.method == 'edgeDragProbe') {
+          if (rejectDragProbe && (call.arguments as Map)['enabled'] == true) {
+            throw PlatformException(code: 'drag_probe_failed', message: '测试：无法注册拖拽接收条');
+          }
+          dragProbeEnabled = (call.arguments as Map)['enabled'] == true;
+        }
+        return {'enabled': dragProbeEnabled, 'revision': ++dragProbeRevision,
+          'phase': dragProbeEnabled ? 'waiting' : 'off', 'files': [], 'formats': [], 'count': 0};
+      }
       if (call.method == 'configureLocalKeys' && rejectLocalKeys) {
         throw PlatformException(code: 'invalid_local_keys', message: '测试：例外设置失败');
       }
@@ -184,6 +202,70 @@ void main() {
       await tester.pumpWidget(const SizedBox());
     },
   );
+
+  windowsTest('edge drag preview displays files, keeps results on leave and clears without starting capture', (tester) async {
+    await open(tester);
+    await configure(tester);
+    final toggle = find.byKey(const Key('edge-drag-preview-toggle'));
+    await tester.ensureVisible(toggle);
+    await tester.tap(find.descendant(of: toggle, matching: find.byType(Switch)));
+    await tester.pumpAndSettle();
+    expect(tester.widget<SwitchListTile>(toggle).value, true);
+    expect(find.text('区域关闭（鼠标穿透）'), findsOneWidget);
+    expect(start(tester).onPressed, isNull);
+    final data = <String, dynamic>{'enabled': true, 'hitEnabled': true, 'revision': 2, 'phase': 'enter', 'count': 2,
+      'files': [{'name': '图像.png', 'path': r'C:\照片\图像.png'}, {'name': '工作文件夹', 'path': r'D:\工作文件夹'}],
+      'formats': ['CF_HDROP']};
+    await native('edgeDragProbeChanged', data);
+    await tester.pumpAndSettle();
+    expect(find.text('1. 图像.png'), findsOneWidget);
+    expect(find.text(r'C:\照片\图像.png'), findsOneWidget);
+    expect(find.textContaining('CF_HDROP'), findsOneWidget);
+    expect(find.text('已识别 2 项'), findsOneWidget);
+    expect(find.text('区域打开（1 像素命中）'), findsOneWidget);
+    await native('edgeDragProbeChanged', {...data, 'hitEnabled': false, 'revision': 3, 'phase': 'leave'});
+    await tester.pumpAndSettle();
+    expect(find.text('1. 图像.png'), findsOneWidget);
+    expect(find.text('区域关闭（鼠标穿透）'), findsOneWidget);
+    await tester.ensureVisible(find.byKey(const Key('clear-edge-drag-preview')));
+    await tester.tap(find.byKey(const Key('clear-edge-drag-preview')));
+    await tester.pumpAndSettle();
+    expect(find.text('1. 图像.png'), findsNothing);
+    expect(tester.widget<EdgeDragPreviewPanel>(find.byType(EdgeDragPreviewPanel)).preview.files, isEmpty);
+    await tester.tap(find.descendant(of: toggle, matching: find.byType(Switch)));
+    await tester.pumpAndSettle();
+    expect(start(tester).onPressed, isNotNull);
+    await native('edgeDragProbeChanged', {...data, 'revision': 2});
+    await tester.pumpAndSettle();
+    expect(tester.widget<SwitchListTile>(toggle).value, false);
+    expect(find.text('区域关闭（测试未开启）'), findsOneWidget);
+    expect(calls.where((call) => call.method == 'start'), isEmpty);
+    await tester.pumpWidget(const SizedBox());
+  });
+
+  windowsTest('drag preview registration errors stay disabled and role switch closes the local receiver', (tester) async {
+    final store = MemorySettingsStore();
+    await open(tester, store: store);
+    final toggle = find.byKey(const Key('edge-drag-preview-toggle'));
+    await tester.ensureVisible(toggle);
+    rejectDragProbe = true;
+    await tester.tap(find.descendant(of: toggle, matching: find.byType(Switch)));
+    await tester.pumpAndSettle();
+    expect(tester.widget<SwitchListTile>(toggle).value, false);
+    rejectDragProbe = false;
+    await tester.tap(find.descendant(of: toggle, matching: find.byType(Switch)));
+    await tester.pumpAndSettle();
+    await tester.ensureVisible(find.text('被控端'));
+    await tester.tap(find.text('被控端'));
+    await tester.pumpAndSettle();
+    expect(find.byType(EdgeDragPreviewPanel), findsNothing);
+    expect(dragProbeEnabled, false);
+    await tester.pumpWidget(const SizedBox());
+    await open(tester, store: MemorySettingsStore());
+    expect(tester.widget<SwitchListTile>(toggle).value, false);
+    expect(tester.takeException(), isNull);
+    await tester.pumpWidget(const SizedBox());
+  });
 
   windowsTest('local key exceptions recognize media keys, deduplicate, persist and remove', (tester) async {
     final store = MemorySettingsStore();

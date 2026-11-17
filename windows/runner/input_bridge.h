@@ -20,6 +20,7 @@
 #include "clipboard_bridge.h"
 #include "audio_output_monitor.h"
 #include "audio_playback_bridge.h"
+#include "edge_drag_probe.h"
 
 class InputBridge {
  public:
@@ -49,6 +50,7 @@ class InputBridge {
   void CancelSetup();
   void Emit(const std::string& method, Map data = {});
   Map AudioOutput() const;
+  Map DragProbeSnapshot() const;
   Map Stats() const;
   bool Down(int key) const;
   bool MatchesShortcut(int key) const;
@@ -64,6 +66,7 @@ class InputBridge {
   std::unique_ptr<ClipboardBridge> clipboard_;
   std::unique_ptr<AudioOutputMonitor> audio_output_;
   std::unique_ptr<AudioPlaybackBridge> audio_playback_;
+  std::unique_ptr<EdgeDragProbe> drag_probe_;
   bool initialized_ = false, active_ = false, recording_ = false;
   bool identifying_local_key_ = false;
   uint32_t local_key_identify_token_ = 0;

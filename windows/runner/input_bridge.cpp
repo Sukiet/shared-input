@@ -24,6 +24,7 @@ constexpr UINT kStreamMessage = WM_APP + 0x144;
 constexpr UINT kBackgroundStopMessage = WM_APP + 0x145;
 constexpr UINT kBackgroundKeyMessage = kBackgroundStopMessage + 1;
 constexpr UINT kLocalKeyIdentifiedMessage = kBackgroundStopMessage + 2;
+constexpr UINT kBackgroundDragGestureMessage = kBackgroundStopMessage + 3;
 constexpr UINT_PTR kStatsTimer = 0x5349;
 constexpr wchar_t kCaptureClass[] = L"SharedInputLocalCapture";
 using Value = flutter::EncodableValue;
@@ -153,6 +154,7 @@ InputBridge::InputBridge(HWND owner, HWND view, flutter::BinaryMessenger* messen
 
 InputBridge::~InputBridge() {
   Stop("shutdown", false);
+  drag_probe_.reset();
   audio_playback_.reset();
   audio_output_.reset();
   background_.Close();
@@ -254,6 +256,8 @@ void InputBridge::OnMethod(const flutter::MethodCall<Value>& call,
     clipboard_->Handle(call, std::move(result)); return;
   }
   if (method == "initialize") {
+    background_.ObserveDrag(0);
+    if (drag_probe_) { drag_probe_->Configure(false, display_layout_.side); drag_probe_->Clear(); }
     clipboard_->Reset();
     // Hot restart / a new Dart view always starts disarmed.
     Stop("manual", false);
@@ -268,6 +272,29 @@ void InputBridge::OnMethod(const flutter::MethodCall<Value>& call,
   if (!initialized_) {
     result->Error("not_initialized", "请先初始化原生采集模块。");
     return;
+  }
+  if (method == "edgeDragProbe" || method == "edgeDragProbeClear") {
+    const auto args = call.arguments() ? std::get_if<Map>(call.arguments()) : nullptr;
+    const bool enabled = method == "edgeDragProbe" && args && BoolArg(*args, "enabled");
+    if (enabled && (active_ || recording_ || identifying_local_key_ || !identifying_.empty())) {
+      result->Error("drag_probe_busy", "请先结束控制或按键识别，再开启拖拽测试。"); return;
+    }
+    if (enabled && !background_.Install(owner_, kBackgroundStopMessage, shortcut_key_, shortcut_shift_)) {
+      result->Error("drag_probe_hook_failed", "无法监听拖动手势，请重试。"); return;
+    }
+    if (!drag_probe_ && enabled) drag_probe_ = std::make_unique<EdgeDragProbe>(owner_);
+    if (drag_probe_) {
+      if (method == "edgeDragProbeClear") drag_probe_->Clear();
+      else {
+        const auto status = drag_probe_->Configure(enabled, display_layout_.side);
+        if (FAILED(status)) {
+          result->Error("drag_probe_failed", "无法注册边缘拖放接收窗口（" + std::to_string(status) + "）"); return;
+        }
+        background_.ObserveDrag(enabled ? static_cast<uint32_t>(drag_probe_->Snapshot().generation) : 0);
+        if (!enabled && !edge_enabled_ && !identifying_local_key_) background_.Close();
+      }
+    }
+    result->Success(Value(DragProbeSnapshot())); return;
   }
   if (method == "heartbeat") {
     heartbeat_ = GetTickCount64();
@@ -336,7 +363,7 @@ void InputBridge::OnMethod(const flutter::MethodCall<Value>& call,
     }
     edge_enabled_ = enabled;
     edge_cooldown_ = GetTickCount64() + 500;
-    if (!enabled) background_.Close();
+    if (!enabled && (!drag_probe_ || !drag_probe_->Enabled())) background_.Close();
     result->Success();
   } else if (method == "configureLayout") {
     const auto args = call.arguments() ? std::get_if<Map>(call.arguments()) : nullptr;
@@ -414,6 +441,9 @@ void InputBridge::OnMethod(const flutter::MethodCall<Value>& call,
 }
 
 void InputBridge::Start(const Map& args, std::unique_ptr<Result> result) {
+  if (drag_probe_ && drag_probe_->Enabled()) {
+    result->Error("drag_probe_active", "请先关闭边缘拖拽测试，再开始控制。"); return;
+  }
   if (active_ || recording_ || identifying_local_key_ || !identifying_.empty() || !shortcut_key_) {
     result->Error("not_ready", "必须先选择设备并设置退出快捷键。");
     return;
@@ -672,7 +702,7 @@ void InputBridge::ProcessInput(const RAWINPUT& raw, UINT bytes) {
   } else if (raw.header.dwType == RIM_TYPEMOUSE && bytes >= sizeof(RAWINPUTHEADER) + sizeof(RAWMOUSE)) {
     if (background_capture_ && !background_.Healthy(now)) { Stop("hook_thread_timeout"); return; }
     const auto& mouse = raw.data.mouse;
-    if (!active_ && edge_enabled_ && !recording_ && identifying_.empty() &&
+    if (!active_ && edge_enabled_ && (!drag_probe_ || !drag_probe_->Enabled()) && !recording_ && identifying_.empty() &&
         !(mouse.usFlags & MOUSE_MOVE_ABSOLUTE) &&
         shared_input::OutwardMotion(display_layout_.side, mouse.lLastX, mouse.lLastY) > 0 &&
         now >= edge_cooldown_ && now - edge_requested_ >= 1000 && !AnyHeld() &&
@@ -750,6 +780,7 @@ bool InputBridge::ConfigureLayout(const Map& options) {
   layout.offset = NumberArg(options, "offset", NAN);
   if (!layout.Valid()) return false;
   display_layout_ = layout;
+  if (drag_probe_ && drag_probe_->Enabled()) drag_probe_->Configure(true, layout.side);
   return true;
 }
 
@@ -799,7 +830,26 @@ InputBridge::Map InputBridge::AudioOutput() const {
       {Value("automatic"), Value(state.automatic)}, {Value("revision"), Value(state.revision)}};
 }
 
+InputBridge::Map InputBridge::DragProbeSnapshot() const {
+  if (!drag_probe_) return {{Value("enabled"), Value(false)}, {Value("revision"), Value(int64_t{0})}};
+  const auto& state = drag_probe_->Snapshot();
+  flutter::EncodableList files, formats;
+  for (const auto& file : state.data.files) files.emplace_back(Map{
+      {Value("name"), Value(Utf8(file.name))}, {Value("path"), Value(Utf8(file.path))},
+      {Value("promised"), Value(file.promised)}});
+  for (const auto& format : state.data.formats) formats.emplace_back(Utf8(format));
+  return {{Value("enabled"), Value(state.enabled)}, {Value("side"), Value(shared_input::EdgeName(state.side))},
+      {Value("hitEnabled"), Value(state.enabled && state.hit_enabled)},
+      {Value("phase"), Value(state.phase)}, {Value("revision"), Value(static_cast<int64_t>(state.revision))},
+      {Value("files"), Value(std::move(files))}, {Value("formats"), Value(std::move(formats))},
+      {Value("count"), Value(static_cast<int>(state.data.count))}, {Value("truncated"), Value(state.data.truncated)},
+      {Value("message"), Value(Utf8(state.data.message))}};
+}
+
 std::optional<LRESULT> InputBridge::HandleMessage(UINT message, WPARAM wparam, LPARAM lparam) {
+  if (drag_probe_ && message == EdgeDragProbe::kChangedMessage) {
+    Emit("edgeDragProbeChanged", DragProbeSnapshot()); return 0;
+  }
   if (audio_playback_ && message == AudioPlaybackBridge::kResultMessage) {
     audio_playback_->Complete(); return 0;
   }
@@ -840,11 +890,13 @@ std::optional<LRESULT> InputBridge::HandleMessage(UINT message, WPARAM wparam, L
       if (!background_capture_) Stop("window_changed");
       break;
     case WM_DISPLAYCHANGE:
+      if (drag_probe_) drag_probe_->Reposition();
       Stop("window_changed");
       break;
     case WM_CLOSE:
     case WM_DESTROY:
     case WM_QUERYENDSESSION:
+      if (drag_probe_) drag_probe_->Configure(false, display_layout_.side);
       Stop("shutdown");
       receiver_.Stop();
       CancelSetup();
@@ -863,6 +915,12 @@ std::optional<LRESULT> InputBridge::HandleMessage(UINT message, WPARAM wparam, L
     case kBackgroundStopMessage:
       if (active_ && background_capture_ &&
           static_cast<unsigned>(lparam) == generation_.load() && !background_.Blocking()) Stop("shortcut");
+      return 0;
+    case kBackgroundDragGestureMessage:
+      if (drag_probe_ && drag_probe_->Enabled() &&
+          static_cast<uint32_t>(lparam) == static_cast<uint32_t>(drag_probe_->Snapshot().generation)) {
+        drag_probe_->SetDragging(wparam != 0);
+      }
       return 0;
     case kLocalKeyIdentifiedMessage: {
       if (!identifying_local_key_ || wparam != local_key_identify_token_ || GetForegroundWindow() != owner_) return 0;

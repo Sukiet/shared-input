@@ -1,5 +1,6 @@
 #include "background_hooks.h"
 #include "key_routing.h"
+#include "drag_gesture.h"
 #include <array>
 #include <atomic>
 #include <future>
@@ -81,6 +82,12 @@ class HookRuntime {
     return true;
   }
   void IdentifyKey(uint32_t token) { identify_ = token; }
+  void ObserveDrag(uint32_t token) {
+    const auto x = GetSystemMetrics(SM_CXDRAG), y = GetSystemMetrics(SM_CYDRAG);
+    drag_threshold_x_ = x > 0 ? x : 4;
+    drag_threshold_y_ = y > 0 ? y : 4;
+    drag_observer_ = token;
+  }
   void ReleaseFor(uint32_t generation, ReleaseCause cause) {
     // One CAS preserves the first cause, unblocks, and rejects old generations.
     release_.Record(generation, cause);
@@ -118,6 +125,7 @@ class HookRuntime {
     mouse_seen_ = keyboard_seen_ = 0;
     pump_seen_ = 0;
     pressed_.fill(false); identify_drain_.fill(false); routing_.Reset(); identify_ = 0; remote_buttons_ = 0;
+    drag_observer_ = 0; drag_observed_ = 0; drag_gesture_ = DragGesture(); drag_notified_ = false;
   }
  public:
   static LRESULT CALLBACK Keyboard(int code, WPARAM message, LPARAM data) {
@@ -187,6 +195,20 @@ class HookRuntime {
       case WM_XBUTTONDOWN: down = true; [[fallthrough]];
       case WM_XBUTTONUP: button = HIWORD(input.mouseData) == XBUTTON1 ? 3 : 4; break;
     }
+    const auto observer = self->drag_observer_.load();
+    if (observer) {
+      if (observer != self->drag_observed_) {
+        self->drag_observed_ = observer; self->drag_gesture_ = DragGesture(); self->drag_notified_ = false;
+      }
+      if (button >= 0 && button < 2) self->drag_gesture_.Button(static_cast<unsigned>(button), down, input.pt.x, input.pt.y);
+      if (message == WM_MOUSEMOVE) self->drag_gesture_.Move(input.pt.x, input.pt.y,
+          self->drag_threshold_x_.load(), self->drag_threshold_y_.load());
+      const bool dragging = self->drag_gesture_.Active();
+      if (dragging != self->drag_notified_) {
+        self->drag_notified_ = dragging;
+        PostMessageW(self->owner_, self->stop_message_ + 3, dragging ? 1 : 0, observer);
+      }
+    }
     bool remote = ownership.blocking;
     if (button >= 0) {
       const unsigned mask = 1u << button;
@@ -235,6 +257,11 @@ class HookRuntime {
   std::array<std::atomic<bool>, 256> local_keys_{};
   std::atomic<uint32_t> identify_{0};
   KeyRouting routing_;
+  std::atomic<uint32_t> drag_observer_{0};
+  std::atomic<int> drag_threshold_x_{4}, drag_threshold_y_{4};
+  uint32_t drag_observed_ = 0;
+  DragGesture drag_gesture_;
+  bool drag_notified_ = false;
   unsigned remote_buttons_ = 0;
   HHOOK keyboard_ = nullptr, mouse_ = nullptr;
   DWORD thread_id_ = 0;
@@ -251,6 +278,7 @@ bool SharedHooksInstall(HWND owner, UINT message, int key, bool shift) { return 
 bool SharedHooksBegin(uint32_t generation) { return runtime.Begin(generation); }
 bool SharedHooksSetLocalKeys(const int* keys, unsigned count) { return runtime.SetLocalKeys(keys, count); }
 void SharedHooksIdentifyKey(uint32_t token) { runtime.IdentifyKey(token); }
+void SharedHooksObserveDrag(uint32_t token) { runtime.ObserveDrag(token); }
 void SharedHooksRelease() { runtime.Release(); }
 void SharedHooksResetRelease(uint32_t generation) { runtime.ResetRelease(generation); }
 void SharedHooksReleaseFor(uint32_t generation, ReleaseCause cause) { runtime.ReleaseFor(generation, cause); }

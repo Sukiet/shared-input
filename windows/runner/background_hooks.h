@@ -16,6 +16,7 @@ SHARED_HOOK_API bool SharedHooksInstall(HWND owner, UINT message, int key, bool 
 SHARED_HOOK_API bool SharedHooksBegin(uint32_t generation);
 SHARED_HOOK_API bool SharedHooksSetLocalKeys(const int* keys, unsigned count);
 SHARED_HOOK_API void SharedHooksIdentifyKey(uint32_t token);
+SHARED_HOOK_API void SharedHooksObserveDrag(uint32_t token);
 SHARED_HOOK_API void SharedHooksRelease();
 SHARED_HOOK_API void SharedHooksResetRelease(uint32_t generation);
 SHARED_HOOK_API void SharedHooksReleaseFor(uint32_t generation, ReleaseCause cause);
@@ -41,6 +42,7 @@ class BackgroundHooks {
   bool Begin(uint32_t generation = 0) { return SharedHooksBegin(generation); }
   bool SetLocalKeys(const int* keys, unsigned count) { return SharedHooksSetLocalKeys(keys, count); }
   void IdentifyKey(uint32_t token) { SharedHooksIdentifyKey(token); }
+  void ObserveDrag(uint32_t token) { SharedHooksObserveDrag(token); }
   void Release() { SharedHooksRelease(); }
   void ResetRelease(uint32_t generation) { SharedHooksResetRelease(generation); }
   void ReleaseFor(uint32_t generation, ReleaseCause cause) { SharedHooksReleaseFor(generation, cause); }

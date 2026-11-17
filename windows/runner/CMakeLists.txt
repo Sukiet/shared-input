@@ -13,6 +13,7 @@ add_executable(${BINARY_NAME} WIN32
   "clipboard_image.cpp"
   "audio_output_monitor.cpp"
   "audio_playback_bridge.cpp"
+  "edge_drag_probe.cpp"
   "remote_receiver.cpp"
   "main.cpp"
   "utils.cpp"
@@ -51,6 +52,7 @@ target_link_libraries(${BINARY_NAME} PRIVATE "winmm.lib")
 target_link_libraries(${BINARY_NAME} PRIVATE "imm32.lib")
 target_link_libraries(${BINARY_NAME} PRIVATE "windowscodecs.lib" "ole32.lib" "gdi32.lib")
 target_link_libraries(${BINARY_NAME} PRIVATE "ws2_32.lib" "bcrypt.lib" "avrt.lib")
+target_link_libraries(${BINARY_NAME} PRIVATE "shell32.lib")
 target_include_directories(${BINARY_NAME} PRIVATE "${CMAKE_SOURCE_DIR}")
 
 # Run the Flutter tool portions of the build. This must not be removed.

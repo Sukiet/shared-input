@@ -10,6 +10,7 @@ import 'audio_sync.dart';
 import 'audio_sync_mode.dart';
 import 'local_key.dart';
 import 'local_key_panel.dart';
+import 'edge_drag_preview.dart';
 import 'private_text_field.dart';
 import 'sensitivity.dart';
 import 'scroll_speed.dart';
@@ -73,6 +74,7 @@ class _InputPageState extends State<InputPage> with WidgetsBindingObserver {
   static const _channel = MethodChannel('shared_input/dry_run');
   final _stats = ValueNotifier<Map<String, dynamic>>({});
   final _audioOutput = ValueNotifier(const AudioOutputInfo());
+  final _dragPreview = ValueNotifier(const EdgeDragPreview());
   bool _readingAudioOutput = false;
   final _speedText = TextEditingController(text: '0.1000');
   final _scrollSpeedText = TextEditingController(text: '3.00');
@@ -109,6 +111,7 @@ class _InputPageState extends State<InputPage> with WidgetsBindingObserver {
       !_receiving &&
       !_active &&
       !_recording &&
+      !_dragPreview.value.enabled &&
       _identify == null &&
       (_settings.edgeSwitchEnabled || (_keyboard != null && _mouse != null)) &&
       _shortcut != null &&
@@ -347,6 +350,8 @@ class _InputPageState extends State<InputPage> with WidgetsBindingObserver {
     if (!mounted) return;
     final data = Map<String, dynamic>.from(call.arguments as Map? ?? {});
     switch (call.method) {
+      case 'edgeDragProbeChanged':
+        _setDragPreview(data);
       case 'localKeyIdentified':
         if (_identifyingLocalKey) {
           _identifyingLocalKey = false;
@@ -465,6 +470,24 @@ class _InputPageState extends State<InputPage> with WidgetsBindingObserver {
         _status = '按 Ctrl + Alt + 字母或 F6～F11，Esc 取消。';
       });
     }
+  });
+
+  void _setDragPreview(Map<String, dynamic> data) {
+    if (!mounted) return;
+    final value = EdgeDragPreview.fromMap(data);
+    if (value.revision < _dragPreview.value.revision) return;
+    final changed = value.enabled != _dragPreview.value.enabled;
+    _dragPreview.value = value;
+    if (changed) setState(() {});
+  }
+
+  Future<void> _toggleDragPreview(bool enabled) => _perform(() async {
+    final data = await _channel.invokeMapMethod<String, dynamic>('edgeDragProbe', {'enabled': enabled});
+    if (data != null) _setDragPreview(data);
+  });
+  Future<void> _clearDragPreview() => _perform(() async {
+    final data = await _channel.invokeMapMethod<String, dynamic>('edgeDragProbeClear');
+    if (data != null) _setDragPreview(data);
   });
 
   Future<void> _configureLocalKeys(List<LocalKeyException> keys) => _channel.invokeMethod<void>(
@@ -780,6 +803,10 @@ class _InputPageState extends State<InputPage> with WidgetsBindingObserver {
 
   Future<void> _switchRole(int index) => _perform(() async {
     ++_edgeGeneration;
+    if (_captureSupported && _dragPreview.value.enabled) {
+      final data = await _channel.invokeMapMethod<String, dynamic>('edgeDragProbe', {'enabled': false});
+      if (data != null) _setDragPreview(data);
+    }
     if (_controlRun != null) await _requestControlStop('role_changed');
     await _lan.endCapture();
     await _lan.close();
@@ -837,6 +864,11 @@ class _InputPageState extends State<InputPage> with WidgetsBindingObserver {
     _channel.setMethodCallHandler(null);
     _stats.dispose();
     _audioOutput.dispose();
+    if (_captureSupported) {
+      unawaited(_channel.invokeMethod<Object?>('edgeDragProbe', {'enabled': false})
+        .then<void>((_) {}).catchError((Object _) {}));
+    }
+    _dragPreview.dispose();
     _returnHistory.dispose();
     _speedText.dispose();
     _scrollSpeedText.dispose();
@@ -1710,6 +1742,16 @@ class _InputPageState extends State<InputPage> with WidgetsBindingObserver {
         const SizedBox(height: 16),
         LocalKeyPanel(keys: _settings.localKeys, enabled: _ready && !_active && !_busy && !_recording && _identify == null,
           onAdd: _addLocalKey, onRemove: _removeLocalKey),
+      ],
+      if (_captureSupported) ...[
+        const SizedBox(height: 16),
+        ValueListenableBuilder<EdgeDragPreview>(valueListenable: _dragPreview,
+          builder: (_, preview, _) => EdgeDragPreviewPanel(
+            preview: preview, edgeLabel: '${_settings.displayLayout.side.label}边缘',
+            canChange: _ready && !_active && !_busy && !_recording && _identify == null,
+            onChanged: _toggleDragPreview, onClear: _clearDragPreview,
+          ),
+        ),
       ],
       const SizedBox(height: 16),
       ControlReturnLogPanel(
