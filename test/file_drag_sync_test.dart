@@ -167,6 +167,26 @@ void main() {
       expect(source.connected && target.connected, true);
     },
   );
+
+  test('startup phases are visible and the first failure survives cancellation cleanup', () async {
+    final drag = 'e' * 32;
+    receiver.onNativeEvent('fileDragSessionState', {'drag': drag, 'phase': 'awaitingDown'});
+    await eventually(() => sender.status == 'Mac 来源窗口等待按下事件');
+    receiver.onNativeEvent('fileDragSessionState', {'drag': drag, 'phase': 'starting', 'sourceEventNumber': 61});
+    await eventually(() => sender.status == 'Mac 已收到按下，正在启动文件拖拽');
+    receiver.onNativeEvent('fileDragSessionState', {'drag': drag, 'phase': 'ended', 'unexpected': true,
+      'error': 'Mac 已收到按下，但 AppKit 未启动文件拖拽', 'startupPhase': 'starting', 'elapsedMs': 1003});
+    await eventually(() => sender.status == 'Mac 已收到按下，但 AppKit 未启动文件拖拽');
+    receiver.onNativeEvent('fileDragSessionState', {'drag': drag, 'phase': 'ended', 'unexpected': false,
+      'accepted': false, 'elapsedMs': 1010});
+    await Future<void>.delayed(const Duration(milliseconds: 40));
+    expect(sender.status, 'Mac 已收到按下，但 AppKit 未启动文件拖拽');
+    expect(sender.lastSessionState['unexpected'], true);
+    expect(sender.lastSessionState['elapsedMs'], 1003);
+    expect(sender.lastSessionState['startupPhase'], 'starting');
+    receiver.onNativeEvent('fileDragSessionState', {'drag': 'f' * 32, 'phase': 'awaitingDown'});
+    await eventually(() => sender.status == 'Mac 来源窗口等待按下事件');
+  });
   test(
     'late OLE metadata may join the same physical press before crossing',
     () async {

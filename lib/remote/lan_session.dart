@@ -2,12 +2,20 @@ import 'dart:async';
 import 'dart:convert';
 import 'dart:io';
 import 'package:flutter/foundation.dart';
+import 'package:flutter/services.dart';
 import '../settings.dart';
 import '../scroll_speed.dart';
 import 'protocol.dart';
 import 'wire.dart';
 import 'clipboard_channel.dart';
 import 'input_diagnostics.dart';
+
+class RemoteCaptureException implements Exception {
+  const RemoteCaptureException(this.message);
+  final String message;
+  @override
+  String toString() => message;
+}
 
 class LanSession extends ChangeNotifier {
   bool fileDragSupported = false, fileDragSource = false, fileDragTarget = false, supportsFileDrag = false;
@@ -541,7 +549,10 @@ class LanSession extends ChangeNotifier {
               }
               _changed();
             } catch (error) {
-              await wire.send({'type': 'rejected', 'message': '$error'});
+              final message = error is PlatformException ? error.message ?? error.code
+                  : error is StateError ? error.message
+                  : error is FormatException ? error.message : '$error';
+              await wire.send({'type': 'rejected', 'message': message});
             }
           case 'begun':
             if (json['capture'] == _capture) {
@@ -550,7 +561,7 @@ class LanSession extends ChangeNotifier {
             }
           case 'rejected':
             _startAck?.completeError(
-              StateError(json['message'] as String? ?? '被控端未允许输入。'),
+              RemoteCaptureException(json['message'] as String? ?? '被控端未允许输入。'),
             );
             _startAck = null;
             _capture = null;

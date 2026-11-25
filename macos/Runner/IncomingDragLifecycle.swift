@@ -4,7 +4,10 @@ struct IncomingDragLifecycle {
   private(set) var phase: Phase = .idle
   private(set) var userReleased = false
   private(set) var cancelled = false
-  var motionAllowed: Bool { phase == .dragging }
+  // AppKit may need the first Dragged event to finish starting. Movement may
+  // bootstrap only after the source view consumed the real down; it must not
+  // depend on willBegin, which would create a circular startup dependency.
+  var motionAllowed: Bool { phase == .starting || phase == .dragging }
   var canWritePromise: Bool { userReleased && !cancelled }
   mutating func prepare() { phase = .awaitingDown; userReleased = false; cancelled = false }
   mutating func sourceMouseDown() -> Bool {

@@ -30,6 +30,7 @@ class FileDragSync extends ChangeNotifier {
   String _error = '';
   String _nativeStatus = '';
   Map<String, dynamic> lastSessionState = {};
+  final _failures = <String, Map<String, dynamic>>{};
   Future<void> _work = Future.value();
   String get status => _error.isNotEmpty
       ? _error
@@ -77,6 +78,7 @@ class FileDragSync extends ChangeNotifier {
     _error = '';
     _nativeStatus = '';
     lastSessionState = {};
+    _failures.clear();
     final generation = _generation;
     _work = _work
         .then((_) async {
@@ -266,19 +268,57 @@ class FileDragSync extends ChangeNotifier {
     final id = value['drag'], phase = value['phase'];
     if (id is! String ||
         !RegExp(r'^[a-f0-9]{32}$').hasMatch(id) ||
-        !['dragging', 'ended'].contains(phase)) {
+        !['awaitingDown', 'starting', 'dragging', 'ended'].contains(phase)) {
       return false;
     }
-    lastSessionState = {
+    final rawError = value['error'];
+    final error = rawError is String
+        ? (rawError.length > 1024 ? rawError.substring(0, 1024) : rawError)
+        : null;
+    final state = <String, dynamic>{
       'drag': id,
       'phase': phase,
       'unexpected': value['unexpected'] == true,
       'accepted': value['accepted'] == true,
+      'error': ?error,
+      if ([
+        'idle',
+        'awaitingDown',
+        'starting',
+        'dragging',
+        'released',
+        'cancelling',
+        'ended',
+      ].contains(value['startupPhase']))
+        'startupPhase': value['startupPhase'],
       for (final field in ['elapsedMs', 'sourceEventNumber', 'operation'])
         if (value[field] is int) field: value[field],
       for (final field in ['combinedLeftDown', 'hidLeftDown'])
         if (value[field] is bool) field: value[field],
     };
+    if (value['unexpected'] == true) {
+      if (_failures.length >= 8 && !_failures.containsKey(id)) {
+        _failures.remove(_failures.keys.first);
+      }
+      _failures[id] ??= Map.of(state);
+      for (final entry in state.entries) {
+        _failures[id]!.putIfAbsent(entry.key, () => entry.value);
+      }
+    }
+    lastSessionState = _failures[id] ?? state;
+    if (lastSessionState['unexpected'] == true) {
+      _nativeStatus =
+          lastSessionState['error'] as String? ?? 'Mac 文件拖拽提前结束，已停止鼠标拖拽转发';
+      _changed();
+      return true;
+    }
+    if (phase == 'awaitingDown' || phase == 'starting') {
+      _nativeStatus = phase == 'awaitingDown'
+          ? 'Mac 来源窗口等待按下事件'
+          : 'Mac 已收到按下，正在启动文件拖拽';
+      _changed();
+      return true;
+    }
     _nativeStatus = phase == 'dragging'
         ? 'Mac 文件拖拽进行中'
         : value['unexpected'] == true

@@ -19,7 +19,9 @@ final class RemoteInputBridge {
         self.emitMotionLocked(self.interpolator.target)
       }
       self.lock.unlock()
-      if active { self.channel.invokeMethod("fileDragSessionState", arguments: ["drag": id, "phase": "dragging"]) }
+    }
+    files.stateChanged = { [weak self] state in
+      self?.channel.invokeMethod("fileDragSessionState", arguments: state)
     }
     files.sessionEnded = { [weak self] state in
       guard let self = self else { return }
@@ -389,24 +391,31 @@ final class RemoteInputBridge {
           self.lock.lock(); defer { self.lock.unlock() }
           return self.capture == id && self.incomingFileActive && self.incomingFileID == (fileDrag["drag"] as? String)
         }) { [weak self] error in
-          guard let self = self else {
-            result(FlutterError(code: "file_drag_failed", message: "接收已结束", details: nil)); return
-          }
+          guard let self = self else { return }
           self.lock.lock()
           let active = self.capture == id && self.incomingFileID == (fileDrag["drag"] as? String) && self.incomingFileActive
           if error != nil && active { self.releaseLocked(parkCursor: false) }
           self.lock.unlock()
-          if let error = error {
+          if let error = error, active {
             self.dragProbe.suppressIncomingFileDrag(false)
-            result(FlutterError(code: "file_drag_failed", message: error, details: nil))
-          } else if active { result(nil) }
-          else { result(FlutterError(code: "file_drag_failed", message: "文件拖拽已取消", details: nil)) }
+            self.channel.invokeMethod("fileDragSessionState", arguments: [
+              "drag": fileDrag["drag"] as? String ?? "", "phase": "ended",
+              "unexpected": true, "accepted": false, "inputStopped": true, "error": error])
+          }
         }
-        if !prepared {
+        lock.lock()
+        let stillPrepared = capture == id && incomingFileActive && incomingFileID == (fileDrag["drag"] as? String)
+        lock.unlock()
+        if !prepared || !stillPrepared {
           dragProbe.suppressIncomingFileDrag(false); stop(parkCursor: false)
           result(FlutterError(code: "file_drag_failed", message: "Mac 无法准备文件拖拽", details: nil))
+        } else {
+          // Ack transport preparation now. Windows cannot send the movement
+          // needed to start AppKit until it receives this acknowledgement.
+          NSLog("Shared Input incoming file drag transport ready: %@", id)
+          result(nil)
         }
-        return // Ack only after AppKit's willBegin callback, not after preparation.
+        return
       }
       result(nil)
     case "receiverHeartbeat":

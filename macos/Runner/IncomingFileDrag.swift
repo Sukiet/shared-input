@@ -49,6 +49,12 @@ private final class IncomingDragView: NSView {
   override func acceptsFirstMouse(for event: NSEvent?) -> Bool { true }
   override func mouseDown(with event: NSEvent) { pressed?(event) }
   override func mouseUp(with event: NSEvent) { released?() }
+  override func draw(_ dirtyRect: NSRect) {
+    // A fully empty surface may be excluded from ordinary mouse hit testing.
+    // This temporary two-point source has one alpha quantum, not a visible bar.
+    NSColor.black.withAlphaComponent(1.0 / 255.0).setFill()
+    bounds.fill()
+  }
 }
 
 private final class FilePromiseWrite {
@@ -97,10 +103,12 @@ final class IncomingFileDrag: NSObject, NSDraggingSource, NSFilePromiseProviderD
   private var preparedItems: [NSDraggingItem] = []
   private var lifecycle = IncomingDragLifecycle()
   private var startCompletion: ((String?) -> Void)?
+  private var startupTimer: Timer?
   private var startedAt = 0.0
   private var sourceEventNumber = -1
   var sessionStarted: ((String) -> Void)?
   var sessionEnded: (([String: Any]) -> Void)?
+  var stateChanged: (([String: Any]) -> Void)?
   // A bounded retain set keeps promise delegates alive after a drop, while a
   // later screen crossing may already start a new drag.
   private var offered: [String: [String: IncomingDragItem]] = [:]
@@ -133,7 +141,8 @@ final class IncomingFileDrag: NSObject, NSDraggingSource, NSFilePromiseProviderD
     let panel = IncomingDragPanel(contentRect: NSRect(x: point.x - 1, y: point.y - 1, width: 2, height: 2),
       styleMask: [.borderless, .nonactivatingPanel], backing: .buffered, defer: false)
     panel.isOpaque = false; panel.backgroundColor = .clear; panel.hasShadow = false
-    panel.level = .floating; panel.hidesOnDeactivate = false
+    panel.level = .statusBar; panel.hidesOnDeactivate = false
+    panel.ignoresMouseEvents = false; panel.animationBehavior = .none
     panel.collectionBehavior = [.canJoinAllSpaces, .fullScreenAuxiliary]
     let view = IncomingDragView(frame: NSRect(x: 0, y: 0, width: 2, height: 2))
     view.pressed = { [weak self, weak view] event in
@@ -143,6 +152,7 @@ final class IncomingFileDrag: NSObject, NSDraggingSource, NSFilePromiseProviderD
     view.released = { [weak self] in self?.sourceMouseUp(id: id) }
     panel.contentView = view
     panel.orderFrontRegardless()
+    panel.displayIfNeeded()
     self.panel = panel
     providers = items.map { item in
       let provider = NSFilePromiseProvider(fileType: item.contentType.identifier, delegate: self)
@@ -200,21 +210,41 @@ final class IncomingFileDrag: NSObject, NSDraggingSource, NSFilePromiseProviderD
     }
     // Source stays hit-testable until the session ends. Making it transparent
     // here can route the still-queued down into Finder and replace the drag.
-    DispatchQueue.main.asyncAfter(deadline: .now() + .seconds(1)) { [weak self] in
+    let timeout = Timer(timeInterval: 1, repeats: false) { [weak self] _ in
       guard let self = self, self.drag == id else { return }
       self.mutex.lock()
       let pending = self.startCompletion != nil
+      let phase = self.lifecycle.phase
       self.mutex.unlock()
-      if pending { self.cancelDrag(); self.finishStart("Mac 未收到有效的文件拖拽启动事件") }
+      if pending {
+        if phase == .cancelling || phase == .ended {
+          self.finishStart("文件拖拽已取消")
+          return
+        }
+        let error = phase == .awaitingDown ? "Mac 来源窗口未收到按下事件"
+          : "Mac 已收到按下，但 AppKit 未启动文件拖拽"
+        self.reportState("ended", error: error, startupPhase: phase.rawValue)
+        self.cancelDrag(); self.finishStart(error)
+      }
     }
+    startupTimer?.invalidate(); startupTimer = timeout
+    RunLoop.main.add(timeout, forMode: .common)
+    reportState("awaitingDown")
     return true
   }
 
   var motionAllowed: Bool { mutex.lock(); defer { mutex.unlock() }; return lifecycle.motionAllowed }
 
   private func sourceMouseDown(_ event: NSEvent, view: NSView, id: String) {
-    guard drag == id, view.window === panel,
-          event.cgEvent?.getIntegerValueField(.eventSourceUserData) == ReceiverCursorVisibility.remoteEventTag else { return }
+    guard drag == id, view.window === panel else { return }
+    let ownEvent = event.cgEvent.map {
+      $0.getIntegerValueField(.eventSourceUserData) == ReceiverCursorVisibility.remoteEventTag ||
+        $0.getIntegerValueField(.eventSourceUnixProcessID) == Int64(getpid())
+    } ?? false
+    guard ownEvent else {
+      NSLog("Shared Input incoming file drag ignored foreign down: event=%ld", event.eventNumber)
+      return
+    }
     mutex.lock()
     let begin = lifecycle.sourceMouseDown()
     if begin { sourceEventNumber = event.eventNumber }
@@ -222,12 +252,14 @@ final class IncomingFileDrag: NSObject, NSDraggingSource, NSFilePromiseProviderD
     guard begin else { return }
     NSLog("Shared Input incoming file drag source down: event=%ld window=%ld",
       event.eventNumber, event.windowNumber)
+    reportState("starting")
     let session = view.beginDraggingSession(with: preparedItems, event: event, source: self)
     session.animatesToStartingPositionsOnCancelOrFail = false
     mutex.lock(); self.session = session; mutex.unlock()
   }
 
   private func finishStart(_ error: String?) {
+    startupTimer?.invalidate(); startupTimer = nil
     mutex.lock(); let completion = startCompletion; startCompletion = nil; mutex.unlock()
     completion?(error)
   }
@@ -254,7 +286,7 @@ final class IncomingFileDrag: NSObject, NSDraggingSource, NSFilePromiseProviderD
     if let id = drag { writable.remove(id) }
     mutex.unlock()
     if cancel { postEscape() }
-    DispatchQueue.main.async { [weak self] in
+    RunLoop.main.perform(inModes: [.common]) { [weak self] in
       guard let self = self, self.drag == id else { return }
       self.finishStart("文件拖拽已取消")
     }
@@ -280,6 +312,7 @@ final class IncomingFileDrag: NSObject, NSDraggingSource, NSFilePromiseProviderD
     mutex.lock(); let began = lifecycle.willBegin(); mutex.unlock()
     guard began else { postEscape(); return }
     if let id = drag { sessionStarted?(id) }
+    reportState("dragging")
     finishStart(nil)
   }
   func draggingSession(_ session: NSDraggingSession, endedAt screenPoint: NSPoint, operation: NSDragOperation) {
@@ -299,11 +332,21 @@ final class IncomingFileDrag: NSObject, NSDraggingSource, NSFilePromiseProviderD
       "combinedLeftDown": CGEventSource.buttonState(.combinedSessionState, button: .left),
       "hidLeftDown": CGEventSource.buttonState(.hidSystemState, button: .left)]
     NSLog("Shared Input incoming file drag ended: %@", String(describing: state))
+    startupTimer?.invalidate(); startupTimer = nil
     // Tell the receiver to stop injected dragging before releasing the source
     // window. A failed file session must never become a desktop selection.
     sessionEnded?(state)
     panel?.orderOut(nil); panel = nil; providers = []; preparedItems = []
     mutex.lock(); drag = nil; mutex.unlock()
+  }
+
+  private func reportState(_ phase: String, error: String? = nil, startupPhase: String? = nil) {
+    var state: [String: Any] = ["drag": drag ?? "", "phase": phase,
+      "sourceEventNumber": sourceEventNumber,
+      "elapsedMs": Int((ProcessInfo.processInfo.systemUptime - startedAt) * 1000)]
+    if let error = error { state["error"] = error; state["unexpected"] = true; state["accepted"] = false }
+    if let startupPhase = startupPhase { state["startupPhase"] = startupPhase }
+    stateChanged?(state)
   }
 
   func filePromiseProvider(_ filePromiseProvider: NSFilePromiseProvider, fileNameForType fileType: String) -> String {

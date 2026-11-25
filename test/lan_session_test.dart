@@ -1,5 +1,6 @@
 import 'dart:async';
 import 'package:flutter_test/flutter_test.dart';
+import 'package:flutter/services.dart';
 import 'package:shared_input/remote/lan_session.dart';
 import 'package:shared_input/remote/protocol.dart';
 
@@ -14,6 +15,36 @@ Future<void> eventually(bool Function() condition) async {
 }
 
 void main() {
+  test('file transport preparation lets both motion axes arrive before drag activation', () async {
+    final receiver = LanSession()..fileDragSupported = true..fileDragTarget = true;
+    final controller = LanSession()..fileDragSupported = true..fileDragSource = true;
+    var prepared = false, appKitActive = false;
+    final motions = <Map<String, dynamic>>[];
+    receiver.onPointerInfo = () async => {'width': 1000.0, 'height': 800.0,
+      'x': 24.0, 'y': 300.0, 'left': 0.0, 'top': 0.0, 'sequence': 0};
+    receiver.onBeginWithOptions = (_, options) async { prepared = options['fileDrag'] != null; };
+    receiver.onInput = (_, frames) async { motions.addAll(frames); };
+    try {
+      await receiver.listen(port: 0, key: 'b' * 32, bindAddress: '127.0.0.1');
+      await controller.connect(host: '127.0.0.1', port: receiver.port, key: 'b' * 32);
+      await controller.beginCapture(edgeEntryY: 0.5, fileDrag: {'drag': 'c' * 32,
+        'items': [{'id': 'd' * 32, 'name': 'sample.txt', 'folder': false, 'size': 10}]}).
+        timeout(const Duration(seconds: 1));
+      expect(prepared, true);
+      expect(appKitActive, false);
+      expect(controller.capturing, true);
+      controller.sendInput({'sequence': 1, 'epoch': 0, 'x': 37.25, 'y': -12.5});
+      await eventually(() => motions.isNotEmpty);
+      expect(motions.last['x'], 37.25);
+      expect(motions.last['y'], -12.5);
+      expect(appKitActive, false);
+      appKitActive = true;
+      expect(receiver.capturing, true);
+    } finally {
+      await controller.close(); await receiver.close();
+      controller.dispose(); receiver.dispose();
+    }
+  });
   test('file drag negotiates source/target roles and accompanies edge begin', () async {
     final receiver = LanSession()..fileDragSupported = true..fileDragTarget = true;
     final controller = LanSession()..fileDragSupported = true..fileDragSource = true;
@@ -495,9 +526,21 @@ void main() {
       throw StateError('permission required');
     };
     await connect();
-    await expectLater(controller.beginCapture(), throwsStateError);
+    await expectLater(controller.beginCapture(), throwsA(isA<RemoteCaptureException>().having(
+      (error) => error.message, 'message', 'permission required')));
     expect(controller.capturing, isFalse);
     expect(receiver.capturing, isFalse);
+  });
+
+  test('native startup rejection displays its message without nested exception prefixes', () async {
+    receiver.onBegin = (_) async {
+      throw PlatformException(code: 'file_drag_failed', message: 'Mac 来源窗口未收到按下事件');
+    };
+    await connect();
+    await expectLater(controller.beginCapture(), throwsA(isA<RemoteCaptureException>().having(
+      (error) => error.toString(), 'message', 'Mac 来源窗口未收到按下事件')));
+    expect(controller.capturing, false);
+    expect(controller.connected, true);
   });
 
   test('socket disconnect releases active receiver state', () async {

@@ -9,7 +9,7 @@ struct IncomingDragLifecycleTest {
     check(!state.motionAllowed && !state.willBegin(), "no drag or motion before a real source down")
     check(state.sourceMouseDown(), "real source event starts once")
     check(!state.sourceMouseDown(), "second down cannot replace current drag")
-    check(!state.motionAllowed, "prepare does not acknowledge a running drag")
+    check(state.motionAllowed, "first Dragged can bootstrap AppKit after real source down")
     check(state.willBegin() && state.motionAllowed, "AppKit willBegin enables forwarding")
     check(!state.canWritePromise, "holding is never a completed drop")
     let premature = state.ended(copy: false)
