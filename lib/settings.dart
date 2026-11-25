@@ -49,6 +49,7 @@ class AppSettings {
   double step = 0.0001;
   int sendHz = 500;
   bool smoothingEnabled = true;
+  bool parkCursorOnExit = false;
   String pointerMode = 'interpolation';
   String get effectivePointerMode => pointerMode == 'prediction'
       ? 'prediction'
@@ -107,6 +108,7 @@ class AppSettings {
     'step': step,
     'sendHz': sendHz,
     'smoothingEnabled': smoothingEnabled,
+    'parkCursorOnExit': parkCursorOnExit,
     'pointerMode': effectivePointerMode,
     'prediction': predictionOptions,
     'smoothingDurationMs': smoothingDurationMs,
@@ -178,6 +180,7 @@ class AppSettings {
     if (json['smoothingEnabled'] is bool) {
       result.smoothingEnabled = json['smoothingEnabled'] as bool;
     }
+    result.parkCursorOnExit = json['parkCursorOnExit'] == true;
     int validInt(String key, int min, int max, int fallback) {
       final value = json[key];
       return value is int && value >= min && value <= max ? value : fallback;

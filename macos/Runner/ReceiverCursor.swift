@@ -1,6 +1,14 @@
 import Cocoa
 import Darwin
 
+enum ReceiverCursorParking {
+  static func destination(for point: CGPoint, displays: [CGRect], fallback: CGRect) -> CGPoint {
+    let screen = displays.first { $0.contains(point) } ?? fallback
+    // Quartz display coordinates have their origin at the upper-left corner.
+    return CGPoint(x: screen.minX, y: screen.minY)
+  }
+}
+
 // Mirrors the intent/edge guards of the controller for visual anticipation only.
 // It never ends a capture or changes the pointer feedback sent to Windows.
 struct ReceiverEdgeExit {
@@ -69,9 +77,15 @@ final class ReceiverCursorVisibility {
   private var hidden = false
   private var anticipating = false
   private var localOverride = false
+  private var exitStartedAt: TimeInterval?
   private var globalMonitor: Any?
   private var localMonitor: Any?
   private let setVisible: (Bool) -> Bool
+
+  var canParkOnExit: Bool {
+    lock.lock(); defer { lock.unlock() }
+    return !localOverride
+  }
 
   init(setVisible: @escaping (Bool) -> Bool = { visible in
     // Reassert on each transition, including after foreground/Space changes.
@@ -102,15 +116,21 @@ final class ReceiverCursorVisibility {
   }
 
   func localInput(_ event: NSEvent) {
-    guard event.cgEvent?.getIntegerValueField(.eventSourceUserData) != Self.remoteEventTag else { return }
+    guard let source = event.cgEvent,
+          source.getIntegerValueField(.eventSourceUserData) != Self.remoteEventTag,
+          source.getIntegerValueField(.eventSourceUnixProcessID) != Int64(getpid()),
+          source.getIntegerValueField(.eventSourceStateID) != Int64(CGEventSourceStateID.privateState.rawValue) else { return }
     lock.lock(); defer { lock.unlock() }
+    // AppKit may deliver older events after hiding. Only fresh local input may
+    // override an exit; untagged events from our own process are still remote.
+    guard let started = exitStartedAt, event.timestamp >= started else { return }
     if hidden || anticipating { localOverride = true }
     restoreLocked()
   }
 
   func anticipateExit() {
     lock.lock(); defer { lock.unlock() }
-    guard !anticipating else { return }
+    if !anticipating && !hidden { exitStartedAt = ProcessInfo.processInfo.systemUptime }
     anticipating = true
     if !localOverride { hideLocked() }
   }
@@ -121,6 +141,7 @@ final class ReceiverCursorVisibility {
     anticipating = false
     // A local takeover remains authoritative until a fresh capture begins.
     restoreLocked()
+    exitStartedAt = nil
   }
 
   func hide() {
@@ -134,12 +155,14 @@ final class ReceiverCursorVisibility {
     lock.lock(); defer { lock.unlock() }
     anticipating = false
     localOverride = false
+    exitStartedAt = nil
     restoreLocked()
   }
 
   private func hideLocked() {
     // Keep local recovery available even if monitor installation fails.
     guard !hidden, globalMonitor != nil, localMonitor != nil else { return }
+    if exitStartedAt == nil { exitStartedAt = ProcessInfo.processInfo.systemUptime }
     if setVisible(false) { hidden = true }
   }
 

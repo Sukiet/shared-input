@@ -14,6 +14,7 @@ final class RemoteInputBridge {
   private lazy var audioCapture = AudioCaptureBridge(channel: channel)
   private let cursorVisibility = ReceiverCursorVisibility()
   private var edgeExit = ReceiverEdgeExit()
+  private var parkCursorOnExit = false
   private let lock = NSLock()
   private var timer: DispatchSourceTimer?
   private var motionTimer: DispatchSourceTimer?
@@ -74,7 +75,7 @@ final class RemoteInputBridge {
       self.lock.lock()
       defer { self.lock.unlock() }
       if self.capture != nil && ProcessInfo.processInfo.systemUptime - self.lastReceived >= 1.5 {
-        self.releaseLocked()
+        self.releaseLocked(hideCursor: true)
       }
     }
     timer.resume()
@@ -91,7 +92,7 @@ final class RemoteInputBridge {
       guard self.capture != nil else { return }
       // Do not emit delayed motion after a stalled connection has timed out.
       let now = ProcessInfo.processInfo.systemUptime
-      if now - self.lastReceived >= 1.5 { self.releaseLocked(); return }
+      if now - self.lastReceived >= 1.5 { self.releaseLocked(hideCursor: true); return }
       let point: CGPoint
       if self.predictionEnabled && self.heldButtons.isEmpty && self.lastPredictionSource > 0 {
         point = self.predictionOutput.update(self.constrained(self.predictor.value(at: now)), at: now)
@@ -102,11 +103,11 @@ final class RemoteInputBridge {
     motionTimer.resume()
     self.motionTimer = motionTimer
   }
-  deinit { motionTimer?.cancel(); timer?.cancel(); clipboard.reset(); dragProbe.shutdown(); stop() }
-  func shutdown() { screenPolicy.reset(); clipboard.reset(); stop(); dragProbe.shutdown(); audioCapture.shutdown() }
-  func stop(hideCursor: Bool = false) {
+  deinit { motionTimer?.cancel(); timer?.cancel(); clipboard.reset(); dragProbe.shutdown(); stop(parkCursor: false) }
+  func shutdown() { screenPolicy.reset(); clipboard.reset(); stop(parkCursor: false); dragProbe.shutdown(); audioCapture.shutdown() }
+  func stop(hideCursor: Bool = false, parkCursor: Bool = true) {
     lock.lock(); defer { lock.unlock() }
-    releaseLocked(hideCursor: hideCursor)
+    releaseLocked(hideCursor: hideCursor, parkCursor: parkCursor)
   }
 
   private func handle(_ call: FlutterMethodCall, _ result: @escaping FlutterResult) {
@@ -118,12 +119,12 @@ final class RemoteInputBridge {
     switch call.method {
     case "screenCapabilities": result(["controller": false, "receiver": true])
     case "screenPolicy":
-      if args["lock"] as? Bool == true { stop() }
+      if args["lock"] as? Bool == true { stop(parkCursor: false) }
       screenPolicy.handle(args, result)
     case "initialize":
       screenPolicy.reset()
       clipboard.reset()
-      stop()
+      stop(parkCursor: false)
       dragProbe.configure(enabled: false, side: "left")
       lock.lock(); dragTestEnabled = false; lock.unlock()
       diagnosticsEnabled = args["diagnostics"] as? Bool ?? false
@@ -137,6 +138,14 @@ final class RemoteInputBridge {
       lock.lock(); dragTestEnabled = dragProbe.enabled; dragPixelScale = dragProbe.pixelScale; lock.unlock()
       result(dragProbe.snapshot)
     case "edgeDragProbeClear": dragProbe.clear(); result(dragProbe.snapshot)
+    case "receiverConfigureCursor":
+      guard let enabled = args["parkOnExit"] as? Bool else {
+        result(FlutterError(code: "invalid_cursor_settings", message: "鼠标设置无效。", details: nil)); return
+      }
+      lock.lock()
+      parkCursorOnExit = enabled
+      lock.unlock()
+      result(nil)
     case "receiverConfigureSmoothing":
       guard let enabled = args["enabled"] as? Bool,
             let duration = args["durationMs"] as? Int, (1...100).contains(duration),
@@ -202,6 +211,7 @@ final class RemoteInputBridge {
       let snapshot: [String: Any] = ["x": actual.x, "y": actual.y,
         "left": bounds.minX, "top": bounds.minY, "width": bounds.width,
         "height": bounds.height, "sequence": predicted ? -1 : sequence, "predicted": predicted]
+      if !predicted { updateExitCursorLocked(at: ProcessInfo.processInfo.systemUptime, feedback: actual) }
       lock.unlock()
       result(snapshot)
     case "devices": result([])
@@ -226,7 +236,7 @@ final class RemoteInputBridge {
       let dragScale = dragProbe.pixelScale
       lock.lock()
       dragPixelScale = dragScale
-      releaseLocked()
+      releaseLocked(parkCursor: false)
       capture = id; sequence = -1; total = .zero
       edgeExit = ReceiverEdgeExit(edge: entry == nil ? nil : entrySide,
                                  started: ProcessInfo.processInfo.systemUptime)
@@ -278,7 +288,7 @@ final class RemoteInputBridge {
       }
       for frame in frames {
         guard apply(frame) else {
-          releaseLocked()
+          releaseLocked(hideCursor: true)
           result(FlutterError(code: "invalid_input", message: "无效输入，已释放按键。", details: nil)); return
         }
       }
@@ -435,7 +445,7 @@ final class RemoteInputBridge {
     }
     return true
   }
-  private func releaseLocked(hideCursor: Bool = false) {
+  private func releaseLocked(hideCursor: Bool = false, parkCursor: Bool = true) {
     let wasCapturing = capture != nil
     predictor.reset(position); lastPredictionSource = 0
     predictionOutput.reset(position, at: ProcessInfo.processInfo.systemUptime)
@@ -458,17 +468,43 @@ final class RemoteInputBridge {
     lastInputTime = nil
     wheelX = 0; wheelY = 0; caps = false
     if let token = activity { ProcessInfo.processInfo.endActivity(token); activity = nil }
+    if wasCapturing && parkCursor && parkCursorOnExit && cursorVisibility.canParkOnExit {
+      parkCursorLocked()
+    }
     if hideCursor {
       if wasCapturing { cursorVisibility.hide() }
     } else { cursorVisibility.show() }
   }
 
-  private func updateExitCursorLocked(at now: TimeInterval) {
+  private func parkCursorLocked() {
+    let actual = CGEvent(source: nil)?.location ?? position
+    var displays = [CGDirectDisplayID](repeating: 0, count: 32)
+    var count: UInt32 = 0
+    let bounds: [CGRect]
+    if CGGetActiveDisplayList(32, &displays, &count) == .success {
+      bounds = displays.prefix(Int(count)).map { CGDisplayBounds($0) }
+    } else { bounds = [] }
+    let destination = ReceiverCursorParking.destination(for: actual, displays: bounds,
+                                                      fallback: CGDisplayBounds(CGMainDisplayID()))
+    // Warping does not inject a movement event or wake the local-input monitor.
+    guard CGWarpMouseCursorPosition(destination) == .success else { return }
+    // Queue the final position after earlier injected motion/button releases,
+    // which otherwise can pull the cursor back after the synchronous warp.
+    post(CGEvent(mouseEventSource: source, mouseType: .mouseMoved,
+                 mouseCursorPosition: destination, mouseButton: .left))
+    position = destination
+    let now = ProcessInfo.processInfo.systemUptime
+    interpolator.reset(destination, at: now)
+    predictor.reset(destination)
+    predictionOutput.reset(destination, at: now)
+  }
+
+  private func updateExitCursorLocked(at now: TimeInterval, feedback: CGPoint? = nil) {
     guard capture != nil, edgeExit.edge != nil else { return }
-    let confirmed = predictionEnabled ? predictor.confirmed : interpolator.target
+    let confirmed = feedback ?? (predictionEnabled ? predictor.confirmed : interpolator.target)
     let bounds = CGDisplayBounds(CGMainDisplayID())
     let held = !heldKeys.isEmpty || (!dragTestEnabled && !heldButtons.isEmpty)
-    if edgeExit.shouldHide(rendered: position, confirmed: confirmed, bounds: bounds, held: held, at: now) {
+    if edgeExit.shouldHide(rendered: feedback ?? position, confirmed: confirmed, bounds: bounds, held: held, at: now) {
       // Cosmetic anticipation only: keep feedback and input alive until Windows
       // actually ends this capture. Never use a predicted-only edge crossing.
       cursorVisibility.anticipateExit()

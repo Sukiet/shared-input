@@ -643,6 +643,39 @@ void main() {
     variant: TargetPlatformVariant.only(TargetPlatform.macOS),
   );
 
+  testWidgets(
+    'Mac receiver cursor parking is visible, applies live and persists',
+    (tester) async {
+      final store = MemorySettingsStore()
+        ..value = jsonEncode(
+          (AppSettings()..role = InputRole.receiver).toJson(),
+        );
+      await open(tester, width: 600, store: store);
+      Map<dynamic, dynamic> applied() =>
+          calls
+                  .lastWhere((call) => call.method == 'receiverConfigureCursor')
+                  .arguments
+              as Map;
+      final toggle = find.byKey(const Key('park-cursor-on-exit'));
+      expect(find.text('控制结束后移至左上角'), findsOneWidget);
+      expect(tester.widget<SwitchListTile>(toggle).value, isFalse);
+      expect(applied()['parkOnExit'], isFalse);
+      await tester.tap(toggle);
+      await tester.pumpAndSettle();
+      expect(applied()['parkOnExit'], isTrue);
+      expect(jsonDecode(store.value!)['parkCursorOnExit'], isTrue);
+      await tester.pumpWidget(const SizedBox.shrink());
+      await open(tester, width: 600, store: store);
+      expect(tester.widget<SwitchListTile>(toggle).value, isTrue);
+      expect(applied()['parkOnExit'], isTrue);
+      await tester.tap(toggle);
+      await tester.pumpAndSettle();
+      expect(applied()['parkOnExit'], isFalse);
+      expect(tester.takeException(), isNull);
+    },
+    variant: TargetPlatformVariant.only(TargetPlatform.macOS),
+  );
+
   testWidgets('Mac receiver smoothing applies live, persists and resets', (
     tester,
   ) async {

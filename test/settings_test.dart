@@ -77,6 +77,7 @@ void main() {
       ..step = 0.001
       ..sendHz = 1000
       ..smoothingEnabled = false
+      ..parkCursorOnExit = true
       ..smoothingDurationMs = 32
       ..smoothingIntervalMs = 2
       ..smoothingLeewayUs = 100
@@ -91,6 +92,8 @@ void main() {
     expect(restored.screenPolicyEnabled, true);
     expect(AppSettings.fromJson({}).screenPolicyEnabled, false);
     expect(AppSettings.fromJson({'screenPolicyEnabled': 'true'}).screenPolicyEnabled, false);
+    expect(restored.parkCursorOnExit, isTrue);
+    expect(AppSettings.fromJson({}).parkCursorOnExit, isFalse);
     expect(restored.toJson().containsKey('active'), isFalse);
     expect(restored.toJson().containsKey('connected'), isFalse);
   });
@@ -105,6 +108,7 @@ void main() {
       'step': -1,
       'listenKey': 'short',
       'smoothingEnabled': 'false',
+      'parkCursorOnExit': 'true',
       'smoothingDurationMs': 0,
       'smoothingIntervalMs': 17,
       'smoothingLeewayUs': -1,
@@ -115,6 +119,7 @@ void main() {
     expect(settings.shortcut, isNull);
     expect(settings.sensitivity, 0.1);
     expect(settings.listenKey.length, 32);
+    expect(settings.parkCursorOnExit, isFalse);
     expect(settings.smoothingOptions, {
       'enabled': true,
       'durationMs': 12,

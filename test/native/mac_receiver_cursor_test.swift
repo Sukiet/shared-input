@@ -3,6 +3,20 @@ import Cocoa
 @main
 struct ReceiverCursorTests {
   static func main() {
+    let primary = CGRect(x: 0, y: 0, width: 1920, height: 1080)
+    let left = CGRect(x: -1280, y: 200, width: 1280, height: 800)
+    let above = CGRect(x: 300, y: -900, width: 1440, height: 900)
+    let displays = [primary, left, above]
+    precondition(ReceiverCursorParking.destination(for: CGPoint(x: 100, y: 100),
+      displays: displays, fallback: primary) == .zero)
+    precondition(ReceiverCursorParking.destination(for: CGPoint(x: -100, y: 300),
+      displays: displays, fallback: primary) == CGPoint(x: -1280, y: 200))
+    precondition(ReceiverCursorParking.destination(for: CGPoint(x: 500, y: -500),
+      displays: displays, fallback: primary) == CGPoint(x: 300, y: -900))
+    precondition(ReceiverCursorParking.destination(for: CGPoint(x: 5000, y: 5000),
+      displays: displays, fallback: primary) == .zero)
+    precondition(ReceiverCursorParking.destination(for: .zero,
+      displays: [], fallback: primary) == .zero)
     let bounds = CGRect(x: -200, y: -100, width: 1000, height: 800)
     let center = CGPoint(x: 300, y: 300)
     for (side, dx, dy, point) in [
@@ -39,10 +53,14 @@ struct ReceiverCursorTests {
     _ = NSApplication.shared
     let backend = CursorBackend()
     var cursor: ReceiverCursorVisibility? = ReceiverCursorVisibility(setVisible: backend.setVisible)
-    func mouse(_ type: CGEventType = .mouseMoved, remote: Bool = false) -> NSEvent {
+    precondition(cursor!.canParkOnExit)
+    func mouse(_ type: CGEventType = .mouseMoved, remote: Bool = false,
+               ownProcess: Bool = false, stale: Bool = false) -> NSEvent {
       let event = CGEvent(mouseEventSource: nil, mouseType: type,
                           mouseCursorPosition: .zero, mouseButton: .left)!
       if remote { event.setIntegerValueField(.eventSourceUserData, value: ReceiverCursorVisibility.remoteEventTag) }
+      if !ownProcess { event.setIntegerValueField(.eventSourceUnixProcessID, value: 0) }
+      event.timestamp = stale ? 1 : DispatchTime.now().uptimeNanoseconds
       return NSEvent(cgEvent: event)!
     }
     cursor!.anticipateExit()
@@ -52,9 +70,16 @@ struct ReceiverCursorTests {
     precondition(backend.hides == 1, "one balanced hide across anticipation and actual end")
     cursor!.localInput(mouse(remote: true))
     precondition(!backend.visible, "queued injected event must not restore cursor")
+    cursor!.localInput(mouse(ownProcess: true))
+    precondition(!backend.visible, "missing user-data tag must not turn our event into local input")
+    cursor!.localInput(mouse(stale: true))
+    precondition(!backend.visible && cursor!.canParkOnExit,
+                 "old local events must not suppress hiding or parking for this exit")
     cursor!.localInput(mouse())
     precondition(backend.visible)
+    precondition(!cursor!.canParkOnExit, "late end must not move a locally resumed cursor")
     cursor!.show() // Fresh capture clears local override.
+    precondition(cursor!.canParkOnExit)
     cursor!.anticipateExit()
     cursor!.localInput(mouse())
     cursor!.anticipateExit()
@@ -79,21 +104,34 @@ struct ReceiverCursorTests {
     cursor!.hide()
     let scroll = CGEvent(scrollWheelEvent2Source: nil, units: .pixel,
                          wheelCount: 1, wheel1: 1, wheel2: 0, wheel3: 0)!
+    scroll.setIntegerValueField(.eventSourceUnixProcessID, value: 0)
+    scroll.timestamp = DispatchTime.now().uptimeNanoseconds
     cursor!.localInput(NSEvent(cgEvent: scroll)!)
     precondition(backend.visible, "native trackpad/mouse scroll restores cursor")
     cursor!.show()
     cursor!.hide()
     cursor = nil
     precondition(backend.visible && backend.hides == backend.shows, "cleanup must balance hide counts")
+    let retryBackend = CursorBackend()
+    retryBackend.failNextHide = true
+    let retry = ReceiverCursorVisibility(setVisible: retryBackend.setVisible)
+    retry.anticipateExit()
+    precondition(retryBackend.visible)
+    retry.anticipateExit()
+    precondition(!retryBackend.visible, "failed anticipation must retry rather than suppress all later attempts")
+    retry.show()
+    precondition(retryBackend.hides == retryBackend.shows)
     print("Receiver cursor checks passed (four edges, prediction guards, delayed end, native input, cleanup)")
     print("Background cursor support on this Mac: \(ReceiverCursorVisibility.enableBackgroundCursor())")
   }
 }
 
 private final class CursorBackend {
+  var failNextHide = false
   var visible = true
   var hides = 0, shows = 0
   func setVisible(_ visible: Bool) -> Bool {
+    if !visible && failNextHide { failNextHide = false; return false }
     self.visible = visible
     if visible { shows += 1 } else { hides += 1 }
     return true

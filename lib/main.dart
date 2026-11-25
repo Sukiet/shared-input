@@ -262,6 +262,7 @@ class _InputPageState extends State<InputPage> with WidgetsBindingObserver {
       await _screenSync.initialize();
       if (defaultTargetPlatform == TargetPlatform.macOS) {
         await _applySmoothing();
+        await _applyCursorSettings();
       }
       if (_captureSupported) {
         await _refresh();
@@ -1579,6 +1580,30 @@ class _InputPageState extends State<InputPage> with WidgetsBindingObserver {
     _settings.smoothingOptions,
   );
 
+  Future<void> _applyCursorSettings() => _channel.invokeMethod<void>(
+    'receiverConfigureCursor',
+    {'parkOnExit': _settings.parkCursorOnExit},
+  );
+
+  Widget _cursorSettings() => SwitchListTile(
+    key: const Key('park-cursor-on-exit'),
+    contentPadding: EdgeInsets.zero,
+    title: const Text('控制结束后移至左上角'),
+    subtitle: const Text('将鼠标指针移至当前屏幕左上角。', style: TextStyle(fontSize: 11)),
+    value: _settings.parkCursorOnExit,
+    onChanged: _ready && !_busy
+        ? (value) {
+            setState(() => _settings.parkCursorOnExit = value);
+            _persist();
+            unawaited(
+              _applyCursorSettings().catchError((Object error) {
+                if (mounted) setState(() => _status = '鼠标设置应用失败：$error');
+              }),
+            );
+          }
+        : null,
+  );
+
   void _updateSmoothing(VoidCallback change) {
     setState(change);
     _persist();
@@ -1858,6 +1883,8 @@ class _InputPageState extends State<InputPage> with WidgetsBindingObserver {
     crossAxisAlignment: CrossAxisAlignment.start,
     children: [
       if (defaultTargetPlatform == TargetPlatform.macOS) ...[
+        _cursorSettings(),
+        const SizedBox(height: 12),
         _smoothingSettings(),
         const SizedBox(height: 20),
       ],
