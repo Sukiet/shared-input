@@ -116,16 +116,20 @@ final class ReceiverCursorVisibility {
   }
 
   func localInput(_ event: NSEvent) {
+    lock.lock(); defer { lock.unlock() }
+    guard let started = exitStartedAt, Self.isLocalInput(event, after: started) else { return }
+    if hidden || anticipating { localOverride = true }
+    restoreLocked()
+  }
+
+  static func isLocalInput(_ event: NSEvent, after started: TimeInterval) -> Bool {
     guard let source = event.cgEvent,
           source.getIntegerValueField(.eventSourceUserData) != Self.remoteEventTag,
           source.getIntegerValueField(.eventSourceUnixProcessID) != Int64(getpid()),
-          source.getIntegerValueField(.eventSourceStateID) != Int64(CGEventSourceStateID.privateState.rawValue) else { return }
-    lock.lock(); defer { lock.unlock() }
+          source.getIntegerValueField(.eventSourceStateID) != Int64(CGEventSourceStateID.privateState.rawValue) else { return false }
     // AppKit may deliver older events after hiding. Only fresh local input may
     // override an exit; untagged events from our own process are still remote.
-    guard let started = exitStartedAt, event.timestamp >= started else { return }
-    if hidden || anticipating { localOverride = true }
-    restoreLocked()
+    return event.timestamp >= started
   }
 
   func anticipateExit() {

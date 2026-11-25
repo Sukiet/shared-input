@@ -15,6 +15,7 @@ class MouseRouting {
     return remote;
   }
   void TransferToLocal(unsigned buttons) { remote_ &= ~buttons; }
+  void TransferToRemote(unsigned buttons) { remote_ |= buttons; windows_ &= ~buttons; }
   bool Forget(unsigned button) {
     const unsigned mask = 1u << button;
     const bool remote = (remote_ & mask) != 0;

@@ -43,6 +43,11 @@ final class RemoteInputBridge {
   private var position = CGPoint.zero
   private var heldKeys = Set<CGKeyCode>()
   private var heldButtons = Set<Int>()
+  private var heldButtonPressIds: [Int: Int64] = [:]
+  private var suspendedDrag: ReceiverDragLease?
+  private var resumingDrag: ReceiverDragLease?
+  private var pendingDragEntry: CGPoint?
+  private var dragHoldNegotiated = false
   private var caps = false
   private var wheelX = 0.0, wheelY = 0.0
   private var clickButton = -1, clickCount: Int64 = 1
@@ -68,13 +73,31 @@ final class RemoteInputBridge {
     dragProbe.changed = { [weak self] snapshot in
       self?.channel.invokeMethod("edgeDragProbeChanged", arguments: snapshot)
     }
+    dragProbe.localInput = { [weak self] event in
+      guard let self = self, ReceiverCursorVisibility.isLocalInput(event, after: 0) else { return }
+      self.lock.lock(); defer { self.lock.unlock() }
+      if let hold = self.suspendedDrag ?? self.resumingDrag,
+         event.timestamp >= hold.started {
+        self.releaseLocked(parkCursor: false)
+      }
+    }
+    dragProbe.dragEnded = { [weak self] flow in
+      guard let self = self else { return }
+      self.lock.lock(); defer { self.lock.unlock() }
+      if self.suspendedDrag?.flow == flow || self.resumingDrag?.flow == flow {
+        // Finder/Escape/source-window cancellation also terminates the lease.
+        self.releaseLocked(parkCursor: false)
+      }
+    }
     let timer = DispatchSource.makeTimerSource(queue: DispatchQueue(label: "shared-input-watchdog"))
     timer.schedule(deadline: .now() + .milliseconds(50), repeating: .milliseconds(50))
     timer.setEventHandler { [weak self] in
       guard let self = self else { return }
       self.lock.lock()
       defer { self.lock.unlock() }
-      if self.capture != nil && ProcessInfo.processInfo.systemUptime - self.lastReceived >= 1.5 {
+      let now = ProcessInfo.processInfo.systemUptime
+      if self.suspendedDrag?.expired(at: now) == true || self.resumingDrag?.expired(at: now) == true ||
+          (self.capture != nil && now - self.lastReceived >= 1.5) {
         self.releaseLocked(hideCursor: true)
       }
     }
@@ -135,9 +158,28 @@ final class RemoteInputBridge {
         result(FlutterError(code: "invalid_layout", message: "拖拽测试边缘无效。", details: nil)); return
       }
       dragProbe.configure(enabled: args["enabled"] as? Bool ?? false, side: side)
-      lock.lock(); dragTestEnabled = dragProbe.enabled; dragPixelScale = dragProbe.pixelScale; lock.unlock()
+      lock.lock()
+      if !dragProbe.enabled && suspendedDrag != nil { releaseLocked(parkCursor: false) }
+      dragTestEnabled = dragProbe.enabled; dragPixelScale = dragProbe.pixelScale; lock.unlock()
       result(dragProbe.snapshot)
     case "edgeDragProbeClear": dragProbe.clear(); result(dragProbe.snapshot)
+    case "receiverDragLease":
+      lock.lock()
+      if var hold = suspendedDrag, hold.matches(args) {
+        let now = ProcessInfo.processInfo.systemUptime
+        if args["held"] as? Bool != true || hold.expired(at: now) {
+          releaseLocked(hideCursor: true)
+        } else { hold.renewed = now; suspendedDrag = hold }
+      }
+      lock.unlock(); result(nil)
+    case "receiverDragResumed":
+      lock.lock()
+      if let hold = resumingDrag, hold.matches(args) { _ = commitDragResumeLocked() }
+      lock.unlock(); result(nil)
+    case "receiverDragCancel":
+      lock.lock()
+      if let hold = suspendedDrag, hold.matches(args) { releaseLocked(parkCursor: false) }
+      lock.unlock(); result(nil)
     case "receiverConfigureCursor":
       guard let enabled = args["parkOnExit"] as? Bool else {
         result(FlutterError(code: "invalid_cursor_settings", message: "鼠标设置无效。", details: nil)); return
@@ -232,16 +274,41 @@ final class RemoteInputBridge {
         result(FlutterError(code: "invalid_layout", message: "显示屏入口无效。", details: nil)); return
       }
       if entry != nil { dragProbe.setSide(entrySide) }
-      dragProbe.receiverBegan()
       let dragScale = dragProbe.pixelScale
       lock.lock()
       dragPixelScale = dragScale
-      releaseLocked(parkCursor: false)
+      let resume = args["receiverDragResume"] as? [String: Any]
+      let resuming = resume != nil
+      if resume == nil && suspendedDrag != nil {
+        // A fast round trip can beat the suspension reply. Keep the original
+        // press alive and ask the controller to retry with its token.
+        lock.unlock()
+        result(FlutterError(code: "drag_resume_required", message: "正在同步原拖拽，请继续向边缘移动后重试。", details: nil)); return
+      }
+      if let resume = resume {
+        guard entry != nil, args["receiverDragHold"] as? Bool == true,
+              let hold = suspendedDrag, hold.matches(resume),
+              !hold.expired(at: ProcessInfo.processInfo.systemUptime),
+              heldButtons == Set([hold.button]) else {
+          if let hold = suspendedDrag, hold.matches(resume) || hold.expired(at: ProcessInfo.processInfo.systemUptime) {
+            releaseLocked(parkCursor: false)
+          }
+          lock.unlock()
+          result(FlutterError(code: "drag_resume_expired", message: "原拖拽已结束，已取消续接。", details: nil)); return
+        }
+        suspendedDrag = nil
+        var pending = hold
+        pending.renewed = ProcessInfo.processInfo.systemUptime
+        resumingDrag = pending
+      } else { releaseLocked(parkCursor: false) }
+      dragHoldNegotiated = args["receiverDragHold"] as? Bool ?? false
       capture = id; sequence = -1; total = .zero
       edgeExit = ReceiverEdgeExit(edge: entry == nil ? nil : entrySide,
                                  started: ProcessInfo.processInfo.systemUptime)
-      activity = ProcessInfo.processInfo.beginActivity(options: [.userInitiated, .latencyCritical],
-        reason: "Receiving keyboard and mouse input")
+      if activity == nil {
+        activity = ProcessInfo.processInfo.beginActivity(options: [.userInitiated, .latencyCritical],
+          reason: "Receiving keyboard and mouse input")
+      }
       position = CGEvent(source: nil)?.location ?? .zero
       if let entry = entry {
         let bounds = CGDisplayBounds(CGMainDisplayID())
@@ -255,7 +322,8 @@ final class RemoteInputBridge {
         case "bottom": destination = CGPoint(x: x, y: bounds.maxY - 1 - insetY)
         default: destination = CGPoint(x: bounds.minX + insetX, y: y)
         }
-        emitMotionLocked(destination)
+        if resuming { pendingDragEntry = destination }
+        else { emitMotionLocked(destination) }
       }
       lastReceived = ProcessInfo.processInfo.systemUptime
       interpolator.reset(position, at: lastReceived)
@@ -263,6 +331,7 @@ final class RemoteInputBridge {
       predictionOutput.reset(position, at: lastReceived)
       scheduleMotionLocked()
       lock.unlock()
+      if !resuming { dragProbe.receiverBegan() }
       result(nil)
     case "receiverHeartbeat":
       lock.lock()
@@ -272,8 +341,38 @@ final class RemoteInputBridge {
       if active { result(nil) }
       else { result(FlutterError(code: "receiver_stopped", message: "接收已停止。", details: nil)) }
     case "receiverStop":
-      dragProbe.receiverStopped(reason: args["reason"] as? String)
-      stop(hideCursor: true); result(nil)
+      let reason = args["reason"] as? String
+      lock.lock()
+      let cancelledResume = reason == "resume_cancelled" && resumingDrag != nil
+      if reason == "edge" || cancelledResume, dragHoldNegotiated, dragTestEnabled, cursorVisibility.canParkOnExit,
+         capture != nil, heldKeys.isEmpty, heldButtons.count == 1,
+         let button = heldButtons.first, (button == 0 || button == 1),
+         let pressId = heldButtonPressIds[button], pressId > 0,
+         let flow = cancelledResume ? resumingDrag?.flow : dragProbe.suspensionFlow(button: button, from: clickPosition, to: position) {
+        let now = ProcessInfo.processInfo.systemUptime
+        suspendedDrag = ReceiverDragLease(token: UUID().uuidString.replacingOccurrences(of: "-", with: "").lowercased(),
+          button: button, pressId: pressId, flow: flow, started: resumingDrag?.started ?? now, renewed: now)
+        resumingDrag = nil
+        pendingDragEntry = nil
+        capture = nil; sequence = -1; total = .zero
+        motionTimer?.schedule(deadline: .distantFuture)
+        position = dragProbeAnchor(CGEvent(source: nil)?.location ?? position,
+          bounds: CGDisplayBounds(CGMainDisplayID()), side: edgeExit.edge, scale: dragPixelScale)
+        post(CGEvent(mouseEventSource: source,
+          mouseType: button == 0 ? .leftMouseDragged : .rightMouseDragged,
+          mouseCursorPosition: position, mouseButton: button == 0 ? .left : .right))
+        interpolator.reset(position, at: now); predictor.reset(position)
+        predictionOutput.reset(position, at: now); lastPredictionSource = 0
+        cursorVisibility.hide()
+        let state = suspendedDrag!.snapshot
+        lock.unlock()
+        dragProbe.receiverStopped(reason: "edge", suspended: true)
+        result(["suspended": state])
+      } else {
+        releaseLocked(hideCursor: true); lock.unlock()
+        dragProbe.receiverStopped(reason: reason)
+        result(nil)
+      }
     case "receiverInput":
       let entered = tick()
       lock.lock()
@@ -338,6 +437,9 @@ final class RemoteInputBridge {
     if next.int64Value == sequence && (sourceUs <= lastPredictionSource || sourceUs == 0) { return true }
     if sourceUs > 0 && sourceUs <= lastPredictionSource { return true }
     let dx = value.x - total.x, dy = value.y - total.y
+    if dx != 0 || dy != 0 {
+      guard commitDragResumeLocked() else { return false }
+    }
     total = value; sequence = next.int64Value
     let now = ProcessInfo.processInfo.systemUptime
     edgeExit.motion(dx: dx, dy: dy, at: now)
@@ -384,6 +486,7 @@ final class RemoteInputBridge {
   private func apply(_ frame: [String: Any]) -> Bool {
     guard motion(frame), let kind = frame["kind"] as? String else { return false }
     if kind != "motion" {
+      guard commitDragResumeLocked() else { return false }
       predictor.reset(interpolator.target)
       // Reach this reliable event's location under the previous button/key
       // state, then apply the transition. In particular, finish a drag before
@@ -412,11 +515,12 @@ final class RemoteInputBridge {
       let button = number.intValue, down = frame["down"] as? Bool ?? false
       if down {
         heldButtons.insert(button)
+        heldButtonPressIds[button] = (frame["pressId"] as? NSNumber)?.int64Value
         let now = ProcessInfo.processInfo.systemUptime
         clickCount = button == clickButton && now - clickTime < NSEvent.doubleClickInterval &&
           hypot(position.x - clickPosition.x, position.y - clickPosition.y) < 4 ? min(clickCount + 1, 3) : 1
         clickButton = button; clickTime = now; clickPosition = position
-      } else { heldButtons.remove(button) }
+      } else { heldButtons.remove(button); heldButtonPressIds.removeValue(forKey: button) }
       let type: CGEventType = button == 0 ? (down ? .leftMouseDown : .leftMouseUp) :
         button == 1 ? (down ? .rightMouseDown : .rightMouseUp) : (down ? .otherMouseDown : .otherMouseUp)
       let event = CGEvent(mouseEventSource: source, mouseType: type, mouseCursorPosition: position,
@@ -446,7 +550,9 @@ final class RemoteInputBridge {
     return true
   }
   private func releaseLocked(hideCursor: Bool = false, parkCursor: Bool = true) {
-    let wasCapturing = capture != nil
+    let previousHold = suspendedDrag ?? resumingDrag
+    suspendedDrag = nil; resumingDrag = nil; pendingDragEntry = nil
+    let wasCapturing = capture != nil || previousHold != nil
     predictor.reset(position); lastPredictionSource = 0
     predictionOutput.reset(position, at: ProcessInfo.processInfo.systemUptime)
     motionTimer?.schedule(deadline: .distantFuture)
@@ -464,6 +570,7 @@ final class RemoteInputBridge {
         mouseButton: CGMouseButton(rawValue: UInt32(button))!))
     }
     heldButtons.removeAll(); capture = nil; sequence = -1; total = .zero
+    heldButtonPressIds.removeAll()
     edgeExit = ReceiverEdgeExit()
     lastInputTime = nil
     wheelX = 0; wheelY = 0; caps = false
@@ -474,6 +581,13 @@ final class RemoteInputBridge {
     if hideCursor {
       if wasCapturing { cursorVisibility.hide() }
     } else { cursorVisibility.show() }
+    if let hold = previousHold {
+      DispatchQueue.main.async { [weak self] in
+        guard let self = self else { return }
+        self.dragProbe.suspendedEnded(flow: hold.flow)
+        self.channel.invokeMethod("receiverDragEnded", arguments: ["token": hold.token])
+      }
+    }
   }
 
   private func parkCursorLocked() {
@@ -497,6 +611,24 @@ final class RemoteInputBridge {
     interpolator.reset(destination, at: now)
     predictor.reset(destination)
     predictionOutput.reset(destination, at: now)
+  }
+
+  private func commitDragResumeLocked() -> Bool {
+    guard let hold = resumingDrag else { return true }
+    guard !hold.expired(at: ProcessInfo.processInfo.systemUptime) else {
+      releaseLocked(hideCursor: true); return false
+    }
+    resumingDrag = nil
+    dragProbe.receiverBegan(resuming: true)
+    if let entry = pendingDragEntry {
+      pendingDragEntry = nil
+      emitMotionLocked(entry)
+      let now = ProcessInfo.processInfo.systemUptime
+      interpolator.reset(position, at: now); predictor.reset(position)
+      predictionOutput.reset(position, at: now); lastPredictionSource = 0
+    }
+    cursorVisibility.show()
+    return true
   }
 
   private func updateExitCursorLocked(at now: TimeInterval, feedback: CGPoint? = nil) {

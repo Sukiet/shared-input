@@ -12,6 +12,7 @@ import 'local_key.dart';
 import 'local_key_panel.dart';
 import 'edge_drag_preview.dart';
 import 'drag_preview_link.dart';
+import 'receiver_drag_hold.dart';
 import 'private_text_field.dart';
 import 'sensitivity.dart';
 import 'scroll_speed.dart';
@@ -86,6 +87,7 @@ class _InputPageState extends State<InputPage> with WidgetsBindingObserver {
   final _listenKeyText = TextEditingController();
   final _lan = LanSession();
   late final DragPreviewLink _dragLink;
+  late final ReceiverDragHold _receiverDragHold;
   bool get _macReceiver => defaultTargetPlatform == TargetPlatform.macOS;
   bool get _dragSupported => _captureSupported || _macReceiver;
   late final ClipboardSync _clipboard;
@@ -156,11 +158,12 @@ class _InputPageState extends State<InputPage> with WidgetsBindingObserver {
     _clipboard = ClipboardSync(_lan, _channel);
     _screenSync = ScreenSync(_lan, _channel);
     _audioSync = AudioSync(_lan, _channel);
+    _receiverDragHold = ReceiverDragHold(_lan, _channel, supported: _captureSupported || _macReceiver);
     _lan.addListener(_connectionChanged);
-    _lan.onBeginWithOptions = (capture, options) => _channel.invokeMethod<void>(
-      'receiverBegin',
-      {'capture': capture, ...options},
-    );
+    _lan.onBeginWithOptions = (capture, options) async {
+      await _channel.invokeMethod<void>('receiverBegin', {'capture': capture, ...options});
+      _receiverDragHold.nativeBegan();
+    };
     if (defaultTargetPlatform == TargetPlatform.macOS) {
       _lan.onPointerInfo = () =>
           _channel.invokeMapMethod<String, dynamic>('receiverPointer');
@@ -174,8 +177,11 @@ class _InputPageState extends State<InputPage> with WidgetsBindingObserver {
     _lan.onHeartbeat = () => _channel.invokeMethod<void>('receiverHeartbeat');
     _lan.diagnostics.native = () =>
         _channel.invokeMapMethod<String, dynamic>('receiverDiagnostics');
-    _lan.onEndWithReason = (reason) =>
-        _channel.invokeMethod<void>('receiverStop', {'reason': reason});
+    _lan.onEndWithReason = (reason) async {
+      final generation = _lan.connectionGeneration;
+      final state = await _channel.invokeMapMethod<String, dynamic>('receiverStop', {'reason': reason});
+      await _receiverDragHold.nativeStopped(state, generation);
+    };
     _lan.onConnectionLost = () {
       ++_edgeGeneration;
       if (mounted) {
@@ -459,6 +465,8 @@ class _InputPageState extends State<InputPage> with WidgetsBindingObserver {
         _stats.value = data;
       case 'inputFrame':
         _lan.sendInput(data);
+      case 'receiverDragEnded':
+        await _receiverDragHold.nativeEnded(data['token'] as String? ?? '');
       case 'stopped':
         final run = _controlRun;
         if (run == null) {
@@ -896,14 +904,17 @@ class _InputPageState extends State<InputPage> with WidgetsBindingObserver {
     await _saveSettings();
     await _preferences.flush();
     if (allowed != null && !allowed()) return;
+    Map<String, dynamic>? resume;
     if (_lan.connected) {
-      await _lan.beginCapture(
+      resume = await _receiverDragHold.beginCapture(
         edgeEntryY: background ? entryY : null,
         edgeEntrySide: entrySide,
+        allowResume: background && dragFlow != null,
+        allowed: allowed,
       );
     }
     if (allowed != null && !allowed()) {
-      await _lan.endCapture();
+      await _lan.endCapture(reason: resume != null ? 'resume_cancelled' : null);
       return;
     }
     final run = _ControlRun(
@@ -924,10 +935,14 @@ class _InputPageState extends State<InputPage> with WidgetsBindingObserver {
         'background': background,
         'edgeTriggered': edgeTriggered,
         'dragFlow': ?dragFlow,
+        'receiverDragResume': ?resume,
       });
+      if (mounted && identical(_controlRun, run)) {
+        unawaited(_receiverDragHold.confirmResume(resume));
+      }
     } catch (_) {
       if (identical(_controlRun, run)) _controlRun = null;
-      await _lan.endCapture();
+      await _lan.endCapture(reason: resume != null ? 'resume_cancelled' : null);
       rethrow;
     }
     // A native emergency exit may arrive before the start reply.
@@ -1050,6 +1065,7 @@ class _InputPageState extends State<InputPage> with WidgetsBindingObserver {
       );
     }
     _dragPreview.dispose();
+    _receiverDragHold.dispose();
     _dragLink.dispose();
     _returnHistory.dispose();
     _speedText.dispose();

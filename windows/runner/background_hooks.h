@@ -14,6 +14,7 @@ namespace shared_input {
 extern "C" {
 SHARED_HOOK_API bool SharedHooksInstall(HWND owner, UINT message, int key, bool shift);
 SHARED_HOOK_API bool SharedHooksBegin(uint32_t generation, uint32_t local_buttons = 0);
+SHARED_HOOK_API bool SharedHooksBeginWithRemote(uint32_t generation, uint32_t local_buttons, uint32_t remote_buttons);
 SHARED_HOOK_API bool SharedHooksPrepare(bool reset_state = false);
 SHARED_HOOK_API bool SharedHooksInstalled();
 SHARED_HOOK_API void SharedHooksRawKey(unsigned key, bool up, uint32_t time);
@@ -49,7 +50,10 @@ class BackgroundHooks {
  public:
   ~BackgroundHooks() { Close(); }
   bool Install(HWND owner, UINT message, int key, bool shift) { return SharedHooksInstall(owner, message, key, shift); }
-  bool Begin(uint32_t generation = 0, uint32_t local_buttons = 0) { return SharedHooksBegin(generation, local_buttons); }
+  bool Begin(uint32_t generation = 0, uint32_t local_buttons = 0, uint32_t remote_buttons = 0) {
+    return remote_buttons ? SharedHooksBeginWithRemote(generation, local_buttons, remote_buttons)
+                          : SharedHooksBegin(generation, local_buttons);
+  }
   bool Prepare(bool reset_state = false) { return SharedHooksPrepare(reset_state); }
   bool Installed() const { return SharedHooksInstalled(); }
   void RawKey(unsigned key, bool up, uint32_t time) { SharedHooksRawKey(key, up, time); }

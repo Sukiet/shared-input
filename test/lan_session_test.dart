@@ -14,6 +14,60 @@ Future<void> eventually(bool Function() condition) async {
 }
 
 void main() {
+  test('receiver drag leases survive capture end and carry explicit resume identity', () async {
+    final receiver = LanSession()..receiverDragHoldSupported = true;
+    final controller = LanSession()..receiverDragHoldSupported = true;
+    final begins = <Map<String, dynamic>>[];
+    final leases = <Map<String, dynamic>>[], notices = <Map<String, dynamic>>[];
+    receiver.onBeginWithOptions = (_, options) async { begins.add(options); };
+    receiver.onReceiverDragControl = (value) async { leases.add(value); };
+    controller.onReceiverDragControl = (value) async { notices.add(value); };
+    receiver.onPointerInfo = () async => {
+      'x': 0.0, 'y': 200.0, 'left': 0.0, 'top': 0.0,
+      'width': 1000.0, 'height': 800.0, 'sequence': 1,
+    };
+    try {
+      await receiver.listen(port: 0, key: 'e' * 32, bindAddress: '127.0.0.1');
+      await controller.connect(host: '127.0.0.1', port: receiver.port, key: 'e' * 32);
+      expect(controller.supportsReceiverDragHold && receiver.supportsReceiverDragHold, true);
+      await controller.beginCapture(edgeEntryY: 0.5);
+      expect(begins.single['receiverDragHold'], true);
+      await controller.endCapture(reason: 'edge');
+      await eventually(() => !receiver.capturing);
+      final hold = {'token': 'a' * 32, 'button': 0, 'pressId': 17};
+      await receiver.sendReceiverDragControl({'type': 'receiverDragSuspended', ...hold});
+      await eventually(() => notices.isNotEmpty);
+      await controller.sendReceiverDragControl({'type': 'receiverDragLease', ...hold, 'held': true});
+      await eventually(() => leases.isNotEmpty);
+      expect(receiver.capturing, false);
+      expect(leases.single['held'], true);
+      await controller.beginCapture(edgeEntryY: 0.5, receiverDragResume: hold);
+      expect(begins.last['receiverDragResume'], hold);
+      await controller.sendReceiverDragControl({'type': 'receiverDragResumed', ...hold});
+      await eventually(() => leases.length == 2);
+      expect(leases.last['type'], 'receiverDragResumed');
+    } finally {
+      await controller.close(); await receiver.close();
+      controller.dispose(); receiver.dispose();
+    }
+  });
+  test('old peer does not receive receiver drag hold messages', () async {
+    final receiver = LanSession(), controller = LanSession()..receiverDragHoldSupported = true;
+    var received = false;
+    receiver.onReceiverDragControl = (_) async { received = true; };
+    try {
+      await receiver.listen(port: 0, key: 'f' * 32, bindAddress: '127.0.0.1');
+      await controller.connect(host: '127.0.0.1', port: receiver.port, key: 'f' * 32);
+      expect(controller.supportsReceiverDragHold, false);
+      await controller.sendReceiverDragControl({'type': 'receiverDragLease', 'held': true});
+      await Future<void>.delayed(const Duration(milliseconds: 15));
+      expect(received, false);
+      expect(receiver.connected && controller.connected, true);
+    } finally {
+      await controller.close(); await receiver.close();
+      controller.dispose(); receiver.dispose();
+    }
+  });
   test('audio capabilities and controls work independently of mouse capture', () async {
     final receiver = LanSession()..audioCaptureSupported = true;
     final controller = LanSession()..audioRenderSupported = true;

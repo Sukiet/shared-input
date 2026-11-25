@@ -19,7 +19,7 @@ class HookRuntime {
     std::promise<bool> result;
     std::atomic<bool> cancelled{false};
     bool begin = false, reset = false;
-    unsigned local_buttons = 0;
+    unsigned local_buttons = 0, remote_buttons = 0;
   };
  public:
   ~HookRuntime() { Close(); }
@@ -69,10 +69,11 @@ class HookRuntime {
             bool allowed = !request->cancelled && !Blocking() &&
                 RefreshHooks() && ReconcileInput(request->reset);
             if (request->begin) allowed = allowed && CanBeginWithLocalButtons(
-                held_.load() != 0, buttons_.load(), request->local_buttons);
+                held_.load() != 0, buttons_.load(), request->local_buttons | request->remote_buttons);
             if (allowed && request->begin && !request->cancelled) {
               local_buttons_ = request->local_buttons;
               mouse_routing_.TransferToLocal(request->local_buttons);
+              mouse_routing_.TransferToRemote(request->remote_buttons);
               pump_seen_ = GetTickCount64();
               release_.Begin(static_cast<uint32_t>(message.wParam), true);
             }
@@ -141,8 +142,8 @@ class HookRuntime {
     return false;
   }
 
-  bool Begin(uint32_t generation, unsigned local_buttons) {
-    return Execute(true, generation, local_buttons, false);
+  bool Begin(uint32_t generation, unsigned local_buttons, unsigned remote_buttons) {
+    return Execute(true, generation, local_buttons, false, remote_buttons);
   }
   bool Prepare(bool reset_state) {
     if (reset_state) reset_requested_ = true;
@@ -327,10 +328,10 @@ class HookRuntime {
     return CallNextHookEx(nullptr, code, message, data);
   }
  private:
-  bool Execute(bool begin, uint32_t generation, unsigned local_buttons, bool reset) {
+  bool Execute(bool begin, uint32_t generation, unsigned local_buttons, bool reset, unsigned remote_buttons = 0) {
     if (!running_.load()) return false;
     auto request = std::make_shared<Request>();
-    request->begin = begin; request->reset = reset; request->local_buttons = local_buttons;
+    request->begin = begin; request->reset = reset; request->local_buttons = local_buttons; request->remote_buttons = remote_buttons;
     auto result = request->result.get_future();
     auto* posted = new std::shared_ptr<Request>(request);
     if (!PostThreadMessageW(thread_id_, kBeginMessage, generation, reinterpret_cast<LPARAM>(posted))) {
@@ -493,7 +494,8 @@ extern "C" __declspec(dllexport) LRESULT CALLBACK SharedMouseProc(int c, WPARAM 
   return HookRuntime::Mouse(c, w, l);
 }
 bool SharedHooksInstall(HWND owner, UINT message, int key, bool shift) { return runtime.Install(owner, message, key, shift); }
-bool SharedHooksBegin(uint32_t generation, uint32_t local_buttons) { return runtime.Begin(generation, local_buttons); }
+bool SharedHooksBegin(uint32_t generation, uint32_t local_buttons) { return runtime.Begin(generation, local_buttons, 0); }
+bool SharedHooksBeginWithRemote(uint32_t generation, uint32_t local_buttons, uint32_t remote_buttons) { return runtime.Begin(generation, local_buttons, remote_buttons); }
 bool SharedHooksPrepare(bool reset_state) { return runtime.Prepare(reset_state); }
 bool SharedHooksInstalled() { return runtime.Installed(); }
 void SharedHooksRawKey(unsigned key, bool up, uint32_t time) { runtime.RawKey(key, up, time); }

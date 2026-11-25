@@ -1,5 +1,22 @@
 import Cocoa
 
+struct ReceiverDragLease {
+  let token: String
+  let button: Int
+  let pressId: Int64
+  let flow: Int
+  let started: TimeInterval
+  var renewed: TimeInterval
+  var snapshot: [String: Any] { ["token": token, "button": button, "pressId": pressId] }
+  func matches(_ value: [String: Any]) -> Bool {
+    value["token"] as? String == token && (value["button"] as? NSNumber)?.intValue == button &&
+      (value["pressId"] as? NSNumber)?.int64Value == pressId
+  }
+  func expired(at now: TimeInterval) -> Bool {
+    now < renewed || now - renewed >= 1.5 || now - started >= 60
+  }
+}
+
 // AppKit coordinates: origin at the lower-left. The configured side is the
 // Mac side facing the controller, not the controller's own outgoing side.
 func dragProbeFrame(screen: CGRect, side: String, scale: CGFloat) -> CGRect {
@@ -30,6 +47,19 @@ func dragProbeCursor(_ point: CGPoint, bounds: CGRect, side: String?, scale: CGF
   }
 }
 
+func dragProbeAnchor(_ point: CGPoint, bounds: CGRect, side: String?, scale: CGFloat) -> CGPoint {
+  let halfPixel = 0.5 / max(1, scale)
+  var anchor = CGPoint(x: min(max(point.x, bounds.minX), bounds.maxX - halfPixel),
+                       y: min(max(point.y, bounds.minY), bounds.maxY - halfPixel))
+  switch side {
+  case "right": anchor.x = bounds.maxX - halfPixel
+  case "top": anchor.y = bounds.minY + halfPixel
+  case "bottom": anchor.y = bounds.maxY - halfPixel
+  default: anchor.x = bounds.minX + halfPixel
+  }
+  return anchor
+}
+
 struct ReceiverDragState {
   private(set) var flow = 0
   private(set) var active = false
@@ -43,7 +73,15 @@ struct ReceiverDragState {
     guard !active else { return }
     flow += 1; active = true; onController = false; history = []; change("gesture")
   }
-  mutating func edge() { if active && stage == "gesture" { change("edge") } }
+  mutating func prepareSuspension(distance: CGFloat) -> Bool {
+    guard !onController else { return false }
+    if !active {
+      guard distance >= 4 else { return false }
+      begin()
+    }
+    return true
+  }
+  mutating func edge() { if active && (stage == "gesture" || stage == "returned") { change("edge") } }
   mutating func crossed() {
     guard active, !onController else { return }
     edge(); onController = true; change("crossed")
@@ -52,9 +90,9 @@ struct ReceiverDragState {
     guard active else { return }
     active = false; change("ended")
   }
-  mutating func returned() {
+  mutating func returned(continuing: Bool = false) {
     guard onController else { return }
-    active = false; onController = false; change("returned")
+    active = continuing; onController = false; change("returned")
   }
   private mutating func change(_ value: String) {
     stage = value; history.append(value)
@@ -140,6 +178,21 @@ final class MacEdgeDragProbe {
   private var globalMonitor: Any?, localMonitor: Any?
   private var screenObserver: NSObjectProtocol?
   var changed: (([String: Any]) -> Void)?
+  var localInput: ((NSEvent) -> Void)?
+  var dragEnded: ((Int) -> Void)?
+  func suspensionFlow(button: Int, from down: CGPoint, to point: CGPoint) -> Int? {
+    guard enabled, atEdge else { return nil }
+    let wasActive = state.active
+    guard state.prepareSuspension(distance: hypot(point.x - down.x, point.y - down.y)) else { return nil }
+    panel?.ignoresMouseEvents = false
+    if !wasActive {
+      sourceButton = button; downPoint = down
+      if !hovering { metadata = MacDragMetadata(); phase = "waiting" }
+    }
+    // Metadata/AppKit destination callbacks can lag behind pointer feedback.
+    // Keeping a genuine drag must not depend on file enumeration completing.
+    return state.flow
+  }
 
   var snapshot: [String: Any] {
     ["origin": "receiver", "enabled": enabled, "side": side, "revision": revision,
@@ -183,7 +236,7 @@ final class MacEdgeDragProbe {
     }
     panel?.ignoresMouseEvents = !hovering
     reposition(); panel?.orderFrontRegardless()
-    let events: NSEvent.EventTypeMask = [.leftMouseDown, .leftMouseUp, .rightMouseDown,
+    let events: NSEvent.EventTypeMask = [.mouseMoved, .scrollWheel, .leftMouseDown, .leftMouseUp, .rightMouseDown,
       .rightMouseUp, .leftMouseDragged, .rightMouseDragged]
     globalMonitor = NSEvent.addGlobalMonitorForEvents(matching: events) { [weak self] event in
       self?.observe(event)
@@ -210,9 +263,13 @@ final class MacEdgeDragProbe {
     if !state.active { state.reset() }
     phase = enabled ? "waiting" : "off"; publish()
   }
-  func receiverBegan() { state.returned(); publish() }
-  func receiverStopped(reason: String?) {
-    if enabled && reason == "edge" && state.active && atEdge {
+  func receiverBegan(resuming: Bool = false) { state.returned(continuing: resuming); publish() }
+  func suspendedEnded(flow: Int) {
+    guard state.flow == flow && state.onController else { return }
+    sourceButton = nil; state.end(); phase = enabled ? "drop" : "off"; publish()
+  }
+  func receiverStopped(reason: String?, suspended: Bool = false) {
+    if enabled && reason == "edge" && state.active && (suspended || atEdge) {
       state.crossed(); publish()
     }
   }
@@ -237,6 +294,7 @@ final class MacEdgeDragProbe {
       scale: screen.backingScaleFactor), display: false)
   }
   private func observe(_ event: NSEvent) {
+    localInput?(event)
     guard enabled else { return }
     let point = event.cgEvent?.location ?? NSEvent.mouseLocation
     switch event.type {
@@ -273,9 +331,11 @@ final class MacEdgeDragProbe {
     publish()
   }
   fileprivate func ended() {
+    let endedFlow = state.flow
     hovering = false; sourceButton = nil; state.end(); phase = enabled ? "drop" : "off"
     if enabled { panel?.ignoresMouseEvents = true } else { closePanel() }
     publish()
+    dragEnded?(endedFlow)
   }
   private func publish() { revision += 1; changed?(snapshot) }
   private func closePanel() {

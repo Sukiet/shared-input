@@ -33,6 +33,12 @@ class LanSession extends ChangeNotifier {
   bool clipboardSupported = false, supportsClipboard = false;
   bool _clipboardOpening = false;
   void Function(Map<String, dynamic> message)? onClipboardControl;
+  bool receiverDragHoldSupported = false, supportsReceiverDragHold = false;
+  Future<void> Function(Map<String, dynamic>)? onReceiverDragControl;
+  Future<void> sendReceiverDragControl(Map<String, dynamic> message) async {
+    if (!connected || !supportsReceiverDragHold) return;
+    await _wire!.send(message);
+  }
   bool dragPreviewSupported = false, supportsDragPreview = false;
   FutureOr<void> Function(Map<String, dynamic>)? onDragPreviewControl;
   Future<void> sendDragPreviewControl(Map<String, dynamic> message) async {
@@ -60,6 +66,7 @@ class LanSession extends ChangeNotifier {
   Future<void> Function()? onEnd;
   Future<void> Function(String? reason)? onEndWithReason;
   Future<void> Function()? onHeartbeat;
+  Future<void> _endingCapture = Future.value();
   VoidCallback? onConnectionLost;
   VoidCallback? onCaptureEnded;
 
@@ -162,6 +169,7 @@ class LanSession extends ChangeNotifier {
                 if (screenPolicySupported) 'screen-policy-v1',
                 if (clipboardSupported) 'clipboard-v1',
                 if (dragPreviewSupported) 'edge-drag-preview-v1',
+                if (receiverDragHoldSupported) 'receiver-drag-hold-v1',
                 if (audioCaptureSupported) 'audio-capture-pcm-v1',
                 if (audioRenderSupported) 'audio-render-pcm-v1',
                 if (onPointerInfo != null) 'edge-pointer-v1',
@@ -204,6 +212,8 @@ class LanSession extends ChangeNotifier {
                     'edge-drag-preview-v1',
                   ) ==
                   true;
+      supportsReceiverDragHold = receiverDragHoldSupported &&
+          (hello['capabilities'] as List?)?.contains('receiver-drag-hold-v1') == true;
           supportsAudio =
               audioCaptureSupported &&
               (hello['capabilities'] as List?)?.contains(
@@ -268,6 +278,7 @@ class LanSession extends ChangeNotifier {
             if (screenPolicySupported) 'screen-policy-v1',
             if (clipboardSupported) 'clipboard-v1',
             if (dragPreviewSupported) 'edge-drag-preview-v1',
+                if (receiverDragHoldSupported) 'receiver-drag-hold-v1',
             if (audioCaptureSupported) 'audio-capture-pcm-v1',
             if (audioRenderSupported) 'audio-render-pcm-v1',
           ],
@@ -287,6 +298,8 @@ class LanSession extends ChangeNotifier {
           dragPreviewSupported &&
           (ack['capabilities'] as List?)?.contains('edge-drag-preview-v1') ==
               true;
+      supportsReceiverDragHold = receiverDragHoldSupported &&
+          (ack['capabilities'] as List?)?.contains('receiver-drag-hold-v1') == true;
       supportsPrediction =
           (ack['capabilities'] as List?)?.contains('motion-prediction-v1') ==
           true;
@@ -402,6 +415,11 @@ class LanSession extends ChangeNotifier {
           case 'screenPolicy':
           case 'screenPolicyStatus':
             if (supportsScreenPolicy) await onScreenControl?.call(json);
+          case 'receiverDragSuspended':
+          case 'receiverDragLease':
+          case 'receiverDragEnded':
+          case 'receiverDragResumed':
+            if (supportsReceiverDragHold) await onReceiverDragControl?.call(json);
           case 'dragPreviewConfig':
           case 'dragPreviewState':
           case 'dragPreviewClear':
@@ -463,6 +481,7 @@ class LanSession extends ChangeNotifier {
               final options = Map<String, dynamic>.from(
                 json['options'] as Map? ?? {},
               );
+              options.remove('receiverDragHold'); // Negotiated by this endpoint, never trusted from a peer option.
               final entry = options['edgeEntryY'];
               final side = options['edgeEntrySide'] ?? 'left';
               if (!['left', 'right', 'top', 'bottom'].contains(side) ||
@@ -479,7 +498,7 @@ class LanSession extends ChangeNotifier {
                 throw const FormatException('被控端不支持边缘切换。');
               }
               if (onBeginWithOptions != null) {
-                await onBeginWithOptions!(id, options);
+                await onBeginWithOptions!(id, {...options, if (supportsReceiverDragHold) 'receiverDragHold': true});
               } else {
                 await onBegin?.call(id);
               }
@@ -579,7 +598,9 @@ class LanSession extends ChangeNotifier {
   Future<void> beginCapture({
     double? edgeEntryY,
     String edgeEntrySide = 'left',
+    Map<String, dynamic>? receiverDragResume,
   }) async {
+    await _endingCapture;
     if (!connected || _receiver) throw StateError('请先连接被控端。');
     if (edgeEntryY != null &&
         (!supportsEdge ||
@@ -604,6 +625,7 @@ class LanSession extends ChangeNotifier {
         if (edgeEntryY != null)
           'options': {
             'edgeEntryY': edgeEntryY,
+            if (supportsReceiverDragHold && receiverDragResume != null) 'receiverDragResume': receiverDragResume,
             if (edgeEntrySide != 'left') 'edgeEntrySide': edgeEntrySide,
           },
       });
@@ -822,21 +844,25 @@ class LanSession extends ChangeNotifier {
     }
   }
 
-  Future<void> endCapture({String? reason}) async {
+  Future<void> endCapture({String? reason}) {
     final capture = _capture;
-    await _end(reason: reason);
-    if (capture != null && connected) {
-      try {
-        await _wire!.send({
-          'type': 'end',
-          'capture': capture,
-          'reason': ?reason,
-        });
-      } catch (_) {
-        /* native watchdog also releases */
+    final wire = _wire;
+    final previous = _endingCapture;
+    final local = _end(reason: reason); // Clear capture synchronously, before awaiting I/O.
+    return _endingCapture = () async {
+      await previous;
+      await local;
+      if (capture != null && connected && wire != null && identical(wire, _wire)) {
+        try {
+          await wire.send({
+            'type': 'end', 'capture': capture, 'reason': ?reason,
+          });
+        } catch (_) {
+          /* native watchdog also releases */
+        }
       }
-    }
-    _changed();
+      _changed();
+    }();
   }
 
   Future<void> _lost(String message) async {
@@ -853,6 +879,7 @@ class LanSession extends ChangeNotifier {
     _closing = true;
     supportsEdge = false;
     supportsDragPreview = false;
+    supportsReceiverDragHold = false;
     supportsLayout = false;
     supportsClipboard = false;
     supportsAudio = false;
@@ -871,6 +898,7 @@ class LanSession extends ChangeNotifier {
     } finally {
       _wire?.close();
       _wire = null;
+      _endingCapture = Future.value();
       for (final wire in _handshakes.toList()) {
         wire.close();
       }

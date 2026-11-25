@@ -410,6 +410,7 @@ void InputBridge::OnMethod(const flutter::MethodCall<Value>& call,
       result->Error("edge_failed", "后台输入监听初始化失败。"); return;
     }
     edge_enabled_ = enabled;
+    if (!enabled) receiver_drag_press_.Cancel();
     edge_cooldown_ = GetTickCount64() + 500;
     if (!enabled && (!drag_probe_ || !drag_probe_->Enabled())) background_.Close();
     result->Success();
@@ -430,6 +431,17 @@ void InputBridge::OnMethod(const flutter::MethodCall<Value>& call,
   } else if (method == "remotePointer") {
     if (const auto args = call.arguments() ? std::get_if<Map>(call.arguments()) : nullptr) RemotePointer(*args);
     result->Success();
+  } else if (method == "receiverDragButtons") {
+    const bool healthy = background_.Installed() && background_.Healthy(GetTickCount64()) &&
+        !screen_state_->locked && !screen_state_->suspended && screen_state_->session_active &&
+        !Down(VK_ESCAPE) && !(shortcut_key_ && MatchesShortcut(shortcut_key_));
+    unsigned buttons = healthy ? background_.PhysicalButtons() : 0;
+    if ((buttons == 1 && !receiver_drag_press_.Matches(0, receiver_drag_press_.Id(0), buttons)) ||
+        (buttons == 2 && !receiver_drag_press_.Matches(1, receiver_drag_press_.Id(1), buttons))) buttons = 0;
+    result->Success(Value(Map{{Value("healthy"), Value(healthy)},
+        {Value("buttons"), Value(static_cast<int>(buttons))},
+        {Value("leftPress"), Value(static_cast<int64_t>(receiver_drag_press_.Id(0)))},
+        {Value("rightPress"), Value(static_cast<int64_t>(receiver_drag_press_.Id(1)))}}));
   } else if (method == "receiverBegin") {
     const auto args = call.arguments() ? std::get_if<Map>(call.arguments()) : nullptr;
     if (active_ || !args || !receiver_.Begin(StringArg(*args, "capture"))) {
@@ -495,7 +507,20 @@ void InputBridge::OnMethod(const flutter::MethodCall<Value>& call,
 void InputBridge::Start(const Map& args, std::unique_ptr<Result> result) {
   const auto drag_flow = static_cast<uint64_t>(std::max(0, IntegerArg(args, "dragFlow")));
   const bool drag_requested = drag_flow != 0;
-  const unsigned local_buttons = drag_requested ? drag_handoff_.Buttons() : 0;
+  unsigned remote_buttons = 0;
+  if (const auto value = Find(args, "receiverDragResume")) {
+    const auto resume = std::get_if<Map>(value);
+    const int button = resume ? IntegerArg(*resume, "button", -1) : -1;
+    const double press = resume ? NumberArg(*resume, "pressId", 0) : 0;
+    if (!BoolArg(args, "background") || !drag_requested || button < 0 || button > 1 ||
+        !std::isfinite(press) || press <= 0 || press > 9007199254740991.0 || std::floor(press) != press ||
+        !receiver_drag_press_.Matches(static_cast<unsigned>(button), static_cast<uint64_t>(press), background_.PhysicalButtons())) {
+      result->Error("drag_resume_cancelled", "鼠标已松开或更换按下，已取消续接。"); return;
+    }
+    remote_buttons = 1u << button;
+  }
+  const unsigned local_buttons = drag_requested ? (drag_handoff_.Buttons() & ~remote_buttons) : 0;
+  const unsigned allowed_buttons = local_buttons | remote_buttons;
   if (drag_requested && (!BoolArg(args, "background") || !drag_probe_ || !drag_probe_->Enabled() ||
       !drag_handoff_.Ready(drag_flow) || drag_handoff_.Stage() != "switching")) {
     result->Error("drag_handoff_cancelled", "拖拽状态已改变，已取消跨屏。"); return;
@@ -517,7 +542,7 @@ void InputBridge::Start(const Map& args, std::unique_ptr<Result> result) {
   }
   // Do not inherit a held modifier or shortcut into the simulated session.
   for (int key = background ? VK_LBUTTON : VK_BACK; key < 255; ++key) {
-    if ((key == VK_LBUTTON && (local_buttons & 1)) || (key == VK_RBUTTON && (local_buttons & 2))) continue;
+    if ((key == VK_LBUTTON && (allowed_buttons & 1)) || (key == VK_RBUTTON && (allowed_buttons & 2))) continue;
     if (GetAsyncKeyState(key) & 0x8000) {
       result->Error("keys_held", "请松开所有键盘按键，再点击开始控制。");
       return;
@@ -565,7 +590,7 @@ void InputBridge::Start(const Map& args, std::unique_ptr<Result> result) {
     }
     std::lock_guard<std::mutex> lock(cursor_lease_);
     const auto generation = ++generation_;
-    if (!background_.Begin(generation, local_buttons)) {
+    if (!background_.Begin(generation, local_buttons, remote_buttons)) {
       background_capture_ = false; remote_capture_ = false;
       drag_capture_ = false; drag_passthrough_buttons_ = 0;
       result->Error("hook_failed", "后台输入拦截未就绪，请移动鼠标或按键后重试。"); return;
@@ -627,11 +652,16 @@ void InputBridge::Start(const Map& args, std::unique_ptr<Result> result) {
       return;
     }
   }
+  for (unsigned button = 0; button < 2; ++button) if (remote_buttons & (1u << button)) held_buttons_.insert(static_cast<int>(button));
   if (drag_requested) { drag_handoff_.Crossed(drag_flow); drag_probe_->Notify(); }
   result->Success();
 }
 
 void InputBridge::Stop(const std::string& reason, bool notify) {
+  if (reason != "edge" && (active_ || reason == "manual" || reason == "shortcut" ||
+      reason == "shutdown" || reason == "system_lock" || reason == "system_suspend")) {
+    receiver_drag_press_.Cancel();
+  }
   const bool was_active = active_;
   const bool was_background = background_capture_;
   const bool was_drag_capture = drag_capture_;
@@ -726,6 +756,10 @@ void InputBridge::ProcessInput(const RAWINPUT& raw, UINT bytes, bool from_hook) 
   // Raw input independently repairs missed hook releases. It never forwards a
   // second keyboard stream; background keyboard forwarding stays hook-only.
   const auto input_time = static_cast<uint32_t>(GetMessageTime());
+  if (!from_hook && raw.header.dwType == RIM_TYPEMOUSE &&
+      bytes >= sizeof(RAWINPUTHEADER) + sizeof(RAWMOUSE)) {
+    receiver_drag_press_.Observe(raw.data.mouse.usButtonFlags);
+  }
   if (!from_hook && edge_enabled_ && raw.header.hDevice) {
     if (raw.header.dwType == RIM_TYPEKEYBOARD && bytes >= sizeof(RAWINPUTHEADER) + sizeof(RAWKEYBOARD) &&
         raw.data.keyboard.VKey != 255) {
@@ -780,6 +814,7 @@ void InputBridge::ProcessInput(const RAWINPUT& raw, UINT bytes, bool from_hook) 
       }
       return;
     }
+    if (!up && (key == VK_ESCAPE || MatchesShortcut(key))) receiver_drag_press_.Cancel();
     if (!active_) return;
     // Emergency shortcut precedes the selected-device filter.
     if (!up && MatchesShortcut(key)) { Stop("shortcut"); return; }
@@ -843,7 +878,8 @@ void InputBridge::ProcessInput(const RAWINPUT& raw, UINT bytes, bool from_hook) 
       }
       if (mouse.usButtonFlags & (1 << (button * 2))) {
         held_buttons_.insert(button);
-        QueueInput({{Value("kind"), Value("button")}, {Value("button"), Value(button)}, {Value("down"), Value(true)}});
+        QueueInput({{Value("kind"), Value("button")}, {Value("button"), Value(button)}, {Value("down"), Value(true)},
+          {Value("pressId"), Value(static_cast<int64_t>(receiver_drag_press_.Id(static_cast<unsigned>(button))))}});
       }
       if (mouse.usButtonFlags & (2 << (button * 2))) {
         held_buttons_.erase(button);
@@ -1025,6 +1061,7 @@ std::optional<LRESULT> InputBridge::HandleMessage(UINT message, WPARAM wparam, L
       return DefWindowProc(owner_, message, wparam, lparam);
     case WM_INPUT_DEVICE_CHANGE:
       if (wparam == GIDC_REMOVAL) {
+        receiver_drag_press_.Cancel();
         const auto device = reinterpret_cast<HANDLE>(lparam);
         physical_keys_.erase(device);
         if (active_ && (device == keyboard_ || device == mouse_)) Stop("device_removed");
