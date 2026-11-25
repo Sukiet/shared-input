@@ -28,6 +28,8 @@ class FileDragSync extends ChangeNotifier {
   bool _connected = false;
   final _requests = <String>{};
   String _error = '';
+  String _nativeStatus = '';
+  Map<String, dynamic> lastSessionState = {};
   Future<void> _work = Future.value();
   String get status => _error.isNotEmpty
       ? _error
@@ -39,6 +41,8 @@ class FileDragSync extends ChangeNotifier {
       ? '文件通道已断开，请重新连接；键鼠连接不受影响'
       : !files.connected
       ? '正在建立文件通道'
+      : _nativeStatus.isNotEmpty
+      ? _nativeStatus
       : '文件拖到 Mac 后松手复制，原文件保留';
 
   Future<void> initialize() async {
@@ -51,6 +55,7 @@ class FileDragSync extends ChangeNotifier {
       lan.fileDragSupported = _source || _target;
       lan.fileDragSource = _source;
       lan.fileDragTarget = _target;
+      lan.fileDragStateSupported = lan.fileDragSupported;
     } on MissingPluginException {
       /* older runner */
     }
@@ -70,6 +75,8 @@ class FileDragSync extends ChangeNotifier {
     _generation = lan.connectionGeneration;
     _connected = lan.connected;
     _error = '';
+    _nativeStatus = '';
+    lastSessionState = {};
     final generation = _generation;
     _work = _work
         .then((_) async {
@@ -101,6 +108,10 @@ class FileDragSync extends ChangeNotifier {
   }
 
   Future<void> _control(Map<String, dynamic> message) async {
+    if (!lan.receiving && _source && message['type'] == 'fileDragState') {
+      _sessionState(message);
+      return;
+    }
     if (lan.receiving || !_source || message['type'] != 'fileDragPort') return;
     final port = message['port'], key = message['key'];
     if (port is! int ||
@@ -205,6 +216,16 @@ class FileDragSync extends ChangeNotifier {
 
   void onNativeEvent(String method, Map<String, dynamic> args) {
     if (!_target || !lan.receiving || !lan.connected) return;
+    if (method == 'fileDragSessionState') {
+      if (!_sessionState(args)) return;
+      if (!lan.supportsFileDragState) return;
+      unawaited(
+        lan
+            .sendFileDragControl({'type': 'fileDragState', ...lastSessionState})
+            .catchError((Object _) {}),
+      );
+      return;
+    }
     final request = args['request'];
     if (request is! String || !RegExp(r'^[a-f0-9]{32}$').hasMatch(request)) {
       return;
@@ -239,6 +260,34 @@ class FileDragSync extends ChangeNotifier {
         }
       }().catchError((Object _) {}),
     );
+  }
+
+  bool _sessionState(Map<String, dynamic> value) {
+    final id = value['drag'], phase = value['phase'];
+    if (id is! String ||
+        !RegExp(r'^[a-f0-9]{32}$').hasMatch(id) ||
+        !['dragging', 'ended'].contains(phase)) {
+      return false;
+    }
+    lastSessionState = {
+      'drag': id,
+      'phase': phase,
+      'unexpected': value['unexpected'] == true,
+      'accepted': value['accepted'] == true,
+      for (final field in ['elapsedMs', 'sourceEventNumber', 'operation'])
+        if (value[field] is int) field: value[field],
+      for (final field in ['combinedLeftDown', 'hidLeftDown'])
+        if (value[field] is bool) field: value[field],
+    };
+    _nativeStatus = phase == 'dragging'
+        ? 'Mac 文件拖拽进行中'
+        : value['unexpected'] == true
+        ? 'Mac 文件拖拽提前结束，已停止鼠标拖拽转发'
+        : value['accepted'] == true
+        ? '已放置文件，正在复制'
+        : '文件拖拽已取消';
+    _changed();
+    return true;
   }
 
   @override

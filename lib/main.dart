@@ -407,6 +407,12 @@ class _InputPageState extends State<InputPage> with WidgetsBindingObserver {
     if (!mounted) return;
     final data = Map<String, dynamic>.from(call.arguments as Map? ?? {});
     switch (call.method) {
+      case 'fileDragSessionState':
+        _fileDrag.onNativeEvent(call.method, data);
+        if (_receiving && data['unexpected'] == true && data['inputStopped'] == true) {
+          setState(() => _status = '文件拖拽在松手前结束，已停止转发以避免误拖 Mac 文件。');
+          await _lan.endCapture(reason: 'file_drag_failed');
+        }
       case 'fileDragRequest':
       case 'fileDragCancel':
         _fileDrag.onNativeEvent(call.method, data);

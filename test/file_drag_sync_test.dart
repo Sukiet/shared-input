@@ -117,6 +117,57 @@ void main() {
     },
   );
   test(
+    'native session loss is reported to controller instead of silently becoming a local drag',
+    () async {
+      expect(source.supportsFileDragState, true);
+      receiver.onNativeEvent('fileDragSessionState', {
+        'drag': 'c' * 32,
+        'phase': 'dragging',
+      });
+      await eventually(() => sender.status == 'Mac 文件拖拽进行中');
+      receiver.onNativeEvent('fileDragSessionState', {
+        'drag': 'c' * 32,
+        'phase': 'ended',
+        'unexpected': true,
+        'accepted': false,
+        'elapsedMs': 247,
+        'sourceEventNumber': 819,
+        'combinedLeftDown': true,
+        'hidLeftDown': false,
+      });
+      await eventually(() => sender.status.contains('提前结束'));
+      expect(sender.lastSessionState['elapsedMs'], 247);
+      expect(sender.lastSessionState['sourceEventNumber'], 819);
+      expect(sender.lastSessionState['combinedLeftDown'], true);
+      expect(source.connected && target.connected, true);
+    },
+  );
+
+  test(
+    'native diagnostics do not send a new control type to older controllers',
+    () async {
+      source.fileDragStateSupported = false;
+      await source.close();
+      await eventually(() => !target.connected);
+      await source.connect(host: '127.0.0.1', port: target.port, key: 'a' * 32);
+      await eventually(
+        () => sender.files.connected && receiver.files.connected,
+      );
+      expect(target.supportsFileDrag, true);
+      expect(target.supportsFileDragState, false);
+      receiver.onNativeEvent('fileDragSessionState', {
+        'drag': 'd' * 32,
+        'phase': 'ended',
+        'unexpected': true,
+        'accepted': false,
+      });
+      await Future<void>.delayed(const Duration(milliseconds: 60));
+      expect(receiver.status, contains('提前结束'));
+      expect(sender.lastSessionState, isEmpty);
+      expect(source.connected && target.connected, true);
+    },
+  );
+  test(
     'late OLE metadata may join the same physical press before crossing',
     () async {
       final stale = await preview(metadataPress: 16), fresh = await preview();

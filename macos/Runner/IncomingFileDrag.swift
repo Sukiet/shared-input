@@ -43,6 +43,14 @@ private final class IncomingDragPanel: NSPanel {
   override var canBecomeMain: Bool { false }
 }
 
+private final class IncomingDragView: NSView {
+  var pressed: ((NSEvent) -> Void)?
+  var released: (() -> Void)?
+  override func acceptsFirstMouse(for event: NSEvent?) -> Bool { true }
+  override func mouseDown(with event: NSEvent) { pressed?(event) }
+  override func mouseUp(with event: NSEvent) { released?() }
+}
+
 private final class FilePromiseWrite {
   let id: String
   let progress: Progress
@@ -86,11 +94,17 @@ final class IncomingFileDrag: NSObject, NSDraggingSource, NSFilePromiseProviderD
   private var session: NSDraggingSession?
   private var drag: String?
   private var providers: [NSFilePromiseProvider] = []
-  private var released = false
-  var sessionEnded: (() -> Void)?
+  private var preparedItems: [NSDraggingItem] = []
+  private var lifecycle = IncomingDragLifecycle()
+  private var startCompletion: ((String?) -> Void)?
+  private var startedAt = 0.0
+  private var sourceEventNumber = -1
+  var sessionStarted: ((String) -> Void)?
+  var sessionEnded: (([String: Any]) -> Void)?
   // A bounded retain set keeps promise delegates alive after a drop, while a
   // later screen crossing may already start a new drag.
   private var offered: [String: [String: IncomingDragItem]] = [:]
+  private var writable = Set<String>()
 
   init(channel: FlutterMethodChannel) { self.channel = channel; super.init() }
 
@@ -101,10 +115,19 @@ final class IncomingFileDrag: NSObject, NSDraggingSource, NSFilePromiseProviderD
     return parsed.count == items.count && Set(parsed.map { $0.id }).count == parsed.count
   }
 
-  func start(_ raw: [String: Any], at quartz: CGPoint, mouseSource: CGEventSource?) -> Bool {
-    guard validate(raw), session == nil,
+  func start(_ raw: [String: Any], at quartz: CGPoint, mouseSource: CGEventSource?,
+      isCurrent: () -> Bool,
+      completion: @escaping (String?) -> Void) -> Bool {
+    guard validate(raw), panel == nil,
           let id = raw["drag"] as? String, let values = raw["items"] as? [[String: Any]] else { return false }
     let items = values.compactMap(IncomingDragItem.parse)
+    mutex.lock(); self.drag = id; lifecycle.prepare()
+    startCompletion = completion; startedAt = ProcessInfo.processInfo.systemUptime; sourceEventNumber = -1
+    offered[id] = Dictionary(uniqueKeysWithValues: items.map { ($0.id, $0) })
+    if offered.count > 8, let first = offered.keys.first(where: { $0 != id }) {
+      offered.removeValue(forKey: first); writable.remove(first)
+    }
+    mutex.unlock()
     let primaryHeight = CGDisplayBounds(CGMainDisplayID()).height
     let point = NSPoint(x: quartz.x, y: primaryHeight - quartz.y)
     let panel = IncomingDragPanel(contentRect: NSRect(x: point.x - 1, y: point.y - 1, width: 2, height: 2),
@@ -112,20 +135,21 @@ final class IncomingFileDrag: NSObject, NSDraggingSource, NSFilePromiseProviderD
     panel.isOpaque = false; panel.backgroundColor = .clear; panel.hasShadow = false
     panel.level = .floating; panel.hidesOnDeactivate = false
     panel.collectionBehavior = [.canJoinAllSpaces, .fullScreenAuxiliary]
-    let view = NSView(frame: NSRect(x: 0, y: 0, width: 2, height: 2))
+    let view = IncomingDragView(frame: NSRect(x: 0, y: 0, width: 2, height: 2))
+    view.pressed = { [weak self, weak view] event in
+      guard let view = view else { return }
+      self?.sourceMouseDown(event, view: view, id: id)
+    }
+    view.released = { [weak self] in self?.sourceMouseUp(id: id) }
     panel.contentView = view
     panel.orderFrontRegardless()
-    self.panel = panel; self.drag = id
-    mutex.lock(); released = false
-    offered[id] = Dictionary(uniqueKeysWithValues: items.map { ($0.id, $0) })
-    if offered.count > 8, let first = offered.keys.first(where: { $0 != id }) { offered.removeValue(forKey: first) }
-    mutex.unlock()
+    self.panel = panel
     providers = items.map { item in
       let provider = NSFilePromiseProvider(fileType: item.contentType.identifier, delegate: self)
       provider.userInfo = ["drag": id, "item": item.id]
       return provider
     }
-    let draggingItems = zip(items, providers).enumerated().map { index, pair -> NSDraggingItem in
+    preparedItems = zip(items, providers).enumerated().map { index, pair -> NSDraggingItem in
       let (item, provider) = pair
       let dragging = NSDraggingItem(pasteboardWriter: provider)
       let icon = item.previewImage ?? NSWorkspace.shared.icon(for: item.contentType)
@@ -148,34 +172,102 @@ final class IncomingFileDrag: NSObject, NSDraggingSource, NSFilePromiseProviderD
       }
       return dragging
     }
-    guard let event = NSEvent.mouseEvent(with: .leftMouseDown, location: NSPoint(x: 1, y: 1),
-        modifierFlags: [], timestamp: ProcessInfo.processInfo.systemUptime, windowNumber: panel.windowNumber,
-        context: nil, eventNumber: 0, clickCount: 1, pressure: 1) else {
-      panel.orderOut(nil); self.panel = nil; self.drag = nil; return false
-    }
+    // Queue exactly one physical-style down to our nonactivating source view.
+    // beginDraggingSession must use the real NSEvent dispatched by WindowServer,
+    // after this down has taken effect, not a fabricated eventNumber=0 event.
     let down = CGEvent(mouseEventSource: mouseSource, mouseType: .leftMouseDown,
       mouseCursorPosition: quartz, mouseButton: .left)
-    down?.setIntegerValueField(.eventSourceUserData, value: ReceiverCursorVisibility.remoteEventTag)
-    down?.post(tap: .cghidEventTap)
-    let session = view.beginDraggingSession(with: draggingItems, event: event, source: self)
-    session.animatesToStartingPositionsOnCancelOrFail = false
-    session.draggingFormation = .pile
-    mutex.lock(); self.session = session; mutex.unlock()
-    // Keep the source window alive, but pass subsequent events to the desktop.
-    panel.ignoresMouseEvents = true
+    guard let down = down else {
+      panel.orderOut(nil); self.panel = nil
+      mutex.lock(); self.drag = nil; startCompletion = nil; mutex.unlock(); return false
+    }
+    down.setIntegerValueField(.eventSourceUserData, value: ReceiverCursorVisibility.remoteEventTag)
+    down.setIntegerValueField(.mouseEventClickState, value: 1)
+    down.setDoubleValueField(.mouseEventPressure, value: 1)
+    down.flags = []
+    // Preparation may include slow icon lookups. Never post a late Down after
+    // the input watchdog has already released this capture's buttons.
+    let current = isCurrent()
+    mutex.lock()
+    let pending = current && lifecycle.phase == .awaitingDown
+    if pending { down.post(tap: .cghidEventTap) }
+    else { _ = lifecycle.cancel() }
+    mutex.unlock()
+    if !pending {
+      finishStart("文件拖拽在准备期间已取消")
+      closeSource(unexpected: false, accepted: false, operation: [])
+      return true
+    }
+    // Source stays hit-testable until the session ends. Making it transparent
+    // here can route the still-queued down into Finder and replace the drag.
+    DispatchQueue.main.asyncAfter(deadline: .now() + .seconds(1)) { [weak self] in
+      guard let self = self, self.drag == id else { return }
+      self.mutex.lock()
+      let pending = self.startCompletion != nil
+      self.mutex.unlock()
+      if pending { self.cancelDrag(); self.finishStart("Mac 未收到有效的文件拖拽启动事件") }
+    }
     return true
   }
 
-  func userReleased() { mutex.lock(); released = true; mutex.unlock() }
+  var motionAllowed: Bool { mutex.lock(); defer { mutex.unlock() }; return lifecycle.motionAllowed }
+
+  private func sourceMouseDown(_ event: NSEvent, view: NSView, id: String) {
+    guard drag == id, view.window === panel,
+          event.cgEvent?.getIntegerValueField(.eventSourceUserData) == ReceiverCursorVisibility.remoteEventTag else { return }
+    mutex.lock()
+    let begin = lifecycle.sourceMouseDown()
+    if begin { sourceEventNumber = event.eventNumber }
+    mutex.unlock()
+    guard begin else { return }
+    NSLog("Shared Input incoming file drag source down: event=%ld window=%ld",
+      event.eventNumber, event.windowNumber)
+    let session = view.beginDraggingSession(with: preparedItems, event: event, source: self)
+    session.animatesToStartingPositionsOnCancelOrFail = false
+    mutex.lock(); self.session = session; mutex.unlock()
+  }
+
+  private func finishStart(_ error: String?) {
+    mutex.lock(); let completion = startCompletion; startCompletion = nil; mutex.unlock()
+    completion?(error)
+  }
+
+  private func sourceMouseUp(id: String) {
+    guard drag == id, session == nil else { return }
+    mutex.lock(); let result = lifecycle.ended(copy: false); mutex.unlock()
+    finishStart("文件拖拽尚未启动就已释放")
+    closeSource(unexpected: result.unexpected, accepted: false, operation: [])
+  }
+
+  func userReleased() {
+    mutex.lock()
+    if lifecycle.release(), let id = drag { writable.insert(id) }
+    mutex.unlock()
+  }
   // Can be requested from the input watchdog queue while it holds its input
   // lock. Queue cancellation before the paired MouseUp, rather than calling
   // AppKit synchronously from that queue or changing focus.
   func cancelDrag() {
     mutex.lock()
-    let cancel = session != nil && !released
-    if cancel { released = true }
+    let cancel = lifecycle.cancel()
+    let id = drag
+    if let id = drag { writable.remove(id) }
     mutex.unlock()
-    guard cancel else { return }
+    if cancel { postEscape() }
+    DispatchQueue.main.async { [weak self] in
+      guard let self = self, self.drag == id else { return }
+      self.finishStart("文件拖拽已取消")
+    }
+    DispatchQueue.main.asyncAfter(deadline: .now() + .seconds(1)) { [weak self] in
+      guard let self = self, let id = id, self.drag == id, self.session == nil else { return }
+      self.mutex.lock()
+      let pending = self.lifecycle.phase == .cancelling
+      if pending { _ = self.lifecycle.ended(copy: false) }
+      self.mutex.unlock()
+      if pending { self.closeSource(unexpected: false, accepted: false, operation: []) }
+    }
+  }
+  private func postEscape() {
     let source = CGEventSource(stateID: .privateState)
     let down = CGEvent(keyboardEventSource: source, virtualKey: 53, keyDown: true)
     let up = CGEvent(keyboardEventSource: source, virtualKey: 53, keyDown: false)
@@ -184,10 +276,34 @@ final class IncomingFileDrag: NSObject, NSDraggingSource, NSFilePromiseProviderD
 
   func draggingSession(_ session: NSDraggingSession, sourceOperationMaskFor context: NSDraggingContext) -> NSDragOperation { .copy }
   func ignoreModifierKeys(for session: NSDraggingSession) -> Bool { true }
+  func draggingSession(_ session: NSDraggingSession, willBeginAt screenPoint: NSPoint) {
+    mutex.lock(); let began = lifecycle.willBegin(); mutex.unlock()
+    guard began else { postEscape(); return }
+    if let id = drag { sessionStarted?(id) }
+    finishStart(nil)
+  }
   func draggingSession(_ session: NSDraggingSession, endedAt screenPoint: NSPoint, operation: NSDragOperation) {
-    mutex.lock(); self.session = nil; mutex.unlock()
-    panel?.orderOut(nil); panel = nil; providers = []; drag = nil
-    sessionEnded?()
+    mutex.lock()
+    self.session = nil
+    let outcome = lifecycle.ended(copy: operation.contains(.copy))
+    if !outcome.accepted, let id = drag { writable.remove(id) }
+    mutex.unlock()
+    finishStart(outcome.unexpected ? "Mac 文件拖拽在松手前异常结束" : "文件拖拽已结束")
+    closeSource(unexpected: outcome.unexpected, accepted: outcome.accepted, operation: operation)
+  }
+
+  private func closeSource(unexpected: Bool, accepted: Bool, operation: NSDragOperation) {
+    let state: [String: Any] = ["drag": drag ?? "", "unexpected": unexpected,
+      "accepted": accepted, "operation": Int(operation.rawValue), "sourceEventNumber": sourceEventNumber,
+      "elapsedMs": Int((ProcessInfo.processInfo.systemUptime - startedAt) * 1000),
+      "combinedLeftDown": CGEventSource.buttonState(.combinedSessionState, button: .left),
+      "hidLeftDown": CGEventSource.buttonState(.hidSystemState, button: .left)]
+    NSLog("Shared Input incoming file drag ended: %@", String(describing: state))
+    // Tell the receiver to stop injected dragging before releasing the source
+    // window. A failed file session must never become a desktop selection.
+    sessionEnded?(state)
+    panel?.orderOut(nil); panel = nil; providers = []; preparedItems = []
+    mutex.lock(); drag = nil; mutex.unlock()
   }
 
   func filePromiseProvider(_ filePromiseProvider: NSFilePromiseProvider, fileNameForType fileType: String) -> String {
@@ -201,7 +317,9 @@ final class IncomingFileDrag: NSObject, NSDraggingSource, NSFilePromiseProviderD
       completionHandler: @escaping (Error?) -> Void) {
     mutex.lock()
     let identity = provider.userInfo as? [String: String]
-    let itemValue = identity.flatMap { value in offered[value["drag"] ?? ""]?[value["item"] ?? ""] }
+    let itemValue = identity.flatMap { value in
+      writable.contains(value["drag"] ?? "") ? offered[value["drag"] ?? ""]?[value["item"] ?? ""] : nil
+    }
     mutex.unlock()
     guard let identity = identity,
           let drag = identity["drag"], let id = identity["item"], let item = itemValue,
@@ -265,7 +383,7 @@ final class IncomingFileDrag: NSObject, NSDraggingSource, NSFilePromiseProviderD
   }
   func reset() {
     cancelDrag()
-    mutex.lock(); let pending = Array(writes.values); offered.removeAll(); mutex.unlock()
+    mutex.lock(); let pending = Array(writes.values); offered.removeAll(); writable.removeAll(); mutex.unlock()
     for write in pending {
       write.complete(NSError(domain: NSCocoaErrorDomain, code: NSUserCancelledError,
         userInfo: [NSLocalizedDescriptionKey: "连接已结束，文件传输已取消"]))

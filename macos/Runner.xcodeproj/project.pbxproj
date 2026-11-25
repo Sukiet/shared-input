@@ -21,6 +21,7 @@
 /* End PBXAggregateTarget section */
 
 /* Begin PBXBuildFile section */
+        AB001001000000000000000F /* IncomingDragLifecycle.swift in Sources */ = {isa = PBXBuildFile; fileRef = AB001002000000000000000C /* IncomingDragLifecycle.swift */; };
         AB001001000000000000000E /* IncomingFileDrag.swift in Sources */ = {isa = PBXBuildFile; fileRef = AB001002000000000000000B /* IncomingFileDrag.swift */; };
         AB001001000000000000000D /* ScreenPolicyBridge.swift in Sources */ = {isa = PBXBuildFile; fileRef = AB001002000000000000000A /* ScreenPolicyBridge.swift */; };
 		AB001001000000000000000B /* EdgeDragProbe.swift in Sources */ = {isa = PBXBuildFile; fileRef = AB0010020000000000000009 /* EdgeDragProbe.swift */; };
@@ -75,6 +76,7 @@
 /* End PBXCopyFilesBuildPhase section */
 
 /* Begin PBXFileReference section */
+        AB001002000000000000000C /* IncomingDragLifecycle.swift */ = {isa = PBXFileReference; lastKnownFileType = sourcecode.swift; path = IncomingDragLifecycle.swift; sourceTree = "<group>"; };
         AB001002000000000000000B /* IncomingFileDrag.swift */ = {isa = PBXFileReference; lastKnownFileType = sourcecode.swift; path = IncomingFileDrag.swift; sourceTree = "<group>"; };
         AB001002000000000000000A /* ScreenPolicyBridge.swift */ = {isa = PBXFileReference; lastKnownFileType = sourcecode.swift; path = ScreenPolicyBridge.swift; sourceTree = "<group>"; };
 		AB0010020000000000000009 /* EdgeDragProbe.swift */ = {isa = PBXFileReference; lastKnownFileType = sourcecode.swift; path = EdgeDragProbe.swift; sourceTree = "<group>"; };
@@ -196,6 +198,7 @@
 				AB0010020000000000000001 /* RemoteInputBridge.swift */,
 				AB001002000000000000000A /* ScreenPolicyBridge.swift */,
 				AB001002000000000000000B /* IncomingFileDrag.swift */,
+				AB001002000000000000000C /* IncomingDragLifecycle.swift */,
 				AB0010020000000000000009 /* EdgeDragProbe.swift */,
 				AB0010020000000000000007 /* AudioCaptureBridge.swift */,
 				AB0010020000000000000008 /* AudioPacket.swift */,
@@ -397,6 +400,7 @@
 				AB0010010000000000000001 /* RemoteInputBridge.swift in Sources */,
 				AB001001000000000000000D /* ScreenPolicyBridge.swift in Sources */,
 				AB001001000000000000000E /* IncomingFileDrag.swift in Sources */,
+				AB001001000000000000000F /* IncomingDragLifecycle.swift in Sources */,
 				AB001001000000000000000B /* EdgeDragProbe.swift in Sources */,
 				AB0010010000000000000009 /* AudioCaptureBridge.swift in Sources */,
 				AB001001000000000000000A /* AudioPacket.swift in Sources */,
