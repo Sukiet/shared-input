@@ -3,7 +3,9 @@
 #include <windows.h>
 #include <cstdint>
 #include <vector>
+#include <string>
 namespace shared_input {
+std::vector<uint8_t> FileDragThumbnail(const std::wstring& path);
 constexpr size_t kClipboardImageLimit = 32u * 1024 * 1024;
 constexpr size_t kClipboardTextLimit = 1024u * 1024;
 constexpr uint64_t kClipboardPixelLimit = 32u * 1024 * 1024;

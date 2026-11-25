@@ -14,6 +14,28 @@ Future<void> eventually(bool Function() condition) async {
 }
 
 void main() {
+  test('file drag negotiates source/target roles and accompanies edge begin', () async {
+    final receiver = LanSession()..fileDragSupported = true..fileDragTarget = true;
+    final controller = LanSession()..fileDragSupported = true..fileDragSource = true;
+    Map<String, dynamic>? received;
+    receiver.onPointerInfo = () async => {'width': 1000.0, 'height': 800.0,
+      'x': 300.0, 'y': 300.0, 'left': 0.0, 'top': 0.0, 'sequence': 0};
+    receiver.onBeginWithOptions = (_, options) async { received = options; };
+    final offer = {'drag': 'f' * 32, 'items': [{'id': 'e' * 32,
+      'name': 'image.png', 'folder': false, 'size': 1234}]};
+    try {
+      await receiver.listen(port: 0, key: 'a' * 32, bindAddress: '127.0.0.1');
+      await controller.connect(host: '127.0.0.1', port: receiver.port, key: 'a' * 32);
+      expect(controller.supportsFileDrag, true);
+      expect(receiver.supportsFileDrag, true);
+      await controller.beginCapture(edgeEntryY: 0.5, fileDrag: offer);
+      expect(received?['fileDrag'], offer);
+      expect(controller.capturing, true);
+    } finally {
+      await controller.close(); await receiver.close();
+      controller.dispose(); receiver.dispose();
+    }
+  });
   test('receiver drag leases survive capture end and carry explicit resume identity', () async {
     final receiver = LanSession()..receiverDragHoldSupported = true;
     final controller = LanSession()..receiverDragHoldSupported = true;

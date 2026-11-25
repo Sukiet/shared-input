@@ -114,6 +114,7 @@ class PreviewTarget final : public IDropTarget {
     auto data = InspectDragObject(object);
     if (state_->enabled && generation == state_->generation) {
       state_->data = std::move(data); state_->hovering = true;
+      state_->metadata_press = state_->source_press;
       state_->phase = state_->data.count ? "enter" : "unsupported"; state_->Changed();
     }
     return S_OK;
@@ -224,7 +225,8 @@ void EdgeDragProbe::Reposition() {
   SetDragging(state_->hit_enabled);
   ShowWindow(state_->window, SW_SHOWNOACTIVATE);
 }
-void EdgeDragProbe::SetDragging(bool dragging) {
+void EdgeDragProbe::SetDragging(bool dragging, uint64_t press) {
+  if (press != 0) state_->source_press = press;
   if (!state_->enabled || !state_->window) return;
   RECT bounds{};
   if (dragging) GetClientRect(state_->window, &bounds);

@@ -98,6 +98,8 @@ class InputBridge {
   bool edge_enabled_ = false, background_capture_ = false;
   shared_input::DragHandoff drag_handoff_;
   bool drag_capture_ = false;
+  bool file_drag_capture_ = false;
+  bool file_drag_released_ = false;
   bool receiver_drag_test_ = false;
   unsigned drag_passthrough_buttons_ = 0;
   uint64_t edge_requested_ = 0, edge_cooldown_ = 0;

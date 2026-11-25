@@ -243,6 +243,10 @@ InputBridge::Map InputBridge::ScreenState() const {
 void InputBridge::OnMethod(const flutter::MethodCall<Value>& call,
                            std::unique_ptr<Result> result) {
   const auto& method = call.method_name();
+  if (method == "fileDragCapabilities") {
+    result->Success(Value(Map{{Value("source"), Value(true)}, {Value("target"), Value(false)}})); return;
+  }
+  if (method == "fileDragThumbnail") { clipboard_->Handle(call, std::move(result)); return; }
   if (method == "screenCapabilities") {
     result->Success(Value(Map{{Value("controller"), Value(screen_state_->available() && session_notifications_)},
         {Value("receiver"), Value(false)}})); return;
@@ -521,6 +525,9 @@ void InputBridge::Start(const Map& args, std::unique_ptr<Result> result) {
   }
   const unsigned local_buttons = drag_requested ? (drag_handoff_.Buttons() & ~remote_buttons) : 0;
   const unsigned allowed_buttons = local_buttons | remote_buttons;
+  if (BoolArg(args, "fileDrag") && local_buttons != 1) {
+    result->Error("file_drag_button", "文件传递暂仅支持左键拖拽。"); return;
+  }
   if (drag_requested && (!BoolArg(args, "background") || !drag_probe_ || !drag_probe_->Enabled() ||
       !drag_handoff_.Ready(drag_flow) || drag_handoff_.Stage() != "switching")) {
     result->Error("drag_handoff_cancelled", "拖拽状态已改变，已取消跨屏。"); return;
@@ -581,6 +588,8 @@ void InputBridge::Start(const Map& args, std::unique_ptr<Result> result) {
   started_ = GetTickCount64();
   background_capture_ = background;
   drag_capture_ = drag_requested;
+  file_drag_capture_ = drag_requested && BoolArg(args, "fileDrag");
+  file_drag_released_ = false;
   drag_passthrough_buttons_ = local_buttons;
   if (background) {
     if (!background_.Install(owner_, kBackgroundStopMessage, shortcut_key_, shortcut_shift_)) {
@@ -679,6 +688,7 @@ void InputBridge::Stop(const std::string& reason, bool notify) {
   const bool source_pending = was_drag_capture && (drag_handoff_.GestureActive() ||
       (drag_probe_ && drag_probe_->Snapshot().hovering));
   drag_capture_ = false; drag_passthrough_buttons_ = 0;
+  file_drag_capture_ = false;
   if (was_active && was_drag_capture && drag_handoff_.Returned(reason) && drag_probe_) drag_probe_->Notify();
   if (was_active && remote_capture_) FlushStream();
   StopStream();
@@ -759,6 +769,9 @@ void InputBridge::ProcessInput(const RAWINPUT& raw, UINT bytes, bool from_hook) 
   if (!from_hook && raw.header.dwType == RIM_TYPEMOUSE &&
       bytes >= sizeof(RAWINPUTHEADER) + sizeof(RAWMOUSE)) {
     receiver_drag_press_.Observe(raw.data.mouse.usButtonFlags);
+    if (drag_probe_ && (raw.data.mouse.usButtonFlags & RI_MOUSE_LEFT_BUTTON_DOWN)) {
+      drag_probe_->ObservePress(receiver_drag_press_.Id(0));
+    }
   }
   if (!from_hook && edge_enabled_ && raw.header.hDevice) {
     if (raw.header.dwType == RIM_TYPEKEYBOARD && bytes >= sizeof(RAWINPUTHEADER) + sizeof(RAWKEYBOARD) &&
@@ -839,7 +852,7 @@ void InputBridge::ProcessInput(const RAWINPUT& raw, UINT bytes, bool from_hook) 
         if (drag_probe_ && drag_probe_->Enabled() && (local_buttons == 1 || local_buttons == 2) &&
             !AnyHeld(local_buttons)) {
           if (drag_handoff_.PushEdge(local_buttons)) {
-            drag_probe_->SetDragging(true);
+            drag_probe_->SetDragging(true, receiver_drag_press_.Id(0));
             drag_probe_->Notify();
           }
         } else if (!AnyHeld() && !background_.HasHeld() &&
@@ -873,8 +886,15 @@ void InputBridge::ProcessInput(const RAWINPUT& raw, UINT bytes, bool from_hook) 
     if (mouse.usButtonFlags) ++buttons_;
     for (int button = 0; button < 5; ++button) {
       if (drag_passthrough_buttons_ & (1u << button)) {
-        if (mouse.usButtonFlags & (2 << (button * 2))) drag_passthrough_buttons_ &= ~(1u << button);
-        continue; // This press began on Windows; never send its lone up to Mac.
+        if (mouse.usButtonFlags & (2 << (button * 2))) {
+          drag_passthrough_buttons_ &= ~(1u << button);
+          if (file_drag_capture_ && !file_drag_released_) {
+            file_drag_released_ = true;
+            QueueInput({{Value("kind"), Value("button")},
+                {Value("button"), Value(button)}, {Value("down"), Value(false)}});
+          }
+        }
+        continue; // Ordinary local presses stay local; promises own a matching remote down.
       }
       if (mouse.usButtonFlags & (1 << (button * 2))) {
         held_buttons_.insert(button);
@@ -993,6 +1013,8 @@ InputBridge::Map InputBridge::DragProbeSnapshot() const {
   return {{Value("enabled"), Value(state.enabled)}, {Value("side"), Value(shared_input::EdgeName(state.side))},
       {Value("hitEnabled"), Value(state.enabled && state.hit_enabled)},
       {Value("hovering"), Value(state.hovering)},
+      {Value("sourcePress"), Value(static_cast<int64_t>(receiver_drag_press_.Id(0)))},
+      {Value("metadataPress"), Value(static_cast<int64_t>(state.metadata_press))},
       {Value("dragStage"), Value(drag_handoff_.Stage())}, {Value("dragFlow"), Value(static_cast<int64_t>(drag_handoff_.Flow()))},
       {Value("gestureActive"), Value(drag_handoff_.GestureActive())}, {Value("onRemote"), Value(drag_handoff_.Remote())},
       {Value("dragHistory"), Value(std::move(history))}, {Value("dragReason"), Value(drag_handoff_.Reason())},
@@ -1003,6 +1025,13 @@ InputBridge::Map InputBridge::DragProbeSnapshot() const {
 }
 
 void InputBridge::EndSourceDragGesture() {
+  // The hook independently observes source release. Repair a missed raw up,
+  // but never turn a shortcut/cancellation while still held into a real drop.
+  if (active_ && file_drag_capture_ && !file_drag_released_ &&
+      (drag_passthrough_buttons_ & 1) && background_.PhysicalButtons() == 0) {
+    file_drag_released_ = true;
+    QueueInput({{Value("kind"), Value("button")}, {Value("button"), Value(0)}, {Value("down"), Value(false)}});
+  }
   const bool changed = drag_handoff_.EndGesture();
   if (!drag_probe_ || !drag_probe_->Enabled()) return;
   // Retain the rejecting target until OLE acknowledges completion. Removing
@@ -1113,7 +1142,7 @@ std::optional<LRESULT> InputBridge::HandleMessage(UINT message, WPARAM wparam, L
         bool changed = false;
         if (wparam && !active_) {
           changed = drag_handoff_.Gesture(static_cast<unsigned>(wparam));
-          if (changed) drag_probe_->SetDragging(true);
+          if (changed) drag_probe_->SetDragging(true, receiver_drag_press_.Id(0));
         } else if (!wparam) {
           EndSourceDragGesture();
         }

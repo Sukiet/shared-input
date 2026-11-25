@@ -177,11 +177,17 @@ final class MacEdgeDragProbe {
   private var panel: DragProbePanel?
   private var globalMonitor: Any?, localMonitor: Any?
   private var screenObserver: NSObjectProtocol?
+  private var incomingFileDrag = false
+  func suppressIncomingFileDrag(_ value: Bool) {
+    incomingFileDrag = value
+    if value || !state.active { panel?.ignoresMouseEvents = true }
+    publish()
+  }
   var changed: (([String: Any]) -> Void)?
   var localInput: ((NSEvent) -> Void)?
   var dragEnded: ((Int) -> Void)?
   func suspensionFlow(button: Int, from down: CGPoint, to point: CGPoint) -> Int? {
-    guard enabled, atEdge else { return nil }
+    guard enabled, !incomingFileDrag, atEdge else { return nil }
     let wasActive = state.active
     guard state.prepareSuspension(distance: hypot(point.x - down.x, point.y - down.y)) else { return nil }
     panel?.ignoresMouseEvents = false
@@ -295,7 +301,7 @@ final class MacEdgeDragProbe {
   }
   private func observe(_ event: NSEvent) {
     localInput?(event)
-    guard enabled else { return }
+    guard enabled, !incomingFileDrag else { return }
     let point = event.cgEvent?.location ?? NSEvent.mouseLocation
     switch event.type {
     case .leftMouseDown, .rightMouseDown:
@@ -319,7 +325,7 @@ final class MacEdgeDragProbe {
     }
   }
   fileprivate func entered(_ sender: NSDraggingInfo) {
-    guard enabled else { return }
+    guard enabled, !incomingFileDrag else { return }
     if !state.active { state.begin() }
     state.edge(); hovering = true; metadata = MacDragMetadata.inspect(sender.draggingPasteboard)
     phase = metadata.count > 0 ? "enter" : "unsupported"; publish()

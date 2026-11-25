@@ -30,6 +30,7 @@ class EdgeDragProbe {
     shared_input::ScreenEdge side = shared_input::ScreenEdge::right;
     std::string phase = "off";
     uint64_t revision = 0, generation = 0;
+    uint64_t source_press = 0, metadata_press = 0;
     DragPreviewData data;
     void Changed();
   };
@@ -38,7 +39,8 @@ class EdgeDragProbe {
   HRESULT Configure(bool enabled, shared_input::ScreenEdge side);
   void Clear();
   void Reposition();
-  void SetDragging(bool dragging);
+  void SetDragging(bool dragging, uint64_t press = 0);
+  void ObservePress(uint64_t press) { state_->source_press = press; }
   void Notify() { state_->Changed(); }
   bool Enabled() const { return state_->enabled; }
   const State& Snapshot() const { return *state_; }

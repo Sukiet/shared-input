@@ -10,6 +10,11 @@ import 'clipboard_channel.dart';
 import 'input_diagnostics.dart';
 
 class LanSession extends ChangeNotifier {
+  bool fileDragSupported = false, fileDragSource = false, fileDragTarget = false, supportsFileDrag = false;
+  FutureOr<void> Function(Map<String, dynamic>)? onFileDragControl;
+  Future<void> sendFileDragControl(Map<String, dynamic> message) async {
+    if (connected && supportsFileDrag) await _wire!.send(message);
+  }
   bool screenPolicySupported = false, supportsScreenPolicy = false;
   FutureOr<void> Function(Map<String, dynamic>)? onScreenControl;
   Future<void> sendScreenControl(Map<String, dynamic> message) async {
@@ -167,6 +172,7 @@ class LanSession extends ChangeNotifier {
               'capabilities': [
                 'motion-prediction-v1',
                 if (screenPolicySupported) 'screen-policy-v1',
+                if (fileDragSupported && fileDragTarget) 'file-drag-v1',
                 if (clipboardSupported) 'clipboard-v1',
                 if (dragPreviewSupported) 'edge-drag-preview-v1',
                 if (receiverDragHoldSupported) 'receiver-drag-hold-v1',
@@ -202,6 +208,8 @@ class LanSession extends ChangeNotifier {
               true;
           supportsScreenPolicy = screenPolicySupported &&
               (hello['capabilities'] as List?)?.contains('screen-policy-v1') == true;
+          supportsFileDrag = fileDragSupported && fileDragTarget &&
+              (hello['capabilities'] as List?)?.contains('file-drag-v1') == true;
           supportsClipboard =
               clipboardSupported &&
               (hello['capabilities'] as List?)?.contains('clipboard-v1') ==
@@ -276,6 +284,7 @@ class LanSession extends ChangeNotifier {
           'capabilities': [
             'motion-prediction-v1',
             if (screenPolicySupported) 'screen-policy-v1',
+            if (fileDragSupported && fileDragSource) 'file-drag-v1',
             if (clipboardSupported) 'clipboard-v1',
             if (dragPreviewSupported) 'edge-drag-preview-v1',
                 if (receiverDragHoldSupported) 'receiver-drag-hold-v1',
@@ -294,6 +303,8 @@ class LanSession extends ChangeNotifier {
           (ack['capabilities'] as List?)?.contains('edge-pointer-v1') == true;
       supportsScreenPolicy = screenPolicySupported &&
           (ack['capabilities'] as List?)?.contains('screen-policy-v1') == true;
+      supportsFileDrag = fileDragSupported && fileDragSource &&
+          (ack['capabilities'] as List?)?.contains('file-drag-v1') == true;
       supportsDragPreview =
           dragPreviewSupported &&
           (ack['capabilities'] as List?)?.contains('edge-drag-preview-v1') ==
@@ -412,6 +423,8 @@ class LanSession extends ChangeNotifier {
         );
         _lastReceived = DateTime.now();
         switch (json['type']) {
+          case 'fileDragPort':
+            if (supportsFileDrag) await onFileDragControl?.call(json);
           case 'screenPolicy':
           case 'screenPolicyStatus':
             if (supportsScreenPolicy) await onScreenControl?.call(json);
@@ -481,6 +494,10 @@ class LanSession extends ChangeNotifier {
               final options = Map<String, dynamic>.from(
                 json['options'] as Map? ?? {},
               );
+              if (options.containsKey('fileDrag') &&
+                  (!supportsFileDrag || options['fileDrag'] is! Map || options['receiverDragResume'] != null)) {
+                throw const FormatException('被控端不支持该文件拖拽或不能同时续接另一拖拽。');
+              }
               options.remove('receiverDragHold'); // Negotiated by this endpoint, never trusted from a peer option.
               final entry = options['edgeEntryY'];
               final side = options['edgeEntrySide'] ?? 'left';
@@ -599,6 +616,7 @@ class LanSession extends ChangeNotifier {
     double? edgeEntryY,
     String edgeEntrySide = 'left',
     Map<String, dynamic>? receiverDragResume,
+    Map<String, dynamic>? fileDrag,
   }) async {
     await _endingCapture;
     if (!connected || _receiver) throw StateError('请先连接被控端。');
@@ -625,6 +643,7 @@ class LanSession extends ChangeNotifier {
         if (edgeEntryY != null)
           'options': {
             'edgeEntryY': edgeEntryY,
+            if (supportsFileDrag && fileDrag != null) 'fileDrag': fileDrag,
             if (supportsReceiverDragHold && receiverDragResume != null) 'receiverDragResume': receiverDragResume,
             if (edgeEntrySide != 'left') 'edgeEntrySide': edgeEntrySide,
           },
@@ -884,6 +903,7 @@ class LanSession extends ChangeNotifier {
     supportsClipboard = false;
     supportsAudio = false;
     supportsScreenPolicy = false;
+    supportsFileDrag = false;
     _clipboardOpening = false;
     clipboard.close();
     remoteDisplay = null;

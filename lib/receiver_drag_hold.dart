@@ -198,12 +198,14 @@ class ReceiverDragHold {
     String edgeEntrySide = 'left',
     bool allowResume = false,
     bool Function()? allowed,
+    Map<String, dynamic>? fileDrag,
   }) async {
     var resume = allowResume ? await prepareResume() : null;
     Future<void> begin() => session.beginCapture(
       edgeEntryY: edgeEntryY,
       edgeEntrySide: edgeEntrySide,
       receiverDragResume: resume,
+      fileDrag: fileDrag,
     );
     try {
       await begin();

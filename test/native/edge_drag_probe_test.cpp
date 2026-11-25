@@ -104,11 +104,15 @@ int main() {
   Check(InspectDragObject(&source).files.empty(), "invalid promise count rejected");
   source.Paths({L"C:\\file.txt"});
   auto state = std::make_shared<EdgeDragProbe::State>(); state->enabled = true;
+  state->source_press = 17;
   auto target = CreateDragPreviewTarget(state);
   DWORD effect = DROPEFFECT_COPY | DROPEFFECT_MOVE;
   Check(target->DragEnter(&source, MK_LBUTTON, POINTL{}, &effect) == S_OK && effect == DROPEFFECT_NONE,
       "DragEnter previews while refusing copy and move");
   Check(state->data.files.size() == 1 && state->phase == "enter", "OLE callback publishes file list");
+  Check(state->metadata_press == 17, "metadata belongs to the physical press observed at DragEnter");
+  state->source_press = 18;
+  Check(state->metadata_press != state->source_press, "retained old preview cannot authorize a new press");
   effect = DROPEFFECT_COPY;
   target->DragOver(MK_LBUTTON, POINTL{}, &effect);
   Check(effect == DROPEFFECT_NONE, "DragOver never accepts a transfer");

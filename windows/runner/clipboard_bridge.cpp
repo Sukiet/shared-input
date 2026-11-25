@@ -86,8 +86,9 @@ void ClipboardBridge::Handle(const flutter::MethodCall<Value>& call, std::unique
   if (call.method_name() == "clipboardCancel") {
     ++generation_; result->Success(); return;
   }
-  if (!enabled_ || closing_) { result->Success(); return; }
-  if (call.method_name() != "clipboardRead" && call.method_name() != "clipboardWrite") {
+  const bool thumbnail = call.method_name() == "fileDragThumbnail";
+  if ((!enabled_ && !thumbnail) || closing_) { result->Success(); return; }
+  if (!thumbnail && call.method_name() != "clipboardRead" && call.method_name() != "clipboardWrite") {
     result->NotImplemented(); return;
   }
   std::shared_ptr<Result> shared = std::move(result);
@@ -120,6 +121,14 @@ void ClipboardBridge::Run() {
   if (SUCCEEDED(initialized)) CoUninitialize();
 }
 void ClipboardBridge::Process(Job job, HWND clipboard) {
+  if (job.method == "fileDragThumbnail") {
+    const auto path = Text(job.arguments, "path");
+    const int count = MultiByteToWideChar(CP_UTF8, MB_ERR_INVALID_CHARS, path.data(), static_cast<int>(path.size()), nullptr, 0);
+    std::wstring wide(count > 0 ? count : 0, L'\0');
+    if (count > 0) MultiByteToWideChar(CP_UTF8, MB_ERR_INVALID_CHARS, path.data(), static_cast<int>(path.size()), wide.data(), count);
+    const auto png = !closing_ && count > 0 ? shared_input::FileDragThumbnail(wide) : std::vector<uint8_t>{};
+    Reply(std::move(job.result), png.empty() ? Value() : Value(png)); return;
+  }
   if (!clipboard || !enabled_ || closing_ || job.generation != generation_) {
     Reply(std::move(job.result), Value()); return;
   }

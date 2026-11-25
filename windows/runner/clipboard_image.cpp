@@ -3,6 +3,7 @@
 #include <wrl/client.h>
 #include <cstring>
 #include <limits>
+#include <algorithm>
 
 namespace shared_input {
 using Microsoft::WRL::ComPtr;
@@ -15,6 +16,33 @@ ComPtr<IWICImagingFactory> Factory() {
   CoCreateInstance(CLSID_WICImagingFactory, nullptr, CLSCTX_INPROC_SERVER, IID_PPV_ARGS(&factory));
   return factory;
 }
+}
+std::vector<uint8_t> FileDragThumbnail(const std::wstring& path) {
+  auto factory = Factory();
+  ComPtr<IWICBitmapDecoder> decoder;
+  ComPtr<IWICBitmapFrameDecode> frame;
+  ComPtr<IWICBitmapScaler> scaler;
+  ComPtr<IWICFormatConverter> converter;
+  UINT width = 0, height = 0;
+  if (!factory || FAILED(factory->CreateDecoderFromFilename(path.c_str(), nullptr,
+      GENERIC_READ, WICDecodeMetadataCacheOnDemand, &decoder)) ||
+      FAILED(decoder->GetFrame(0, &frame)) || FAILED(frame->GetSize(&width, &height)) ||
+      !ValidClipboardSize(width, height)) return {};
+  const double ratio = std::min(1.0, 64.0 / std::max(width, height));
+  ClipboardPixels pixels;
+  pixels.width = std::max<UINT>(1, static_cast<UINT>(width * ratio));
+  pixels.height = std::max<UINT>(1, static_cast<UINT>(height * ratio));
+  if (FAILED(factory->CreateBitmapScaler(&scaler)) ||
+      FAILED(scaler->Initialize(frame.Get(), pixels.width, pixels.height, WICBitmapInterpolationModeFant)) ||
+      FAILED(factory->CreateFormatConverter(&converter)) ||
+      FAILED(converter->Initialize(scaler.Get(), GUID_WICPixelFormat32bppBGRA,
+          WICBitmapDitherTypeNone, nullptr, 0, WICBitmapPaletteTypeCustom))) return {};
+  pixels.bgra.resize(static_cast<size_t>(pixels.width) * pixels.height * 4);
+  std::vector<uint8_t> result;
+  if (FAILED(converter->CopyPixels(nullptr, pixels.width * 4,
+      static_cast<UINT>(pixels.bgra.size()), pixels.bgra.data())) ||
+      !EncodeClipboardPng(pixels, result) || result.size() > 16 * 1024) return {};
+  return result;
 }
 bool DecodeClipboardImage(const std::vector<uint8_t>& encoded, ClipboardPixels& pixels) {
   if (encoded.empty() || encoded.size() > kClipboardImageLimit) return false;

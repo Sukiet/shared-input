@@ -1,0 +1,141 @@
+import 'dart:io';
+import 'package:flutter/services.dart';
+import 'package:flutter_test/flutter_test.dart';
+import 'package:shared_input/edge_drag_preview.dart';
+import 'package:shared_input/file_drag_sync.dart';
+import 'package:shared_input/remote/lan_session.dart';
+
+Future<void> eventually(bool Function() condition) async {
+  final until = DateTime.now().add(const Duration(seconds: 8));
+  while (!condition()) {
+    if (DateTime.now().isAfter(until)) {
+      fail('File drag handshake did not finish');
+    }
+    await Future<void>.delayed(const Duration(milliseconds: 5));
+  }
+}
+
+void main() {
+  TestWidgetsFlutterBinding.ensureInitialized();
+  const sourceNative = MethodChannel('file-drag-test/source');
+  const targetNative = MethodChannel('file-drag-test/target');
+  final messenger =
+      TestDefaultBinaryMessengerBinding.instance.defaultBinaryMessenger;
+  late LanSession source, target;
+  late FileDragSync sender, receiver;
+  late Directory workspace;
+  final targetCalls = <MethodCall>[];
+  setUp(() async {
+    workspace = await Directory.systemTemp.createTemp(
+      'shared-input-file-link-',
+    );
+    targetCalls.clear();
+    messenger.setMockMethodCallHandler(
+      sourceNative,
+      (call) async => call.method == 'fileDragCapabilities'
+          ? {'source': true, 'target': false}
+          : null,
+    );
+    messenger.setMockMethodCallHandler(targetNative, (call) async {
+      targetCalls.add(call);
+      return call.method == 'fileDragCapabilities'
+          ? {'source': false, 'target': true}
+          : null;
+    });
+    source = LanSession();
+    target = LanSession();
+    sender = FileDragSync(source, sourceNative);
+    receiver = FileDragSync(target, targetNative);
+    await sender.initialize();
+    await receiver.initialize();
+    await target.listen(port: 0, key: 'a' * 32, bindAddress: '127.0.0.1');
+    await source.connect(host: '127.0.0.1', port: target.port, key: 'a' * 32);
+    await eventually(() => sender.files.connected && receiver.files.connected);
+  });
+  tearDown(() async {
+    await source.close();
+    await target.close();
+    sender.dispose();
+    receiver.dispose();
+    source.dispose();
+    target.dispose();
+    await sender.files.close();
+    await receiver.files.close();
+    await Future<void>.delayed(const Duration(milliseconds: 30));
+    messenger.setMockMethodCallHandler(sourceNative, null);
+    messenger.setMockMethodCallHandler(targetNative, null);
+    await workspace.delete(recursive: true);
+  });
+  Future<EdgeDragPreview> preview({
+    int metadataPress = 17,
+    bool promised = false,
+  }) async {
+    final file = await File(
+      '${workspace.path}/sample.txt',
+    ).writeAsString('from Windows');
+    return EdgeDragPreview(
+      enabled: true,
+      gestureActive: true,
+      sourcePress: 17,
+      metadataPress: metadataPress,
+      dragFlow: 1,
+      files: [DragPreviewFile('sample.txt', file.path, promised)],
+    );
+  }
+
+  test(
+    'promise destination requests use separate channel and finish native progress',
+    () async {
+      final offer = await sender.prepare(await preview());
+      final items = offer!['items'] as List;
+      expect((items.single as Map).containsKey('path'), false);
+      expect(source.capturing, false);
+      final destination = '${workspace.path}/received.txt';
+      receiver.onNativeEvent('fileDragRequest', {
+        'drag': offer['drag'],
+        'item': (items.single as Map)['id'],
+        'request': 'b' * 32,
+        'destination': destination,
+      });
+      await eventually(
+        () => targetCalls.any((call) => call.method == 'fileDragComplete'),
+      );
+      expect(await File(destination).readAsString(), 'from Windows');
+      expect(targetCalls.last.arguments, {'request': 'b' * 32, 'error': null});
+      expect(
+        targetCalls.any((call) => call.method == 'fileDragProgress'),
+        true,
+      );
+      expect(source.connected, true);
+    },
+  );
+  test(
+    'retained metadata from another press cannot create a file offer',
+    () async {
+      expect(await sender.prepare(await preview(metadataPress: 16)), isNull);
+      expect(await sender.prepare(await preview(metadataPress: 0)), isNull);
+    },
+  );
+  test(
+    'late OLE metadata may join the same physical press before crossing',
+    () async {
+      final stale = await preview(metadataPress: 16), fresh = await preview();
+      var reads = 0;
+      final offer = await sender.prepare(
+        stale,
+        current: () => ++reads >= 2 ? fresh : stale,
+      );
+      expect(offer, isNotNull);
+      expect(reads, 2);
+    },
+  );
+  test(
+    'virtual attachments fail visibly without reading arbitrary paths',
+    () async {
+      await expectLater(
+        sender.prepare(await preview(promised: true)),
+        throwsFormatException,
+      );
+    },
+  );
+}

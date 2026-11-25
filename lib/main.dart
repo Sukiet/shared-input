@@ -19,6 +19,7 @@ import 'scroll_speed.dart';
 import 'display_layout.dart';
 import 'display_layout_dialog.dart';
 import 'clipboard_sync.dart';
+import 'file_drag_sync.dart';
 import 'screen_sync.dart';
 import 'settings.dart';
 import 'remote/lan_session.dart';
@@ -91,6 +92,7 @@ class _InputPageState extends State<InputPage> with WidgetsBindingObserver {
   bool get _macReceiver => defaultTargetPlatform == TargetPlatform.macOS;
   bool get _dragSupported => _captureSupported || _macReceiver;
   late final ClipboardSync _clipboard;
+  late final FileDragSync _fileDrag;
   late final ScreenSync _screenSync;
   late final AudioSync _audioSync;
   late final SettingsRepository _preferences;
@@ -156,6 +158,7 @@ class _InputPageState extends State<InputPage> with WidgetsBindingObserver {
       widget.returnLogStore ?? MemorySettingsStore(),
     );
     _clipboard = ClipboardSync(_lan, _channel);
+    _fileDrag = FileDragSync(_lan, _channel);
     _screenSync = ScreenSync(_lan, _channel);
     _audioSync = AudioSync(_lan, _channel);
     _receiverDragHold = ReceiverDragHold(_lan, _channel, supported: _captureSupported || _macReceiver);
@@ -266,6 +269,7 @@ class _InputPageState extends State<InputPage> with WidgetsBindingObserver {
       });
       _screenSync.configure(_settings.screenPolicyEnabled, _settings.role);
       await _screenSync.initialize();
+      await _fileDrag.initialize();
       if (defaultTargetPlatform == TargetPlatform.macOS) {
         await _applySmoothing();
         await _applyCursorSettings();
@@ -403,6 +407,9 @@ class _InputPageState extends State<InputPage> with WidgetsBindingObserver {
     if (!mounted) return;
     final data = Map<String, dynamic>.from(call.arguments as Map? ?? {});
     switch (call.method) {
+      case 'fileDragRequest':
+      case 'fileDragCancel':
+        _fileDrag.onNativeEvent(call.method, data);
       case 'screenStateChanged':
         _screenSync.onNativeState(data);
       case 'edgeDragProbeChanged':
@@ -905,12 +912,18 @@ class _InputPageState extends State<InputPage> with WidgetsBindingObserver {
     await _preferences.flush();
     if (allowed != null && !allowed()) return;
     Map<String, dynamic>? resume;
+    Map<String, dynamic>? fileDrag;
+    if (dragFlow != null) {
+      fileDrag = await _fileDrag.prepare(_dragPreview.value, current: () => _dragPreview.value);
+      if (allowed != null && !allowed()) return;
+    }
     if (_lan.connected) {
       resume = await _receiverDragHold.beginCapture(
         edgeEntryY: background ? entryY : null,
         edgeEntrySide: entrySide,
         allowResume: background && dragFlow != null,
         allowed: allowed,
+        fileDrag: fileDrag,
       );
     }
     if (allowed != null && !allowed()) {
@@ -935,6 +948,7 @@ class _InputPageState extends State<InputPage> with WidgetsBindingObserver {
         'background': background,
         'edgeTriggered': edgeTriggered,
         'dragFlow': ?dragFlow,
+        'fileDrag': fileDrag != null,
         'receiverDragResume': ?resume,
       });
       if (mounted && identical(_controlRun, run)) {
@@ -1078,6 +1092,7 @@ class _InputPageState extends State<InputPage> with WidgetsBindingObserver {
     _audioSync.dispose();
     _screenSync.dispose();
     _clipboard.dispose();
+    _fileDrag.dispose();
     _lan.dispose();
     super.dispose();
   }
@@ -1952,7 +1967,7 @@ class _InputPageState extends State<InputPage> with WidgetsBindingObserver {
   );
 
   Widget _dragPanel() => ListenableBuilder(
-    listenable: _dragLink,
+    listenable: Listenable.merge([_dragLink, _fileDrag]),
     builder: (_, _) => ValueListenableBuilder<EdgeDragPreview>(
       valueListenable: _dragPreview,
       builder: (_, preview, _) {
@@ -1965,7 +1980,7 @@ class _InputPageState extends State<InputPage> with WidgetsBindingObserver {
         return EdgeDragPreviewPanel(
           preview: preview,
           peer: _dragLink.peer,
-          syncStatus: _dragLink.status,
+          syncStatus: '${_dragLink.status}\n${_fileDrag.status}',
           edgeLabel: '${side.label}边缘',
           canChange:
               _ready &&

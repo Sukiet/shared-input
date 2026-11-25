@@ -12,6 +12,7 @@ class HoldLan extends LanSession {
     double? edgeEntryY,
     String edgeEntrySide = 'left',
     Map<String, dynamic>? receiverDragResume,
+    Map<String, dynamic>? fileDrag,
   }) async {
     begins.add(receiverDragResume);
     await begin?.call(receiverDragResume);
@@ -70,8 +71,9 @@ void main() {
     link = ReceiverDragHold(lan, channel, supported: true);
     messenger.setMockMethodCallHandler(channel, (call) async {
       calls.add(call);
-      if (call.method == 'receiverDragButtons')
+      if (call.method == 'receiverDragButtons') {
         return pending?.future ?? Future.value(physical);
+      }
       return null;
     });
   });

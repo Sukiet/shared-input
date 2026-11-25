@@ -28,6 +28,8 @@ class EdgeDragPreview {
     this.dragReason = '',
     this.origin = DragOrigin.controller,
     this.side = '',
+    this.sourcePress = 0,
+    this.metadataPress = 0,
   });
   final bool enabled, hitEnabled, truncated;
   final int revision, count;
@@ -35,6 +37,7 @@ class EdgeDragPreview {
   final List<DragPreviewFile> files;
   final List<String> formats;
   final int dragFlow;
+  final int sourcePress, metadataPress;
   final String dragStage, dragReason;
   final bool gestureActive, onRemote, hovering;
   final List<String> dragHistory;
@@ -49,6 +52,8 @@ class EdgeDragPreview {
             ? DragOrigin.receiver
             : DragOrigin.controller,
         side: value['side'] as String? ?? '',
+        sourcePress: value['sourcePress'] as int? ?? 0,
+        metadataPress: value['metadataPress'] as int? ?? 0,
         hitEnabled: value['enabled'] == true && value['hitEnabled'] == true,
         revision: value['revision'] is int ? value['revision'] as int : 0,
         phase: value['phase'] is String ? value['phase'] as String : 'off',
@@ -142,7 +147,7 @@ class EdgeDragPreviewPanel extends StatelessWidget {
         contentPadding: EdgeInsets.zero,
         dense: true,
         title: const Text(
-          '边缘拖拽测试',
+          '跨屏拖拽',
           style: TextStyle(fontWeight: FontWeight.w600),
         ),
         subtitle: Text(
@@ -227,7 +232,7 @@ class EdgeDragPreviewPanel extends StatelessWidget {
       ),
       if (preview.enabled)
         const Text(
-          '开启后按住鼠标也可连续来回跨屏，无需松手；文件识别只用于展示，不传文件。',
+          'Windows 文件拖到 Mac 后松手复制，原文件保留；Mac → Windows 当前仍只显示拖拽信息。',
           style: TextStyle(fontSize: 11, color: Color(0xff929aa6)),
         ),
       if (preview.files.isNotEmpty)
