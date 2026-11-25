@@ -18,6 +18,7 @@ import 'scroll_speed.dart';
 import 'display_layout.dart';
 import 'display_layout_dialog.dart';
 import 'clipboard_sync.dart';
+import 'screen_sync.dart';
 import 'settings.dart';
 import 'remote/lan_session.dart';
 
@@ -88,6 +89,7 @@ class _InputPageState extends State<InputPage> with WidgetsBindingObserver {
   bool get _macReceiver => defaultTargetPlatform == TargetPlatform.macOS;
   bool get _dragSupported => _captureSupported || _macReceiver;
   late final ClipboardSync _clipboard;
+  late final ScreenSync _screenSync;
   late final AudioSync _audioSync;
   late final SettingsRepository _preferences;
   AppSettings _settings = AppSettings();
@@ -152,6 +154,7 @@ class _InputPageState extends State<InputPage> with WidgetsBindingObserver {
       widget.returnLogStore ?? MemorySettingsStore(),
     );
     _clipboard = ClipboardSync(_lan, _channel);
+    _screenSync = ScreenSync(_lan, _channel);
     _audioSync = AudioSync(_lan, _channel);
     _lan.addListener(_connectionChanged);
     _lan.onBeginWithOptions = (capture, options) => _channel.invokeMethod<void>(
@@ -255,6 +258,8 @@ class _InputPageState extends State<InputPage> with WidgetsBindingObserver {
       await _channel.invokeMethod<void>('initialize', {
         'diagnostics': const bool.fromEnvironment('INPUT_DIAGNOSTICS'),
       });
+      _screenSync.configure(_settings.screenPolicyEnabled, _settings.role);
+      await _screenSync.initialize();
       if (defaultTargetPlatform == TargetPlatform.macOS) {
         await _applySmoothing();
       }
@@ -391,6 +396,8 @@ class _InputPageState extends State<InputPage> with WidgetsBindingObserver {
     if (!mounted) return;
     final data = Map<String, dynamic>.from(call.arguments as Map? ?? {});
     switch (call.method) {
+      case 'screenStateChanged':
+        _screenSync.onNativeState(data);
       case 'edgeDragProbeChanged':
         _setDragPreview(data);
         _tryDragHandoff();
@@ -990,6 +997,7 @@ class _InputPageState extends State<InputPage> with WidgetsBindingObserver {
     await _configureEdge();
     _configureAudioSync();
     if (!_receiving) unawaited(_readAudioOutput());
+    _screenSync.configure(_settings.screenPolicyEnabled, _settings.role);
   });
   Future<void> _connect() => _perform(_changeConnection);
 
@@ -1051,6 +1059,7 @@ class _InputPageState extends State<InputPage> with WidgetsBindingObserver {
     _listenKeyText.dispose();
     _lan.removeListener(_connectionChanged);
     _audioSync.dispose();
+    _screenSync.dispose();
     _clipboard.dispose();
     _lan.dispose();
     super.dispose();
@@ -1526,6 +1535,7 @@ class _InputPageState extends State<InputPage> with WidgetsBindingObserver {
           ],
         ),
         _clipboardSettings(),
+        if (!_receiving && _captureSupported) _screenPolicySettings(),
       ],
     );
   }
@@ -1545,6 +1555,22 @@ class _InputPageState extends State<InputPage> with WidgetsBindingObserver {
               _persist();
             }
           : null,
+    ),
+  );
+
+  Widget _screenPolicySettings() => ListenableBuilder(
+    listenable: _screenSync,
+    builder: (_, _) => SwitchListTile(
+      key: const Key('screen-policy-sync'),
+      contentPadding: EdgeInsets.zero,
+      title: const Text('屏幕与锁屏同步'),
+      subtitle: Text(_screenSync.status, style: const TextStyle(fontSize: 11)),
+      value: _settings.screenPolicyEnabled,
+      onChanged: _ready && !_busy ? (value) {
+        setState(() => _settings.screenPolicyEnabled = value);
+        _screenSync.configure(value, _settings.role);
+        _persist();
+      } : null,
     ),
   );
 

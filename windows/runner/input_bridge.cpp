@@ -153,9 +153,11 @@ InputBridge::InputBridge(HWND owner, HWND view, flutter::BinaryMessenger* messen
   });
   watchdog_ = std::thread([this] { Watchdog(); });
   session_notifications_ = WTSRegisterSessionNotification(owner_, NOTIFY_FOR_THIS_SESSION) != FALSE;
+  screen_state_ = std::make_unique<ScreenStateMonitor>(owner_);
 }
 
 InputBridge::~InputBridge() {
+  screen_state_.reset();
   if (session_notifications_) WTSUnRegisterSessionNotification(owner_);
   Stop("shutdown", false);
   drag_probe_.reset();
@@ -229,9 +231,23 @@ std::vector<InputBridge::Device> InputBridge::Enumerate() {
   return devices;
 }
 
+InputBridge::Map InputBridge::ScreenState() const {
+  return Map{{Value("displayKnown"), Value(screen_state_->display_known)},
+      {Value("displayOn"), Value(screen_state_->display_on)},
+      {Value("locked"), Value(screen_state_->locked)},
+      {Value("suspended"), Value(screen_state_->suspended)},
+      {Value("sessionActive"), Value(screen_state_->session_active)},
+      {Value("lockSequence"), Value(static_cast<int64_t>(screen_state_->lock_sequence))}};
+}
+
 void InputBridge::OnMethod(const flutter::MethodCall<Value>& call,
                            std::unique_ptr<Result> result) {
   const auto& method = call.method_name();
+  if (method == "screenCapabilities") {
+    result->Success(Value(Map{{Value("controller"), Value(screen_state_->available() && session_notifications_)},
+        {Value("receiver"), Value(false)}})); return;
+  }
+  if (method == "screenState") { result->Success(Value(ScreenState())); return; }
   if (method == "audioCapabilities") {
     result->Success(Value(Map{{Value("render"), Value(true)}, {Value("capture"), Value(false)}})); return;
   }
@@ -984,6 +1000,7 @@ std::optional<LRESULT> InputBridge::HandleMessage(UINT message, WPARAM wparam, L
   if (clipboard_ && message == ClipboardBridge::kResultMessage) { clipboard_->Complete(); return 0; }
   switch (message) {
     case WM_WTSSESSION_CHANGE:
+      if (screen_state_->Handle(message, wparam, lparam)) Emit("screenStateChanged", ScreenState());
       if (wparam == WTS_SESSION_LOCK || wparam == WTS_SESSION_LOGOFF ||
           wparam == WTS_CONSOLE_DISCONNECT || wparam == WTS_REMOTE_DISCONNECT) {
         Stop("system_lock"); CancelSetup();
@@ -992,6 +1009,7 @@ std::optional<LRESULT> InputBridge::HandleMessage(UINT message, WPARAM wparam, L
       }
       break;
     case WM_POWERBROADCAST:
+      if (screen_state_->Handle(message, wparam, lparam)) Emit("screenStateChanged", ScreenState());
       if (wparam == PBT_APMSUSPEND) { Stop("system_suspend"); CancelSetup(); }
       else if (wparam == PBT_APMRESUMEAUTOMATIC || wparam == PBT_APMRESUMESUSPEND) {
         Stop("system_suspend"); ResumeBackgroundInput();

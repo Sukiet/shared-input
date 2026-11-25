@@ -126,6 +126,24 @@ void main() {
 
   FilledButton start(WidgetTester tester) =>
       tester.widget<FilledButton>(find.byKey(const Key('start-control')));
+
+  windowsTest('screen policy switch is below clipboard and survives reopening', (tester) async {
+    final store = MemorySettingsStore();
+    await open(tester, store: store);
+    final policy = find.byKey(const Key('screen-policy-sync'));
+    expect(tester.widget<SwitchListTile>(policy).value, false);
+    await tester.ensureVisible(policy);
+    await tester.pumpAndSettle();
+    expect(tester.getTopLeft(policy).dy,
+      greaterThan(tester.getTopLeft(find.byKey(const Key('clipboard-sync'))).dy));
+    await tester.tap(policy);
+    await tester.pumpAndSettle();
+    expect((await SettingsRepository(store).load()).screenPolicyEnabled, true);
+    await tester.pumpWidget(const SizedBox.shrink());
+    await open(tester, store: store);
+    expect(tester.widget<SwitchListTile>(policy).value, true);
+    await tester.pumpWidget(const SizedBox.shrink());
+  });
   ControlReturnHistory history(WidgetTester tester) => tester
       .widget<ControlReturnLogPanel>(find.byType(ControlReturnLogPanel)).history;
 
@@ -840,6 +858,8 @@ void main() {
       await tester.pumpWidget(const SizedBox());
       await open(tester, returnLogStore: logStore);
       expect(history(tester).entries.length, 3);
+      await tester.ensureVisible(find.byKey(const Key('clear-return-logs')));
+      await tester.pumpAndSettle();
       await tester.tap(find.byKey(const Key('clear-return-logs')));
       await tester.pumpAndSettle();
       expect(history(tester).entries, isEmpty);

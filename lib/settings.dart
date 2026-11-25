@@ -77,6 +77,7 @@ class AppSettings {
   bool statisticsExpanded = false;
   bool edgeSwitchEnabled = false;
   bool clipboardEnabled = true;
+  bool screenPolicyEnabled = false;
   AudioSyncMode audioSyncMode = AudioSyncMode.off;
   int audioBufferMs = 40;
   List<LocalKeyException> localKeys = [];
@@ -114,6 +115,7 @@ class AppSettings {
     'statisticsExpanded': statisticsExpanded,
     'edgeSwitchEnabled': edgeSwitchEnabled,
     'clipboardEnabled': clipboardEnabled,
+    'screenPolicyEnabled': screenPolicyEnabled,
     'audioSyncMode': audioSyncMode.name,
     'audioBufferMs': audioBufferMs,
     'localKeys': localKeys.map((key) => key.toJson()).toList(),
@@ -163,6 +165,7 @@ class AppSettings {
     }
     result.statisticsExpanded = json['statisticsExpanded'] == true;
     result.edgeSwitchEnabled = json['edgeSwitchEnabled'] == true;
+    result.screenPolicyEnabled = json['screenPolicyEnabled'] == true;
     if (json['clipboardEnabled'] is bool) {
       result.clipboardEnabled = json['clipboardEnabled'] as bool;
     }

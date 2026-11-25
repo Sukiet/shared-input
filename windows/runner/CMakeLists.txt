@@ -9,6 +9,7 @@ project(runner LANGUAGES CXX)
 add_executable(${BINARY_NAME} WIN32
   "flutter_window.cpp"
   "input_bridge.cpp"
+  "screen_state_monitor.cpp"
   "clipboard_bridge.cpp"
   "clipboard_image.cpp"
   "audio_output_monitor.cpp"

@@ -22,6 +22,7 @@
 #include "audio_playback_bridge.h"
 #include "edge_drag_probe.h"
 #include "drag_handoff.h"
+#include "screen_state_monitor.h"
 
 class InputBridge {
  public:
@@ -53,6 +54,7 @@ class InputBridge {
   void CancelSetup();
   void Emit(const std::string& method, Map data = {});
   Map AudioOutput() const;
+  Map ScreenState() const;
   Map DragProbeSnapshot() const;
   Map Stats() const;
   bool Down(int key) const;
@@ -72,6 +74,7 @@ class InputBridge {
   std::unique_ptr<EdgeDragProbe> drag_probe_;
   bool initialized_ = false, active_ = false, recording_ = false;
   bool session_notifications_ = false;
+  std::unique_ptr<ScreenStateMonitor> screen_state_;
   bool identifying_local_key_ = false;
   uint32_t local_key_identify_token_ = 0;
   std::string identifying_;

@@ -10,6 +10,12 @@ import 'clipboard_channel.dart';
 import 'input_diagnostics.dart';
 
 class LanSession extends ChangeNotifier {
+  bool screenPolicySupported = false, supportsScreenPolicy = false;
+  FutureOr<void> Function(Map<String, dynamic>)? onScreenControl;
+  Future<void> sendScreenControl(Map<String, dynamic> message) async {
+    if (!connected || !supportsScreenPolicy) return;
+    await _wire!.send(message);
+  }
   final clipboard = ClipboardChannel();
   bool audioCaptureSupported = false,
       audioRenderSupported = false,
@@ -153,6 +159,7 @@ class LanSession extends ChangeNotifier {
               'udpPort': _udp!.port,
               'capabilities': [
                 'motion-prediction-v1',
+                if (screenPolicySupported) 'screen-policy-v1',
                 if (clipboardSupported) 'clipboard-v1',
                 if (dragPreviewSupported) 'edge-drag-preview-v1',
                 if (audioCaptureSupported) 'audio-capture-pcm-v1',
@@ -185,6 +192,8 @@ class LanSession extends ChangeNotifier {
                 'motion-prediction-v1',
               ) ==
               true;
+          supportsScreenPolicy = screenPolicySupported &&
+              (hello['capabilities'] as List?)?.contains('screen-policy-v1') == true;
           supportsClipboard =
               clipboardSupported &&
               (hello['capabilities'] as List?)?.contains('clipboard-v1') ==
@@ -256,6 +265,7 @@ class LanSession extends ChangeNotifier {
           'udpPort': _udp!.port,
           'capabilities': [
             'motion-prediction-v1',
+            if (screenPolicySupported) 'screen-policy-v1',
             if (clipboardSupported) 'clipboard-v1',
             if (dragPreviewSupported) 'edge-drag-preview-v1',
             if (audioCaptureSupported) 'audio-capture-pcm-v1',
@@ -271,6 +281,8 @@ class LanSession extends ChangeNotifier {
       }
       supportsEdge =
           (ack['capabilities'] as List?)?.contains('edge-pointer-v1') == true;
+      supportsScreenPolicy = screenPolicySupported &&
+          (ack['capabilities'] as List?)?.contains('screen-policy-v1') == true;
       supportsDragPreview =
           dragPreviewSupported &&
           (ack['capabilities'] as List?)?.contains('edge-drag-preview-v1') ==
@@ -387,6 +399,9 @@ class LanSession extends ChangeNotifier {
         );
         _lastReceived = DateTime.now();
         switch (json['type']) {
+          case 'screenPolicy':
+          case 'screenPolicyStatus':
+            if (supportsScreenPolicy) await onScreenControl?.call(json);
           case 'dragPreviewConfig':
           case 'dragPreviewState':
           case 'dragPreviewClear':
@@ -841,6 +856,7 @@ class LanSession extends ChangeNotifier {
     supportsLayout = false;
     supportsClipboard = false;
     supportsAudio = false;
+    supportsScreenPolicy = false;
     _clipboardOpening = false;
     clipboard.close();
     remoteDisplay = null;

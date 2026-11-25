@@ -82,11 +82,15 @@ void main() {
       ..smoothingLeewayUs = 100
       ..statisticsExpanded = true;
     saved.edgeSwitchEnabled = true;
+    saved.screenPolicyEnabled = true;
     await SettingsRepository(store).save(saved);
     final restored = await SettingsRepository(store).load();
     expect(restored.toJson(), saved.toJson());
     expect(restored.shortcut!.label, 'Ctrl + Alt + Shift + F8');
     expect(restored.scrollSpeed, 12.34);
+    expect(restored.screenPolicyEnabled, true);
+    expect(AppSettings.fromJson({}).screenPolicyEnabled, false);
+    expect(AppSettings.fromJson({'screenPolicyEnabled': 'true'}).screenPolicyEnabled, false);
     expect(restored.toJson().containsKey('active'), isFalse);
     expect(restored.toJson().containsKey('connected'), isFalse);
   });

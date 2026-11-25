@@ -7,6 +7,7 @@ import ApplicationServices
 final class RemoteInputBridge {
   private let channel: FlutterMethodChannel
   private let clipboard = ClipboardBridge()
+  private let screenPolicy = ScreenPolicyBridge()
   private let dragProbe = MacEdgeDragProbe()
   private var dragTestEnabled = false // protected by lock, like heldButtons
   private var dragPixelScale: CGFloat = 1
@@ -102,7 +103,7 @@ final class RemoteInputBridge {
     self.motionTimer = motionTimer
   }
   deinit { motionTimer?.cancel(); timer?.cancel(); clipboard.reset(); dragProbe.shutdown(); stop() }
-  func shutdown() { clipboard.reset(); stop(); dragProbe.shutdown(); audioCapture.shutdown() }
+  func shutdown() { screenPolicy.reset(); clipboard.reset(); stop(); dragProbe.shutdown(); audioCapture.shutdown() }
   func stop(hideCursor: Bool = false) {
     lock.lock(); defer { lock.unlock() }
     releaseLocked(hideCursor: hideCursor)
@@ -115,7 +116,12 @@ final class RemoteInputBridge {
     if call.method.hasPrefix("clipboard") { clipboard.handle(call, result); return }
     let args = call.arguments as? [String: Any] ?? [:]
     switch call.method {
+    case "screenCapabilities": result(["controller": false, "receiver": true])
+    case "screenPolicy":
+      if args["lock"] as? Bool == true { stop() }
+      screenPolicy.handle(args, result)
     case "initialize":
+      screenPolicy.reset()
       clipboard.reset()
       stop()
       dragProbe.configure(enabled: false, side: "left")
