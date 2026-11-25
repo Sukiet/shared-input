@@ -7,6 +7,7 @@
 #include <cfgmgr32.h>
 #include <setupapi.h>
 #include <mmsystem.h>
+#include <wtsapi32.h>
 #include <flutter/standard_method_codec.h>
 #include <algorithm>
 #include <chrono>
@@ -151,9 +152,11 @@ InputBridge::InputBridge(HWND owner, HWND view, flutter::BinaryMessenger* messen
     OnMethod(call, std::move(result));
   });
   watchdog_ = std::thread([this] { Watchdog(); });
+  session_notifications_ = WTSRegisterSessionNotification(owner_, NOTIFY_FOR_THIS_SESSION) != FALSE;
 }
 
 InputBridge::~InputBridge() {
+  if (session_notifications_) WTSUnRegisterSessionNotification(owner_);
   Stop("shutdown", false);
   drag_probe_.reset();
   audio_playback_.reset();
@@ -308,6 +311,9 @@ void InputBridge::OnMethod(const flutter::MethodCall<Value>& call,
       if (drag_handoff_.Failed(flow, args ? StringArg(*args, "message") : "切换未完成") && drag_probe_) drag_probe_->Notify();
       result->Success(); return;
     }
+    if (!background_.Prepare()) {
+      result->Error("hook_recovery_failed", "后台输入拦截正在恢复，请稍后重试。"); return;
+    }
     const unsigned buttons = drag_handoff_.Buttons();
     const bool source_down = buttons != 0 && background_.PhysicalButtons() == buttons;
     if (active_ || !edge_enabled_ || !shortcut_key_ || !drag_probe_ || !drag_probe_->Enabled() ||
@@ -382,7 +388,7 @@ void InputBridge::OnMethod(const flutter::MethodCall<Value>& call,
       result->Error("hook_failed", "后台输入拦截初始化失败。"); return;
     }
     RAWINPUTDEVICE devices[] = {
-      {1, 6, static_cast<DWORD>(enabled ? RIDEV_REMOVE : RIDEV_DEVNOTIFY), enabled ? nullptr : owner_},
+      {1, 6, static_cast<DWORD>(RIDEV_DEVNOTIFY | (enabled ? RIDEV_INPUTSINK : 0)), owner_},
       {1, 2, static_cast<DWORD>(RIDEV_DEVNOTIFY | (enabled ? RIDEV_INPUTSINK : 0)), owner_}};
     if (!RegisterRawInputDevices(devices, 2, sizeof(RAWINPUTDEVICE))) {
       result->Error("edge_failed", "后台输入监听初始化失败。"); return;
@@ -400,7 +406,11 @@ void InputBridge::OnMethod(const flutter::MethodCall<Value>& call,
     result->Success(Value(Map{{Value("width"), Value(static_cast<int>(bounds.right - bounds.left))},
       {Value("height"), Value(static_cast<int>(bounds.bottom - bounds.top))}}));
   } else if (method == "edgeState") {
-    result->Success(Value(EdgeState()));
+    const bool prepared = !edge_enabled_ || background_.Prepare();
+    auto state = EdgeState();
+    state[Value("hookReady")] = Value(prepared && background_.Installed());
+    state[Value("ready")] = Value(prepared && BoolArg(state, "ready"));
+    result->Success(Value(std::move(state)));
   } else if (method == "remotePointer") {
     if (const auto args = call.arguments() ? std::get_if<Map>(call.arguments()) : nullptr) RemotePointer(*args);
     result->Success();
@@ -696,7 +706,19 @@ void InputBridge::ReadInput(HRAWINPUT handle) {
   ProcessInput(raw, bytes);
 }
 
-void InputBridge::ProcessInput(const RAWINPUT& raw, UINT bytes) {
+void InputBridge::ProcessInput(const RAWINPUT& raw, UINT bytes, bool from_hook) {
+  // Raw input independently repairs missed hook releases. It never forwards a
+  // second keyboard stream; background keyboard forwarding stays hook-only.
+  const auto input_time = static_cast<uint32_t>(GetMessageTime());
+  if (!from_hook && edge_enabled_ && raw.header.hDevice) {
+    if (raw.header.dwType == RIM_TYPEKEYBOARD && bytes >= sizeof(RAWINPUTHEADER) + sizeof(RAWKEYBOARD) &&
+        raw.data.keyboard.VKey != 255) {
+      background_.RawKey(static_cast<unsigned>(PhysicalKey(raw.data.keyboard)),
+          (raw.data.keyboard.Flags & RI_KEY_BREAK) != 0, input_time);
+    } else if (raw.header.dwType == RIM_TYPEMOUSE && bytes >= sizeof(RAWINPUTHEADER) + sizeof(RAWMOUSE)) {
+      background_.RawMouse(raw.data.mouse.usButtonFlags, input_time);
+    }
+  }
   // Raw input independently observes source release, including after return.
   // Do this before capture/foreground guards, which may legitimately discard
   // the same packet for forwarding purposes.
@@ -710,6 +732,7 @@ void InputBridge::ProcessInput(const RAWINPUT& raw, UINT bytes) {
   if (active_ && background_capture_ && !background_.Blocking()) return;
   const auto now = GetTickCount64();
   if (raw.header.dwType == RIM_TYPEKEYBOARD && bytes >= sizeof(RAWINPUTHEADER) + sizeof(RAWKEYBOARD)) {
+    if (background_capture_ && !from_hook) return;
     if (background_capture_ && !background_.Healthy(now)) { Stop("hook_thread_timeout"); return; }
     const auto& keyboard = raw.data.keyboard;
     if (keyboard.VKey == 255 || (!background_capture_ && !raw.header.hDevice)) return;
@@ -830,7 +853,9 @@ InputBridge::Map InputBridge::EdgeState() const {
       bounds.left, bounds.top, bounds.right - bounds.left, bounds.bottom - bounds.top))},
       {Value("entryY"), Value(std::clamp(remote, 0.0, 1.0))}, {Value("localPosition"), Value(local)},
       {Value("entrySide"), Value(shared_input::EdgeName(shared_input::OppositeEdge(display_layout_.side)))},
-      {Value("ready"), Value(background_.Observed() && !background_.HasHeld() && !AnyHeld())}};
+      {Value("hookReady"), Value(background_.Installed())},
+      {Value("held"), Value(background_.HasHeld() || AnyHeld())},
+      {Value("ready"), Value(background_.Installed() && !background_.HasHeld() && !AnyHeld())}};
 }
 
 bool InputBridge::ConfigureLayout(const Map& options) {
@@ -934,6 +959,13 @@ void InputBridge::EndSourceDragGesture() {
   if (changed) drag_probe_->Notify();
 }
 
+void InputBridge::ResumeBackgroundInput() {
+  EndSourceDragGesture();
+  if (edge_enabled_ || (drag_probe_ && drag_probe_->Enabled())) {
+    if (background_.Install(owner_, kBackgroundStopMessage, shortcut_key_, shortcut_shift_)) background_.Prepare(true);
+  }
+}
+
 std::optional<LRESULT> InputBridge::HandleMessage(UINT message, WPARAM wparam, LPARAM lparam) {
   if (drag_probe_ && message == EdgeDragProbe::kChangedMessage) {
     const auto& probe = drag_probe_->Snapshot();
@@ -951,6 +983,20 @@ std::optional<LRESULT> InputBridge::HandleMessage(UINT message, WPARAM wparam, L
   }
   if (clipboard_ && message == ClipboardBridge::kResultMessage) { clipboard_->Complete(); return 0; }
   switch (message) {
+    case WM_WTSSESSION_CHANGE:
+      if (wparam == WTS_SESSION_LOCK || wparam == WTS_SESSION_LOGOFF ||
+          wparam == WTS_CONSOLE_DISCONNECT || wparam == WTS_REMOTE_DISCONNECT) {
+        Stop("system_lock"); CancelSetup();
+      } else if (wparam == WTS_SESSION_UNLOCK || wparam == WTS_CONSOLE_CONNECT || wparam == WTS_REMOTE_CONNECT) {
+        Stop("system_lock"); ResumeBackgroundInput();
+      }
+      break;
+    case WM_POWERBROADCAST:
+      if (wparam == PBT_APMSUSPEND) { Stop("system_suspend"); CancelSetup(); }
+      else if (wparam == PBT_APMRESUMEAUTOMATIC || wparam == PBT_APMRESUMESUSPEND) {
+        Stop("system_suspend"); ResumeBackgroundInput();
+      }
+      break; // Flutter/plugins must also receive power-resume notifications.
     case kStreamMessage:
       stream_posted_ = false;
       if (static_cast<unsigned>(wparam) == generation_.load() && active_ && remote_capture_) FlushStream();
@@ -1053,7 +1099,7 @@ std::optional<LRESULT> InputBridge::HandleMessage(UINT message, WPARAM wparam, L
       input.data.keyboard.MakeCode = static_cast<USHORT>(lparam & 0xff);
       input.data.keyboard.Flags = static_cast<USHORT>(((lparam & 0x100) ? RI_KEY_E0 : 0) |
           ((lparam & 0x200) ? 0 : RI_KEY_BREAK));
-      ProcessInput(input, sizeof(input));
+      ProcessInput(input, sizeof(input), true);
       return 0;
     }
     case kWatchdogMessage:

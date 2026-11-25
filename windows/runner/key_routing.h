@@ -18,6 +18,9 @@ class KeyRouting {
     return remote;
   }
   void Reset() { held_.fill(false); remote_.fill(false); }
+  bool LocalHeld(unsigned key) const { return key < held_.size() && held_[key] && !remote_[key]; }
+  bool RemoteHeld(unsigned key) const { return key < held_.size() && remote_[key]; }
+  void Forget(unsigned key) { if (key < held_.size()) { held_[key] = false; remote_[key] = false; } }
  private:
   std::array<bool, 256> held_{}, remote_{};
 };

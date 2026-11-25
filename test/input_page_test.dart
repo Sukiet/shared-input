@@ -21,6 +21,7 @@ void main() {
   final calls = <MethodCall>[];
   var devices = <Map<String, dynamic>>[];
   var rejectStart = false;
+  var edgeReady = true, heldAtEdge = false;
   var rejectLocalKeys = false;
   var rejectDragProbe = false, dragProbeEnabled = false;
   var dragProbeRevision = 0;
@@ -62,6 +63,7 @@ void main() {
       {'id': 'mouse-1', 'name': 'Test mouse', 'type': 'mouse', 'usb': true},
     ];
     rejectStart = false;
+    edgeReady = true; heldAtEdge = false;
     rejectLocalKeys = false;
     rejectDragProbe = false; dragProbeEnabled = false; dragProbeRevision = 0;
     stopDuringStart = null;
@@ -89,7 +91,7 @@ void main() {
         };
       }
       if (call.method == 'edgeState') {
-        return {'atEdge': true, 'entryY': 0.25, 'ready': true};
+        return {'atEdge': true, 'entryY': 0.25, 'ready': edgeReady, 'held': heldAtEdge};
       }
       if (call.method == 'pointer') {
         return [123.4567, 67.8912, true];
@@ -941,6 +943,54 @@ void main() {
     expect(tester.takeException(), isNull);
     await tester.pumpWidget(const SizedBox());
   });
+
+  for (final held in [false, true]) {
+    windowsTest('edge readiness recovers without restarting (held=$held)', (tester) async {
+      const key = '0123456789abcdef0123456789abcdef';
+      final receiver = LanSession();
+      var ended = false;
+      receiver.onPointerInfo = () async => {'x': 100, 'y': 200, 'left': 0, 'top': 0,
+        'width': 1920, 'height': 1080, 'sequence': 0};
+      receiver.onEnd = () async { ended = true; };
+      addTearDown(() async { await receiver.close(); receiver.dispose(); });
+      await tester.runAsync(() => receiver.listen(port: 0, key: key, bindAddress: '127.0.0.1'));
+      final saved = AppSettings()..edgeSwitchEnabled = true
+        ..shortcut = const ExitShortcut(0x77)..host = '127.0.0.1'
+        ..port = receiver.port..peerKey = key;
+      await open(tester, store: MemorySettingsStore()..value = jsonEncode(saved.toJson()));
+      edgeReady = false; heldAtEdge = held;
+      Future<void> waitUntil(bool Function() predicate) async {
+        final deadline = DateTime.now().add(const Duration(seconds: 5));
+        while (!predicate()) {
+          if (DateTime.now().isAfter(deadline)) fail('Edge recovery did not complete');
+          await Future<void>.delayed(const Duration(milliseconds: 5));
+        }
+      }
+      await tester.runAsync(() async {
+        await native('edgeEnter');
+        await waitUntil(() => calls.any((c) => c.method == 'edgeState'));
+        await Future<void>.delayed(const Duration(milliseconds: 20));
+      });
+      await tester.pumpAndSettle();
+      expect(find.text(held ? '检测到键盘按键或鼠标按钮仍按住，请松开后重试。'
+          : '后台输入拦截正在恢复，请稍后重试。'), findsOneWidget);
+      expect(find.textContaining('Bad state:'), findsNothing);
+      expect(calls.where((c) => c.method == 'start'), isEmpty);
+      expect(receiver.capturing, false);
+      edgeReady = true; heldAtEdge = false;
+      await tester.runAsync(() async {
+        await native('edgeEnter');
+        await waitUntil(() => calls.any((c) => c.method == 'start'));
+        await Future<void>.delayed(const Duration(milliseconds: 20));
+        await native('stopped', {'reason': held ? 'system_lock' : 'system_suspend'});
+        await waitUntil(() => ended);
+      });
+      await tester.pumpAndSettle();
+      expect(history(tester).entries.single.type, ControlReturnType.environment);
+      expect(start(tester).onPressed, isNotNull);
+      await tester.pumpWidget(const SizedBox());
+    });
+  }
 
   windowsTest(
     'edge switching retains shortcut exit and edge return',

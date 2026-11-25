@@ -15,8 +15,13 @@ class MouseRouting {
     return remote;
   }
   void TransferToLocal(unsigned buttons) { remote_ &= ~buttons; }
+  bool Forget(unsigned button) {
+    const unsigned mask = 1u << button;
+    const bool remote = (remote_ & mask) != 0;
+    remote_ &= ~mask; windows_ &= ~mask; return remote;
+  }
   unsigned ReconcileCandidates(unsigned held, unsigned local, bool blocking) const {
-    return (blocking ? local : (held & ~remote_)) & windows_ & 3u;
+    return (blocking ? local : (held & ~remote_)) & windows_ & 31u;
   }
  private:
   unsigned remote_ = 0, windows_ = 0;

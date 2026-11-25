@@ -14,6 +14,10 @@ namespace shared_input {
 extern "C" {
 SHARED_HOOK_API bool SharedHooksInstall(HWND owner, UINT message, int key, bool shift);
 SHARED_HOOK_API bool SharedHooksBegin(uint32_t generation, uint32_t local_buttons = 0);
+SHARED_HOOK_API bool SharedHooksPrepare(bool reset_state = false);
+SHARED_HOOK_API bool SharedHooksInstalled();
+SHARED_HOOK_API void SharedHooksRawKey(unsigned key, bool up, uint32_t time);
+SHARED_HOOK_API void SharedHooksRawMouse(unsigned flags, uint32_t time);
 SHARED_HOOK_API bool SharedHooksHasRemoteHeld(bool ignore_mouse = false);
 SHARED_HOOK_API unsigned SharedHooksPhysicalButtons();
 SHARED_HOOK_API bool SharedHooksSetLocalKeys(const int* keys, unsigned count);
@@ -33,6 +37,10 @@ SHARED_HOOK_API bool SharedHooksObserved();
 SHARED_HOOK_API bool SharedHooksMouseFresh(uint64_t now);
 SHARED_HOOK_API bool SharedHooksKeyboardFresh(uint64_t now);
 SHARED_HOOK_API void SharedHooksClose();
+#ifdef SHARED_INPUT_HOOK_TESTING
+// Only compiled into the native-test DLL, never the application DLL.
+SHARED_HOOK_API bool SharedHooksTestFault(unsigned mode);
+#endif
 }
 
 // One controller per process. The DLL owns the callbacks and a dedicated native pump;
@@ -42,6 +50,10 @@ class BackgroundHooks {
   ~BackgroundHooks() { Close(); }
   bool Install(HWND owner, UINT message, int key, bool shift) { return SharedHooksInstall(owner, message, key, shift); }
   bool Begin(uint32_t generation = 0, uint32_t local_buttons = 0) { return SharedHooksBegin(generation, local_buttons); }
+  bool Prepare(bool reset_state = false) { return SharedHooksPrepare(reset_state); }
+  bool Installed() const { return SharedHooksInstalled(); }
+  void RawKey(unsigned key, bool up, uint32_t time) { SharedHooksRawKey(key, up, time); }
+  void RawMouse(unsigned flags, uint32_t time) { SharedHooksRawMouse(flags, time); }
   bool HasRemoteHeld(bool ignore_mouse = false) const { return SharedHooksHasRemoteHeld(ignore_mouse); }
   unsigned PhysicalButtons() const { return SharedHooksPhysicalButtons(); }
   bool SetLocalKeys(const int* keys, unsigned count) { return SharedHooksSetLocalKeys(keys, count); }

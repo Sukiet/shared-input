@@ -505,6 +505,8 @@ class _InputPageState extends State<InputPage> with WidgetsBindingObserver {
     'heartbeat' => '界面响应中断，已释放鼠标。',
     'device_removed' => '所选设备已断开，已退出。',
     'window_changed' => '窗口位置或大小变化，已退出。',
+    'system_lock' => '系统锁屏或会话切换，已释放输入。',
+    'system_suspend' => '系统进入休眠，已释放输入。',
     'shutdown' => '已退出。',
     _ => '已停止控制。',
   };
@@ -772,7 +774,12 @@ class _InputPageState extends State<InputPage> with WidgetsBindingObserver {
       final state =
           await _channel.invokeMapMethod<String, dynamic>('edgeState') ?? {};
       if (state['ready'] != true) {
-        throw StateError('后台输入拦截未就绪，请松开按键并移动鼠标后重试。');
+        throw PlatformException(
+          code: state['held'] == true ? 'keys_held' : 'hook_recovery_failed',
+          message: state['held'] == true
+              ? '检测到键盘按键或鼠标按钮仍按住，请松开后重试。'
+              : '后台输入拦截正在恢复，请稍后重试。',
+        );
       }
       if (!allowed() || (triggered && state['atEdge'] != true)) return;
       await _startCapture(

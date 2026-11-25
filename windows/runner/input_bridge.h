@@ -42,8 +42,9 @@ class InputBridge {
   bool Initialize();
   std::vector<Device> Enumerate();
   void ReadInput(HRAWINPUT input);
-  void ProcessInput(const RAWINPUT& input, UINT bytes);
+  void ProcessInput(const RAWINPUT& input, UINT bytes, bool from_hook = false);
   void EndSourceDragGesture();
+  void ResumeBackgroundInput();
   Map EdgeState() const;
   bool ConfigureLayout(const Map& options);
   void RemotePointer(const Map& data);
@@ -70,6 +71,7 @@ class InputBridge {
   std::unique_ptr<AudioPlaybackBridge> audio_playback_;
   std::unique_ptr<EdgeDragProbe> drag_probe_;
   bool initialized_ = false, active_ = false, recording_ = false;
+  bool session_notifications_ = false;
   bool identifying_local_key_ = false;
   uint32_t local_key_identify_token_ = 0;
   std::string identifying_;

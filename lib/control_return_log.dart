@@ -24,7 +24,11 @@ enum ControlReturnType {
     'heartbeat' ||
     'input_overflow' ||
     'timeout' => protection,
-    'focus_lost' || 'window_changed' || 'device_removed' => environment,
+    'focus_lost' ||
+    'window_changed' ||
+    'device_removed' ||
+    'system_lock' ||
+    'system_suspend' => environment,
     'manual' ||
     'shutdown' ||
     'manual_disconnect' ||
@@ -124,6 +128,8 @@ class ControlReturnEntry {
     'timeout' => '本地测试达到 30 秒上限',
     'focus_lost' => '控制窗口失去焦点',
     'window_changed' => '窗口或显示配置变化',
+    'system_lock' => '系统锁屏或会话切换',
+    'system_suspend' => '系统进入休眠',
     'device_removed' => '所选键盘或鼠标断开',
     'remote_end' => '被控端结束控制会话',
     'manual_disconnect' => '手动断开远程连接',
