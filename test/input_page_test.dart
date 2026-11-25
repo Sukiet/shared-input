@@ -296,44 +296,80 @@ void main() {
     await tester.pumpWidget(const SizedBox());
   }, variant: TargetPlatformVariant.only(TargetPlatform.macOS));
 
-  testWidgets('Mac file session loss ends capture while retaining the paired connection', (tester) async {
-    const key = 'eeeeeeeeeeeeeeeeeeeeeeeeeeeeeeee';
-    final reservation = LanSession();
-    await tester.runAsync(() => reservation.listen(port: 0, key: key, bindAddress: '127.0.0.1'));
-    final port = reservation.port;
-    await tester.runAsync(() => reservation.close());
-    reservation.dispose();
-    final settings = AppSettings()..role = InputRole.receiver..port = port..listenKey = key;
-    final controller = LanSession();
-    addTearDown(() async { await controller.close(); controller.dispose(); });
-    await open(tester, store: MemorySettingsStore()..value = jsonEncode(settings.toJson()));
-    final connect = find.byKey(const Key('connection-action'));
-    await tester.ensureVisible(connect);
-    await tester.pumpAndSettle();
-    await tester.runAsync(() async {
-      await tester.tap(connect);
-      await Future<void>.delayed(const Duration(milliseconds: 100));
-    });
-    await tester.pump();
-    await tester.runAsync(() async {
-      await controller.connect(host: '127.0.0.1', port: port, key: key);
-      await controller.beginCapture();
-      expect(controller.capturing, true);
-      await native('fileDragSessionState', {'drag': 'f' * 32, 'phase': 'ended',
-        'unexpected': true, 'inputStopped': true, 'accepted': false});
-      final until = DateTime.now().add(const Duration(seconds: 3));
-      while (controller.capturing) {
-        if (DateTime.now().isAfter(until)) fail('Receiver did not stop a failed file drag');
-        await Future<void>.delayed(const Duration(milliseconds: 5));
-      }
-      expect(controller.connected, true);
-    });
-    await tester.pumpAndSettle();
-    expect(calls.any((call) => call.method == 'receiverStop' &&
-      (call.arguments as Map?)?['reason'] == 'file_drag_failed'), true);
-    expect(find.textContaining('避免误拖 Mac 文件'), findsOneWidget);
-    await tester.pumpWidget(const SizedBox.shrink());
-  }, variant: TargetPlatformVariant.only(TargetPlatform.macOS));
+  for (final fatal in [false, true]) {
+    testWidgets(
+      'Mac file session loss ${fatal ? 'stops unsafe input' : 'preserves ordinary pointer capture'} while retaining connection',
+      (tester) async {
+        const key = 'eeeeeeeeeeeeeeeeeeeeeeeeeeeeeeee';
+        final reservation = LanSession();
+        await tester.runAsync(
+          () => reservation.listen(port: 0, key: key, bindAddress: '127.0.0.1'),
+        );
+        final port = reservation.port;
+        await tester.runAsync(() => reservation.close());
+        reservation.dispose();
+        final settings = AppSettings()
+          ..role = InputRole.receiver
+          ..port = port
+          ..listenKey = key;
+        final controller = LanSession();
+        addTearDown(() async {
+          await controller.close();
+          controller.dispose();
+        });
+        await open(
+          tester,
+          store: MemorySettingsStore()..value = jsonEncode(settings.toJson()),
+        );
+        final connect = find.byKey(const Key('connection-action'));
+        await tester.ensureVisible(connect);
+        await tester.pumpAndSettle();
+        await tester.runAsync(() async {
+          await tester.tap(connect);
+          await Future<void>.delayed(const Duration(milliseconds: 100));
+        });
+        await tester.pump();
+        await tester.runAsync(() async {
+          await controller.connect(host: '127.0.0.1', port: port, key: key);
+          await controller.beginCapture();
+          expect(controller.capturing, true);
+          await native('fileDragSessionState', {
+            'drag': 'f' * 32,
+            'phase': 'ended',
+            'unexpected': true,
+            'inputStopped': fatal,
+            'captureContinues': !fatal,
+            'accepted': false,
+          });
+          if (!fatal) {
+            expect(controller.capturing, true);
+            expect(controller.connected, true);
+            return;
+          }
+          final until = DateTime.now().add(const Duration(seconds: 3));
+          while (controller.capturing) {
+            if (DateTime.now().isAfter(until)) {
+              fail('Receiver did not stop a failed file drag');
+            }
+            await Future<void>.delayed(const Duration(milliseconds: 5));
+          }
+          expect(controller.connected, true);
+        });
+        await tester.pumpAndSettle();
+        expect(
+          calls.any(
+            (call) =>
+                call.method == 'receiverStop' &&
+                (call.arguments as Map?)?['reason'] == 'file_drag_failed',
+          ),
+          fatal,
+        );
+        if (fatal) expect(find.textContaining('避免误拖 Mac 文件'), findsOneWidget);
+        await tester.pumpWidget(const SizedBox.shrink());
+      },
+      variant: TargetPlatformVariant.only(TargetPlatform.macOS),
+    );
+  }
 
   windowsTest('drag preview registration errors stay disabled and role switch closes the local receiver', (tester) async {
     final store = MemorySettingsStore();

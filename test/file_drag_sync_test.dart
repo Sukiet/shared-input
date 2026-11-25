@@ -1,3 +1,4 @@
+import 'dart:async';
 import 'dart:io';
 import 'package:flutter/services.dart';
 import 'package:flutter_test/flutter_test.dart';
@@ -39,7 +40,7 @@ void main() {
     messenger.setMockMethodCallHandler(targetNative, (call) async {
       targetCalls.add(call);
       return call.method == 'fileDragCapabilities'
-          ? {'source': false, 'target': true}
+          ? {'source': false, 'target': true, 'deferred': true}
           : null;
     });
     source = LanSession();
@@ -83,6 +84,47 @@ void main() {
     );
   }
 
+  test(
+    'file activation dispatch does not wait for native AppKit and failure keeps capture',
+    () async {
+      final blocked = Completer<void>();
+      messenger.setMockMethodCallHandler(targetNative, (call) async {
+        targetCalls.add(call);
+        if (call.method == 'receiverFileDragActivate') await blocked.future;
+        return null;
+      });
+      await source.beginCapture();
+      await source.activateFileDrag();
+      await eventually(
+        () => targetCalls.any(
+          (call) => call.method == 'receiverFileDragActivate',
+        ),
+      );
+      // The independent file task must not block Stop/Begin in the reader.
+      await source.endCapture().timeout(const Duration(seconds: 1));
+      await eventually(() => !target.capturing);
+      await source.beginCapture().timeout(const Duration(seconds: 1));
+      blocked.completeError(
+        PlatformException(code: 'file_drag_failed', message: 'native rejected'),
+      );
+      await Future<void>.delayed(const Duration(milliseconds: 40));
+      expect(receiver.status.contains('native rejected'), false);
+      await source.activateFileDrag();
+      await eventually(() => receiver.status.contains('native rejected'));
+      expect(source.capturing && target.capturing, true);
+      receiver.onNativeEvent('fileDragSessionState', {
+        'drag': 'c' * 32,
+        'phase': 'ended',
+        'unexpected': true,
+        'captureContinues': true,
+        'inputStopped': false,
+        'error': '来源窗口启动失败',
+      });
+      await eventually(() => sender.status.contains('普通鼠标控制继续'));
+      expect(sender.lastSessionState['inputStopped'], false);
+      expect(source.capturing && target.capturing, true);
+    },
+  );
   test(
     'promise destination requests use separate channel and finish native progress',
     () async {

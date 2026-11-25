@@ -15,36 +15,96 @@ Future<void> eventually(bool Function() condition) async {
 }
 
 void main() {
-  test('file transport preparation lets both motion axes arrive before drag activation', () async {
-    final receiver = LanSession()..fileDragSupported = true..fileDragTarget = true;
-    final controller = LanSession()..fileDragSupported = true..fileDragSource = true;
-    var prepared = false, appKitActive = false;
-    final motions = <Map<String, dynamic>>[];
-    receiver.onPointerInfo = () async => {'width': 1000.0, 'height': 800.0,
-      'x': 24.0, 'y': 300.0, 'left': 0.0, 'top': 0.0, 'sequence': 0};
-    receiver.onBeginWithOptions = (_, options) async { prepared = options['fileDrag'] != null; };
-    receiver.onInput = (_, frames) async { motions.addAll(frames); };
-    try {
-      await receiver.listen(port: 0, key: 'b' * 32, bindAddress: '127.0.0.1');
-      await controller.connect(host: '127.0.0.1', port: receiver.port, key: 'b' * 32);
-      await controller.beginCapture(edgeEntryY: 0.5, fileDrag: {'drag': 'c' * 32,
-        'items': [{'id': 'd' * 32, 'name': 'sample.txt', 'folder': false, 'size': 10}]}).
-        timeout(const Duration(seconds: 1));
-      expect(prepared, true);
-      expect(appKitActive, false);
-      expect(controller.capturing, true);
-      controller.sendInput({'sequence': 1, 'epoch': 0, 'x': 37.25, 'y': -12.5});
-      await eventually(() => motions.isNotEmpty);
-      expect(motions.last['x'], 37.25);
-      expect(motions.last['y'], -12.5);
-      expect(appKitActive, false);
-      appKitActive = true;
-      expect(receiver.capturing, true);
-    } finally {
-      await controller.close(); await receiver.close();
-      controller.dispose(); receiver.dispose();
-    }
-  });
+  test(
+    'file transport preparation lets both motion axes arrive before drag activation',
+    () async {
+      final receiver = LanSession()
+        ..fileDragSupported = true
+        ..fileDragTarget = true
+        ..fileDragActivationSupported = true;
+      final controller = LanSession()
+        ..fileDragSupported = true
+        ..fileDragSource = true
+        ..fileDragActivationSupported = true;
+      var prepared = false, appKitActive = false;
+      final motions = <Map<String, dynamic>>[];
+      receiver.onPointerInfo = () async => {
+        'width': 1000.0,
+        'height': 800.0,
+        'x': 24.0,
+        'y': 300.0,
+        'left': 0.0,
+        'top': 0.0,
+        'sequence': 0,
+      };
+      receiver.onBeginWithOptions = (_, options) async {
+        prepared = options['fileDrag'] != null;
+        if (options['fileDrag'] != null) expect(options['deferFileDrag'], true);
+      };
+      receiver.onFileDragControl = (message) async {
+        expect(message['type'], 'fileDragActivate');
+        appKitActive = true;
+      };
+      receiver.onInput = (_, frames) async {
+        motions.addAll(frames);
+      };
+      try {
+        await receiver.listen(port: 0, key: 'b' * 32, bindAddress: '127.0.0.1');
+        await controller.connect(
+          host: '127.0.0.1',
+          port: receiver.port,
+          key: 'b' * 32,
+        );
+        await controller
+            .beginCapture(
+              edgeEntryY: 0.5,
+              fileDrag: {
+                'drag': 'c' * 32,
+                'items': [
+                  {
+                    'id': 'd' * 32,
+                    'name': 'sample.txt',
+                    'folder': false,
+                    'size': 10,
+                  },
+                ],
+              },
+            )
+            .timeout(const Duration(seconds: 1));
+        expect(prepared, true);
+        expect(appKitActive, false);
+        expect(controller.capturing, true);
+        controller.sendInput({
+          'sequence': 1,
+          'epoch': 0,
+          'x': 37.25,
+          'y': -12.5,
+        });
+        await eventually(() => motions.isNotEmpty);
+        expect(motions.last['x'], 37.25);
+        expect(motions.last['y'], -12.5);
+        expect(appKitActive, false);
+        await controller.activateFileDrag();
+        await eventually(() => appKitActive);
+        // Stale activation must not affect a later capture or survive stop.
+        await controller.endCapture();
+        await eventually(() => !receiver.capturing);
+        appKitActive = false;
+        await controller.sendFileDragControl({
+          'type': 'fileDragActivate',
+          'capture': '0' * 32,
+        });
+        await controller.beginCapture();
+        expect(appKitActive, false);
+        expect(receiver.capturing, true);
+      } finally {
+        await controller.close();
+        await receiver.close();
+        controller.dispose();
+        receiver.dispose();
+      }
+    },
+  );
   test('file drag negotiates source/target roles and accompanies edge begin', () async {
     final receiver = LanSession()..fileDragSupported = true..fileDragTarget = true;
     final controller = LanSession()..fileDragSupported = true..fileDragSource = true;
@@ -58,9 +118,11 @@ void main() {
       await receiver.listen(port: 0, key: 'a' * 32, bindAddress: '127.0.0.1');
       await controller.connect(host: '127.0.0.1', port: receiver.port, key: 'a' * 32);
       expect(controller.supportsFileDrag, true);
+      expect(controller.supportsFileDragActivation, false);
       expect(receiver.supportsFileDrag, true);
       await controller.beginCapture(edgeEntryY: 0.5, fileDrag: offer);
       expect(received?['fileDrag'], offer);
+      expect(received!.containsKey('deferFileDrag'), false);
       expect(controller.capturing, true);
     } finally {
       await controller.close(); await receiver.close();

@@ -10,6 +10,17 @@ final class RemoteInputBridge {
   private let screenPolicy = ScreenPolicyBridge()
   private lazy var incomingFiles: IncomingFileDrag = {
     let files = IncomingFileDrag(channel: channel)
+    files.sourcePressed = { [weak self] id in
+      guard let self = self else { return false }
+      self.lock.lock(); defer { self.lock.unlock() }
+      guard self.incomingFileID == id, self.incomingFileActive, self.capture != nil else { return false }
+      // The source view has actually consumed Down. Only now may ordinary
+      // motion become Dragged; preparation must never freeze the pointer.
+      self.heldButtons.insert(0)
+      self.clickCount = 1; self.clickButton = 0; self.clickPosition = self.position
+      self.clickTime = ProcessInfo.processInfo.systemUptime
+      return true
+    }
     files.sessionStarted = { [weak self] id in
       guard let self = self else { return }
       self.lock.lock()
@@ -21,23 +32,30 @@ final class RemoteInputBridge {
       self.lock.unlock()
     }
     files.stateChanged = { [weak self] state in
-      self?.channel.invokeMethod("fileDragSessionState", arguments: state)
+      guard let self = self else { return }
+      self.lock.lock()
+      let continuing = self.capture != nil && state["unexpected"] as? Bool == true
+      self.lock.unlock()
+      self.channel.invokeMethod("fileDragSessionState", arguments: state.merging([
+        "inputStopped": false, "captureContinues": continuing]) { _, new in new })
     }
     files.sessionEnded = { [weak self] state in
       guard let self = self else { return }
       self.lock.lock()
       let failed = state["unexpected"] as? Bool == true &&
         self.incomingFileID == (state["drag"] as? String) && self.incomingFileActive
-      if failed { self.releaseLocked(parkCursor: false) }
+      let matching = self.incomingFileID == (state["drag"] as? String)
+      if failed, let id = self.incomingFileID { self.releaseIncomingFileLocked(id: id) }
       self.lock.unlock()
-      self.dragProbe.suppressIncomingFileDrag(false)
+      if matching { self.dragProbe.suppressIncomingFileDrag(false) }
       self.channel.invokeMethod("fileDragSessionState", arguments: state.merging([
-        "phase": "ended", "inputStopped": failed]) { _, new in new })
+        "phase": "ended", "inputStopped": false, "captureContinues": failed]) { _, new in new })
     }
     return files
   }()
   private var incomingFileActive = false // under input lock
   private var incomingFileID: String?
+  private var pendingIncomingFile: [String: Any]?
   private let dragProbe = MacEdgeDragProbe()
   private var dragTestEnabled = false // protected by lock, like heldButtons
   private var dragPixelScale: CGFloat = 1
@@ -170,7 +188,10 @@ final class RemoteInputBridge {
     if call.method.hasPrefix("clipboard") { clipboard.handle(call, result); return }
     let args = call.arguments as? [String: Any] ?? [:]
     switch call.method {
-    case "fileDragCapabilities": result(["source": false, "target": true])
+    case "fileDragCapabilities": result(["source": false, "target": true, "deferred": true])
+    case "receiverFileDragActivate":
+      if let id = args["capture"] as? String { activateIncomingFile(captureID: id) }
+      result(nil)
     case "fileDragProgress": incomingFiles.progress(args); result(nil)
     case "fileDragComplete": incomingFiles.complete(args); result(nil)
     case "fileDragReset": incomingFiles.reset(); result(nil)
@@ -303,6 +324,9 @@ final class RemoteInputBridge {
       if let fileDrag = fileDrag, !incomingFiles.validate(fileDrag) {
         result(FlutterError(code: "invalid_file_drag", message: "文件拖拽对象无效", details: nil)); return
       }
+      if fileDrag != nil && args["receiverDragResume"] != nil {
+        result(FlutterError(code: "invalid_file_drag", message: "不能同时开始文件拖拽并续接另一拖拽", details: nil)); return
+      }
       guard CGPreflightPostEventAccess(), let id = args["capture"] as? String, id.count == 32 else {
         result(FlutterError(code: "permission_required", message: "请先在系统设置中允许辅助功能访问。", details: nil)); return
       }
@@ -369,55 +393,17 @@ final class RemoteInputBridge {
       predictor.reset(position); lastPredictionSource = 0
       predictionOutput.reset(position, at: lastReceived)
       scheduleMotionLocked()
+      pendingIncomingFile = fileDrag
+      incomingFileID = fileDrag?["drag"] as? String
       lock.unlock()
       if !resuming { dragProbe.receiverBegan() }
-      if let fileDrag = fileDrag {
-        dragProbe.suppressIncomingFileDrag(true)
-        guard !resuming else {
-          dragProbe.suppressIncomingFileDrag(false)
-          stop(parkCursor: false)
-          result(FlutterError(code: "file_drag_failed", message: "Mac 无法开始文件拖拽", details: nil)); return
-        }
-        lock.lock()
-        incomingFileActive = true
-        incomingFileID = fileDrag["drag"] as? String
-        heldButtons.insert(0)
-        let startPoint = position
-        clickCount = 1; clickButton = 0; clickPosition = startPoint
-        clickTime = ProcessInfo.processInfo.systemUptime
-        lock.unlock()
-        let prepared = incomingFiles.start(fileDrag, at: startPoint, mouseSource: source, isCurrent: { [weak self] in
-          guard let self = self else { return false }
-          self.lock.lock(); defer { self.lock.unlock() }
-          return self.capture == id && self.incomingFileActive && self.incomingFileID == (fileDrag["drag"] as? String)
-        }) { [weak self] error in
-          guard let self = self else { return }
-          self.lock.lock()
-          let active = self.capture == id && self.incomingFileID == (fileDrag["drag"] as? String) && self.incomingFileActive
-          if error != nil && active { self.releaseLocked(parkCursor: false) }
-          self.lock.unlock()
-          if let error = error, active {
-            self.dragProbe.suppressIncomingFileDrag(false)
-            self.channel.invokeMethod("fileDragSessionState", arguments: [
-              "drag": fileDrag["drag"] as? String ?? "", "phase": "ended",
-              "unexpected": true, "accepted": false, "inputStopped": true, "error": error])
-          }
-        }
-        lock.lock()
-        let stillPrepared = capture == id && incomingFileActive && incomingFileID == (fileDrag["drag"] as? String)
-        lock.unlock()
-        if !prepared || !stillPrepared {
-          dragProbe.suppressIncomingFileDrag(false); stop(parkCursor: false)
-          result(FlutterError(code: "file_drag_failed", message: "Mac 无法准备文件拖拽", details: nil))
-        } else {
-          // Ack transport preparation now. Windows cannot send the movement
-          // needed to start AppKit until it receives this acknowledgement.
-          NSLog("Shared Input incoming file drag transport ready: %@", id)
-          result(nil)
-        }
-        return
-      }
+      // Acknowledge normal capture before any AppKit/icon work. Current peers
+      // explicitly activate after their Windows hook is running. Old peers
+      // start on the next run-loop turn, without holding the begin reply.
       result(nil)
+      if fileDrag != nil && args["deferFileDrag"] as? Bool != true {
+        RunLoop.main.perform(inModes: [.common]) { [weak self] in self?.activateIncomingFile(captureID: id) }
+      }
     case "receiverHeartbeat":
       lock.lock()
       let active = capture != nil
@@ -553,8 +539,56 @@ final class RemoteInputBridge {
     }
     return true
   }
+  private func activateIncomingFile(captureID: String) {
+    lock.lock()
+    guard capture == captureID, let raw = pendingIncomingFile,
+          let id = incomingFileID, raw["drag"] as? String == id else { lock.unlock(); return }
+    pendingIncomingFile = nil
+    incomingFileActive = true
+    let startPoint = position
+    lock.unlock()
+    dragProbe.suppressIncomingFileDrag(true)
+    incomingFiles.start(raw, at: startPoint, mouseSource: source, isCurrent: { [weak self] in
+      guard let self = self else { return false }
+      self.lock.lock(); defer { self.lock.unlock() }
+      return self.capture == captureID && self.incomingFileID == id && self.incomingFileActive
+    }) { [weak self] error in
+      guard let self = self, let error = error else { return }
+      self.lock.lock()
+      let active = self.capture == captureID && self.incomingFileID == id && self.incomingFileActive
+      if active { self.releaseIncomingFileLocked(id: id) }
+      self.lock.unlock()
+      if active {
+        self.clearIncomingFileSuppression()
+        self.channel.invokeMethod("fileDragSessionState", arguments: [
+          "drag": id, "phase": "ended", "unexpected": true, "accepted": false,
+          "inputStopped": false, "captureContinues": true, "error": error])
+      }
+    }
+  }
+
+  // Cancel only the file-owned press. Capture, the pointer clocks and keyboard
+  // state continue normally; the watchdog/shortcut still stop the whole run.
+  private func releaseIncomingFileLocked(id: String) {
+    guard incomingFileID == id else { return }
+    let down = incomingFiles.hasPostedDown(id: id)
+    incomingFiles.cancelDrag(expectedID: id)
+    let held = incomingFileActive && heldButtons.remove(0) != nil
+    if down || held {
+      post(CGEvent(mouseEventSource: source, mouseType: .leftMouseUp,
+        mouseCursorPosition: position, mouseButton: .left))
+      heldButtonPressIds.removeValue(forKey: 0)
+    }
+    incomingFileActive = false; incomingFileID = nil; pendingIncomingFile = nil
+    DispatchQueue.main.async { [weak self] in self?.clearIncomingFileSuppression() }
+  }
+
+  private func clearIncomingFileSuppression() {
+    lock.lock(); let cleared = incomingFileID == nil; lock.unlock()
+    if cleared { dragProbe.suppressIncomingFileDrag(false) }
+  }
+
   private func emitMotionLocked(_ point: CGPoint) {
-    if incomingFileActive && !incomingFiles.motionAllowed { return }
     var point = constrained(point)
     if dragTestEnabled && !heldButtons.isEmpty {
       let bounds = CGDisplayBounds(CGMainDisplayID())
@@ -597,9 +631,12 @@ final class RemoteInputBridge {
       event?.setIntegerValueField(.keyboardEventAutorepeat, value: (frame["repeat"] as? Bool ?? false) ? 1 : 0)
       post(event)
     case "button":
-      if incomingFileActive && frame["button"] as? Int == 0 && frame["down"] as? Bool == false {
-        incomingFiles.userReleased()
+      if let id = incomingFileID, frame["button"] as? Int == 0 && frame["down"] as? Bool == false {
+        incomingFiles.userReleased(id: id)
+        pendingIncomingFile = nil
         incomingFileActive = false
+        incomingFileID = nil
+        DispatchQueue.main.async { [weak self] in self?.clearIncomingFileSuppression() }
       }
       guard let number = frame["button"] as? NSNumber, (0...4).contains(number.intValue) else { return false }
       let button = number.intValue, down = frame["down"] as? Bool ?? false
@@ -640,11 +677,7 @@ final class RemoteInputBridge {
     return true
   }
   private func releaseLocked(hideCursor: Bool = false, parkCursor: Bool = true) {
-    if incomingFileActive {
-      incomingFiles.cancelDrag()
-      incomingFileActive = false
-    }
-    incomingFileID = nil
+    if let id = incomingFileID { releaseIncomingFileLocked(id: id) }
     let previousHold = suspendedDrag ?? resumingDrag
     suspendedDrag = nil; resumingDrag = nil; pendingDragEntry = nil
     let wasCapturing = capture != nil || previousHold != nil

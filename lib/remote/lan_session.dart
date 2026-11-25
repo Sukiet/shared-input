@@ -20,6 +20,13 @@ class RemoteCaptureException implements Exception {
 class LanSession extends ChangeNotifier {
   bool fileDragSupported = false, fileDragSource = false, fileDragTarget = false, supportsFileDrag = false;
   bool fileDragStateSupported = false, supportsFileDragState = false;
+  bool fileDragActivationSupported = false, supportsFileDragActivation = false;
+  Future<void> activateFileDrag() async {
+    if (!_receiver && connected && capturing && supportsFileDragActivation) {
+      await _wire!.send({'type': 'fileDragActivate', 'capture': _capture});
+    }
+  }
+
   FutureOr<void> Function(Map<String, dynamic>)? onFileDragControl;
   Future<void> sendFileDragControl(Map<String, dynamic> message) async {
     if (connected && supportsFileDrag) await _wire!.send(message);
@@ -61,6 +68,7 @@ class LanSession extends ChangeNotifier {
   }
 
   int get connectionGeneration => _generation;
+  bool isCurrentCapture(Object? id) => id != null && connected && _capture == id;
   bool get receiving => _receiver;
   final diagnostics = InputDiagnostics();
   double scrollSpeed = ScrollSpeed.defaultValue;
@@ -183,6 +191,7 @@ class LanSession extends ChangeNotifier {
                 if (screenPolicySupported) 'screen-policy-v1',
                 if (fileDragSupported && fileDragTarget) 'file-drag-v1',
                 if (fileDragStateSupported && fileDragTarget) 'file-drag-state-v1',
+                if (fileDragActivationSupported && fileDragTarget) 'file-drag-activation-v1',
                 if (clipboardSupported) 'clipboard-v1',
                 if (dragPreviewSupported) 'edge-drag-preview-v1',
                 if (receiverDragHoldSupported) 'receiver-drag-hold-v1',
@@ -222,6 +231,8 @@ class LanSession extends ChangeNotifier {
               (hello['capabilities'] as List?)?.contains('file-drag-v1') == true;
           supportsFileDragState = supportsFileDrag && fileDragStateSupported &&
               (hello['capabilities'] as List?)?.contains('file-drag-state-v1') == true;
+          supportsFileDragActivation = supportsFileDrag && fileDragActivationSupported &&
+              (hello['capabilities'] as List?)?.contains('file-drag-activation-v1') == true;
           supportsClipboard =
               clipboardSupported &&
               (hello['capabilities'] as List?)?.contains('clipboard-v1') ==
@@ -298,6 +309,7 @@ class LanSession extends ChangeNotifier {
             if (screenPolicySupported) 'screen-policy-v1',
             if (fileDragSupported && fileDragSource) 'file-drag-v1',
             if (fileDragStateSupported && fileDragSource) 'file-drag-state-v1',
+            if (fileDragActivationSupported && fileDragSource) 'file-drag-activation-v1',
             if (clipboardSupported) 'clipboard-v1',
             if (dragPreviewSupported) 'edge-drag-preview-v1',
                 if (receiverDragHoldSupported) 'receiver-drag-hold-v1',
@@ -320,6 +332,8 @@ class LanSession extends ChangeNotifier {
           (ack['capabilities'] as List?)?.contains('file-drag-v1') == true;
       supportsFileDragState = supportsFileDrag && fileDragStateSupported &&
           (ack['capabilities'] as List?)?.contains('file-drag-state-v1') == true;
+      supportsFileDragActivation = supportsFileDrag && fileDragActivationSupported &&
+          (ack['capabilities'] as List?)?.contains('file-drag-activation-v1') == true;
       supportsDragPreview =
           dragPreviewSupported &&
           (ack['capabilities'] as List?)?.contains('edge-drag-preview-v1') ==
@@ -442,6 +456,13 @@ class LanSession extends ChangeNotifier {
             if (supportsFileDrag) await onFileDragControl?.call(json);
           case 'fileDragState':
             if (supportsFileDragState) await onFileDragControl?.call(json);
+          case 'fileDragActivate':
+            if (_receiver &&
+                supportsFileDragActivation &&
+                _capture != null &&
+                json['capture'] == _capture) {
+              await onFileDragControl?.call(json);
+            }
           case 'screenPolicy':
           case 'screenPolicyStatus':
             if (supportsScreenPolicy) await onScreenControl?.call(json);
@@ -516,6 +537,10 @@ class LanSession extends ChangeNotifier {
                 throw const FormatException('被控端不支持该文件拖拽或不能同时续接另一拖拽。');
               }
               options.remove('receiverDragHold'); // Negotiated by this endpoint, never trusted from a peer option.
+              options.remove('deferFileDrag');
+              if (supportsFileDragActivation && options['fileDrag'] != null) {
+                options['deferFileDrag'] = true;
+              }
               final entry = options['edgeEntryY'];
               final side = options['edgeEntrySide'] ?? 'left';
               if (!['left', 'right', 'top', 'bottom'].contains(side) ||
@@ -925,6 +950,7 @@ class LanSession extends ChangeNotifier {
     supportsScreenPolicy = false;
     supportsFileDrag = false;
     supportsFileDragState = false;
+    supportsFileDragActivation = false;
     _clipboardOpening = false;
     clipboard.close();
     remoteDisplay = null;

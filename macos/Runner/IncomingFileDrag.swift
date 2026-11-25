@@ -106,6 +106,8 @@ final class IncomingFileDrag: NSObject, NSDraggingSource, NSFilePromiseProviderD
   private var startupTimer: Timer?
   private var startedAt = 0.0
   private var sourceEventNumber = -1
+  private var postedDown = false // under mutex; paired even if source Down is never delivered
+  var sourcePressed: ((String) -> Bool)?
   var sessionStarted: ((String) -> Void)?
   var sessionEnded: (([String: Any]) -> Void)?
   var stateChanged: (([String: Any]) -> Void)?
@@ -125,12 +127,19 @@ final class IncomingFileDrag: NSObject, NSDraggingSource, NSFilePromiseProviderD
 
   func start(_ raw: [String: Any], at quartz: CGPoint, mouseSource: CGEventSource?,
       isCurrent: () -> Bool,
-      completion: @escaping (String?) -> Void) -> Bool {
-    guard validate(raw), panel == nil,
-          let id = raw["drag"] as? String, let values = raw["items"] as? [[String: Any]] else { return false }
+      completion: @escaping (String?) -> Void) {
+    guard validate(raw), let id = raw["drag"] as? String,
+          let values = raw["items"] as? [[String: Any]] else {
+      completion("Mac 拒绝无效的文件拖拽对象"); return
+    }
+    guard panel == nil else {
+      mutex.lock(); let phase = lifecycle.phase.rawValue; mutex.unlock()
+      completion("Mac 文件拖拽来源窗口仍被占用（\(phase)）"); return
+    }
     let items = values.compactMap(IncomingDragItem.parse)
     mutex.lock(); self.drag = id; lifecycle.prepare()
     startCompletion = completion; startedAt = ProcessInfo.processInfo.systemUptime; sourceEventNumber = -1
+    postedDown = false
     offered[id] = Dictionary(uniqueKeysWithValues: items.map { ($0.id, $0) })
     if offered.count > 8, let first = offered.keys.first(where: { $0 != id }) {
       offered.removeValue(forKey: first); writable.remove(first)
@@ -188,8 +197,9 @@ final class IncomingFileDrag: NSObject, NSDraggingSource, NSFilePromiseProviderD
     let down = CGEvent(mouseEventSource: mouseSource, mouseType: .leftMouseDown,
       mouseCursorPosition: quartz, mouseButton: .left)
     guard let down = down else {
-      panel.orderOut(nil); self.panel = nil
-      mutex.lock(); self.drag = nil; startCompletion = nil; mutex.unlock(); return false
+      finishStart("Mac 无法创建来源鼠标按下事件")
+      closeSource(unexpected: true, accepted: false, operation: [])
+      return
     }
     down.setIntegerValueField(.eventSourceUserData, value: ReceiverCursorVisibility.remoteEventTag)
     down.setIntegerValueField(.mouseEventClickState, value: 1)
@@ -200,13 +210,13 @@ final class IncomingFileDrag: NSObject, NSDraggingSource, NSFilePromiseProviderD
     let current = isCurrent()
     mutex.lock()
     let pending = current && lifecycle.phase == .awaitingDown
-    if pending { down.post(tap: .cghidEventTap) }
+    if pending { postedDown = true; down.post(tap: .cghidEventTap) }
     else { _ = lifecycle.cancel() }
     mutex.unlock()
     if !pending {
       finishStart("文件拖拽在准备期间已取消")
       closeSource(unexpected: false, accepted: false, operation: [])
-      return true
+      return
     }
     // Source stays hit-testable until the session ends. Making it transparent
     // here can route the still-queued down into Finder and replace the drag.
@@ -230,10 +240,12 @@ final class IncomingFileDrag: NSObject, NSDraggingSource, NSFilePromiseProviderD
     startupTimer?.invalidate(); startupTimer = timeout
     RunLoop.main.add(timeout, forMode: .common)
     reportState("awaitingDown")
-    return true
   }
 
-  var motionAllowed: Bool { mutex.lock(); defer { mutex.unlock() }; return lifecycle.motionAllowed }
+  func hasPostedDown(id: String) -> Bool {
+    mutex.lock(); defer { mutex.unlock() }
+    return drag == id && postedDown
+  }
 
   private func sourceMouseDown(_ event: NSEvent, view: NSView, id: String) {
     guard drag == id, view.window === panel else { return }
@@ -250,12 +262,15 @@ final class IncomingFileDrag: NSObject, NSDraggingSource, NSFilePromiseProviderD
     if begin { sourceEventNumber = event.eventNumber }
     mutex.unlock()
     guard begin else { return }
+    guard sourcePressed?(id) == true else { cancelDrag(expectedID: id); return }
     NSLog("Shared Input incoming file drag source down: event=%ld window=%ld",
       event.eventNumber, event.windowNumber)
     reportState("starting")
     let session = view.beginDraggingSession(with: preparedItems, event: event, source: self)
     session.animatesToStartingPositionsOnCancelOrFail = false
-    mutex.lock(); self.session = session; mutex.unlock()
+    mutex.lock()
+    if drag == id && lifecycle.phase != .ended { self.session = session }
+    mutex.unlock()
   }
 
   private func finishStart(_ error: String?) {
@@ -271,16 +286,25 @@ final class IncomingFileDrag: NSObject, NSDraggingSource, NSFilePromiseProviderD
     closeSource(unexpected: result.unexpected, accepted: false, operation: [])
   }
 
-  func userReleased() {
+  func userReleased(id: String) {
     mutex.lock()
-    if lifecycle.release(), let id = drag { writable.insert(id) }
+    guard drag == id else { mutex.unlock(); return }
+    postedDown = false
+    let wasStarting = lifecycle.phase == .starting
+    let accepted = lifecycle.release()
+    if accepted { writable.insert(id) }
     mutex.unlock()
+    if !accepted {
+      if wasStarting { postEscape() }
+      cancelDrag(expectedID: id)
+    }
   }
   // Can be requested from the input watchdog queue while it holds its input
   // lock. Queue cancellation before the paired MouseUp, rather than calling
   // AppKit synchronously from that queue or changing focus.
-  func cancelDrag() {
+  func cancelDrag(expectedID: String? = nil) {
     mutex.lock()
+    guard expectedID == nil || drag == expectedID else { mutex.unlock(); return }
     let cancel = lifecycle.cancel()
     let id = drag
     if let id = drag { writable.remove(id) }
@@ -337,7 +361,7 @@ final class IncomingFileDrag: NSObject, NSDraggingSource, NSFilePromiseProviderD
     // window. A failed file session must never become a desktop selection.
     sessionEnded?(state)
     panel?.orderOut(nil); panel = nil; providers = []; preparedItems = []
-    mutex.lock(); drag = nil; mutex.unlock()
+    mutex.lock(); drag = nil; postedDown = false; mutex.unlock()
   }
 
   private func reportState(_ phase: String, error: String? = nil, startupPhase: String? = nil) {

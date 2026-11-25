@@ -57,6 +57,7 @@ class FileDragSync extends ChangeNotifier {
       lan.fileDragSource = _source;
       lan.fileDragTarget = _target;
       lan.fileDragStateSupported = lan.fileDragSupported;
+      lan.fileDragActivationSupported = _source || caps?['deferred'] == true;
     } on MissingPluginException {
       /* older runner */
     }
@@ -110,6 +111,23 @@ class FileDragSync extends ChangeNotifier {
   }
 
   Future<void> _control(Map<String, dynamic> message) async {
+    if (lan.receiving && _target && message['type'] == 'fileDragActivate') {
+      final generation = lan.connectionGeneration;
+      unawaited(
+        native
+            .invokeMethod<void>('receiverFileDragActivate', {
+              'capture': message['capture'],
+            })
+            .catchError((Object error) {
+              if (!_disposed && generation == lan.connectionGeneration && lan.isCurrentCapture(message['capture'])) {
+                final detail = error is PlatformException ? error.message ?? error.code : error.toString();
+                _nativeStatus = 'Mac 文件会话启动失败：$detail\n普通鼠标控制继续，文件拖拽已取消';
+                _changed();
+              }
+            }),
+      );
+      return;
+    }
     if (!lan.receiving && _source && message['type'] == 'fileDragState') {
       _sessionState(message);
       return;
@@ -293,7 +311,12 @@ class FileDragSync extends ChangeNotifier {
         'startupPhase': value['startupPhase'],
       for (final field in ['elapsedMs', 'sourceEventNumber', 'operation'])
         if (value[field] is int) field: value[field],
-      for (final field in ['combinedLeftDown', 'hidLeftDown'])
+      for (final field in [
+        'combinedLeftDown',
+        'hidLeftDown',
+        'inputStopped',
+        'captureContinues',
+      ])
         if (value[field] is bool) field: value[field],
     };
     if (value['unexpected'] == true) {
@@ -309,6 +332,9 @@ class FileDragSync extends ChangeNotifier {
     if (lastSessionState['unexpected'] == true) {
       _nativeStatus =
           lastSessionState['error'] as String? ?? 'Mac 文件拖拽提前结束，已停止鼠标拖拽转发';
+      if (lastSessionState['captureContinues'] == true) {
+        _nativeStatus += '\n普通鼠标控制继续，文件拖拽已取消';
+      }
       _changed();
       return true;
     }

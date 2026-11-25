@@ -959,6 +959,15 @@ class _InputPageState extends State<InputPage> with WidgetsBindingObserver {
       });
       if (mounted && identical(_controlRun, run)) {
         unawaited(_receiverDragHold.confirmResume(resume));
+        if (fileDrag != null) {
+          // Local capture is already running. File setup can never hold up the
+          // initial transport acknowledgement or the pointer's two axes.
+          unawaited(
+            _lan.activateFileDrag().catchError((Object error) {
+              if (mounted) setState(() => _status = '文件拖拽启动指令发送失败：$error');
+            }),
+          );
+        }
       }
     } catch (_) {
       if (identical(_controlRun, run)) _controlRun = null;
